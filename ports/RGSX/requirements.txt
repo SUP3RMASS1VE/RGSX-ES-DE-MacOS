@@ -1,0 +1,6 @@
+pygame==2.6.1
+requests==2.32.5
+# Optional (the app runs without them)
+Pillow==11.3.0
+watchdog==6.0.0
+# cairosvg is intentionally omitted (needs: brew install cairo)

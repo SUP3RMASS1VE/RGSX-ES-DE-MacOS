@@ -46,6 +46,37 @@ def get_application_root():
         return os.path.abspath(os.getcwd())
 
 
+### macOS: ROMs root derived from the launcher location (ES-DE layout: <ROMs>/ports/RGSX/RGSX.sh)
+def _roms_root_from_dir(_d):
+    """Rules 1-2: <ROMs>/ports/RGSX -> <ROMs>; <ROMs>/ports -> <ROMs>. Case-insensitive (APFS)."""
+    _d = os.path.normpath(_d)
+    _base = os.path.basename(_d).lower()
+    _parent = os.path.dirname(_d)
+    if _base == "rgsx" and os.path.basename(_parent).lower() == "ports":
+        return os.path.dirname(_parent)
+    if _base == "ports":
+        return _parent
+    return None
+def _derive_roms_from_launcher():
+    """Return the ES-DE ROMs root implied by where RGSX lives, or None. macOS only."""
+    try:
+        _launcher = os.environ.get("RGSX_LAUNCHER_PATH", "").strip()
+        _candidates = []
+        if _launcher and os.path.isabs(_launcher):
+            # Logical path first (a symlinked 'ports' on another disk must keep its logical root),
+            # then the symlink-resolved path as a last candidate.
+            _candidates.append(os.path.dirname(_launcher))
+            _candidates.append(os.path.dirname(os.path.realpath(_launcher)))
+        elif not _launcher:
+            # Direct "python __main__.py" runs: no launcher env, use this file's real location
+            _candidates.append(os.path.dirname(os.path.realpath(os.path.abspath(__file__))))
+        for _cand in _candidates:
+            _root = _roms_root_from_dir(_cand)
+            if _root and os.path.isdir(_root) and not os.path.lexists(os.path.join(_root, ".git")):
+                return _root
+    except Exception:
+        pass
+    return None
 ### CONSTANTES DES CHEMINS DE BASE
 
 
@@ -53,8 +84,14 @@ def get_application_root():
 _docker_app_dir = os.environ.get("RGSX_APP_DIR", "").strip()
 _docker_config_dir = os.environ.get("RGSX_CONFIG_DIR", "").strip()
 _docker_data_dir = os.environ.get("RGSX_DATA_DIR", "").strip()
+_macos_default_dirs = False  # True only when the macOS per-user defaults below were injected
 
-# Determine if we're running in Docker mode
+# macOS: per-user locations. Reuses the external-dirs branch below; RGSX_CONFIG_DIR / RGSX_DATA_DIR still override.
+if platform.system() == "Darwin" and not (_docker_config_dir or _docker_data_dir):
+    _docker_config_dir = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "RGSX")
+    _docker_data_dir = os.path.join(os.path.expanduser("~"), "Documents", "RGSX")
+    _macos_default_dirs = True
+# Determine if we're running in Docker mode (or macOS per-user mode)
 _is_docker_mode = bool(_docker_config_dir or _docker_data_dir)
 
 if _is_docker_mode:
@@ -108,6 +145,30 @@ else:
 
 # Default ROM location
 _default_roms_folder = os.path.join(DATA_FOLDER if _is_docker_mode else USERDATA_FOLDER, "roms")
+# macOS + ES-DE: default to ~/ROMs (ES-DE's default ROM root) when it exists and RGSX_DATA_DIR/RGSX_CONFIG_DIR
+# were not set explicitly. A roms_folder in rgsx_settings.json still wins (handled below).
+if _macos_default_dirs and os.path.isdir(os.path.join(os.path.expanduser("~"), "ROMs")):
+    _default_roms_folder = os.path.join(os.path.expanduser("~"), "ROMs")
+# macOS: ROMs root precedence (below an explicit roms_folder in rgsx_settings.json, applied afterwards):
+# RGSX_ROMS_DIR env > derived from the launcher location > the defaults above.
+# Not gated by _macos_default_dirs, so RGSX_DATA_DIR / RGSX_CONFIG_DIR do not disable env/derived.
+_roms_src = "default"
+if platform.system() == "Darwin":
+    _env_roms = os.environ.get("RGSX_ROMS_DIR", "").strip()
+    if _env_roms and os.path.isabs(_env_roms) and os.path.isdir(_env_roms):
+        _default_roms_folder = _env_roms
+        _roms_src = "env"
+    else:
+        if _env_roms:
+            logging.getLogger(__name__).warning(f"RGSX_ROMS_DIR ignored (not an existing absolute directory): {_env_roms}")
+        _derived_roms = _derive_roms_from_launcher()
+        if _derived_roms:
+            _default_roms_folder = _derived_roms
+            _roms_src = "derived"
+        elif _macos_default_dirs and _default_roms_folder == os.path.join(os.path.expanduser("~"), "ROMs"):
+            _roms_src = "home_default"
+        else:
+            _roms_src = "data_default"
 
 try:
     # Try to load custom roms_folder from settings
@@ -143,6 +204,15 @@ try:
 except Exception as _e:
     ROMS_FOLDER = _default_roms_folder
     logging.getLogger(__name__).debug(f"Impossible de charger roms_folder depuis settings: {_e}")
+if platform.system() == "Darwin":
+    # settings | env | derived | home_default | data_default (a settings path equal to the default reports the default's source)
+    ROMS_FOLDER_SOURCE = "settings" if ROMS_FOLDER != _default_roms_folder else _roms_src
+    if ROMS_FOLDER_SOURCE in ("home_default", "data_default") and os.environ.get("RGSX_LAUNCHER_PATH"):
+        logging.getLogger(__name__).warning(
+            f"ROMs folder not derived from launcher {os.environ.get('RGSX_LAUNCHER_PATH')} "
+            f"(expected <ROMs>/ports/RGSX/RGSX.sh); using {ROMS_FOLDER} ({ROMS_FOLDER_SOURCE})")
+    else:
+        logging.getLogger(__name__).info(f"ROMS_FOLDER={ROMS_FOLDER} (source: {ROMS_FOLDER_SOURCE})")
 
 
 # Configuration du logging
@@ -166,6 +236,7 @@ connection_status_progress = {"done": 0, "total": 0}
 
 # Log directory
 # Docker mode: /config/logs (persisted in config volume)
+# macOS: ~/Library/Application Support/RGSX/logs
 # Traditional mode: /app/RGSX/logs (current behavior)
 if _is_docker_mode:
     log_dir = os.path.join(CONFIG_FOLDER, "logs")
@@ -284,6 +355,10 @@ PS3DEC_EXE = os.path.join(APP_FOLDER,"assets", "progs", "ps3dec_win.exe")
 PS3DEC_LINUX = os.path.join(APP_FOLDER,"assets", "progs", "ps3dec_linux")
 SEVEN_Z_LINUX = os.path.join(APP_FOLDER,"assets", "progs", "7zz")
 SEVEN_Z_EXE = os.path.join(APP_FOLDER,"assets", "progs", "7z.exe")
+# macOS: 7zz installed by macos/rgsx-macos into the runtime dir (RGSX_SEVENZIP overrides)
+SEVEN_Z_DARWIN = os.environ.get("RGSX_SEVENZIP", "").strip() or os.path.join(
+    os.environ.get("RGSX_RUNTIME_DIR", "").strip() or os.path.join(os.path.expanduser("~"), "Library", "Application Support", "RGSX", "runtime"),
+    "bin", "7zz")
 TORRENT_QBITTORRENT_WEBUI_PASSWORD = "RGSXqbt"
 
 # Détection du système d'exploitation (une seule fois au démarrage)

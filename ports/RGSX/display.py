@@ -3915,8 +3915,8 @@ def draw_pause_display_menu(screen, selected_index):
         monitor_value = f"{monitor_info['name']} ({monitor_info['resolution']})"
         monitor_txt = f"{_('display_monitor') if _ else 'Monitor'}: < {monitor_value} >"
 
-    # Display mode - Windows only
-    show_display_mode_option = getattr(config, 'OPERATING_SYSTEM', '') == "Windows"
+    # Display mode - Windows and macOS only
+    show_display_mode_option = getattr(config, 'OPERATING_SYSTEM', '') in ("Windows", "Darwin")
     if show_display_mode_option:
         is_fullscreen = get_display_fullscreen()
         display_mode_value = _("display_fullscreen") if is_fullscreen else _("display_windowed")

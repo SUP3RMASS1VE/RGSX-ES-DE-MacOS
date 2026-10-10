@@ -1,0 +1,157 @@
+diff --git a/ports/RGSX/__main__.py b/ports/RGSX/__main__.py
+index 8963857..f33b9c1 100644
+--- a/ports/RGSX/__main__.py
++++ b/ports/RGSX/__main__.py
+@@ -510,0 +511,4 @@ def start_web_server():
++            web_server_cmd = [exe, web_server_script]
++            if config.OPERATING_SYSTEM == "Darwin":
++                # macOS: local only by default (the web UI has no authentication); RGSX_WEB_HOST overrides
++                web_server_cmd += ["--host", os.environ.get("RGSX_WEB_HOST", "127.0.0.1")]
+@@ -513 +517 @@ def start_web_server():
+-                    [exe, web_server_script],
++                    web_server_cmd,
+@@ -1865,0 +1870,2 @@ async def main():
++    elif config.OPERATING_SYSTEM == "Darwin":
++        logger.debug("Mise à jour liste des jeux EmulationStation ignorée sur macOS")
+diff --git a/ports/RGSX/config.py b/ports/RGSX/config.py
+index 81df871..862f6b9 100644
+--- a/ports/RGSX/config.py
++++ b/ports/RGSX/config.py
+@@ -56,2 +56,8 @@ _docker_data_dir = os.environ.get("RGSX_DATA_DIR", "").strip()
+-
+-# Determine if we're running in Docker mode
++_macos_default_dirs = False  # True only when the macOS per-user defaults below were injected
++
++# macOS: per-user locations. Reuses the external-dirs branch below; RGSX_CONFIG_DIR / RGSX_DATA_DIR still override.
++if platform.system() == "Darwin" and not (_docker_config_dir or _docker_data_dir):
++    _docker_config_dir = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "RGSX")
++    _docker_data_dir = os.path.join(os.path.expanduser("~"), "Documents", "RGSX")
++    _macos_default_dirs = True
++# Determine if we're running in Docker mode (or macOS per-user mode)
+@@ -110,0 +117,4 @@ _default_roms_folder = os.path.join(DATA_FOLDER if _is_docker_mode else USERDATA
++# macOS + ES-DE: default to ~/ROMs (ES-DE's default ROM root) when it exists and RGSX_DATA_DIR/RGSX_CONFIG_DIR
++# were not set explicitly. A roms_folder in rgsx_settings.json still wins (handled below).
++if _macos_default_dirs and os.path.isdir(os.path.join(os.path.expanduser("~"), "ROMs")):
++    _default_roms_folder = os.path.join(os.path.expanduser("~"), "ROMs")
+@@ -168,0 +179 @@ connection_status_progress = {"done": 0, "total": 0}
++# macOS: ~/Library/Application Support/RGSX/logs
+diff --git a/ports/RGSX/controls.py b/ports/RGSX/controls.py
+index 4df8dc6..d41f42a 100644
+--- a/ports/RGSX/controls.py
++++ b/ports/RGSX/controls.py
+@@ -585 +585,4 @@ def load_controls_config(path=CONTROLS_CONFIG_PATH):
+-                src = os.path.join(config.PRECONF_CONTROLS_PATH, 'keyboard.json')
++                kb_name = 'keyboard.json'
++                if config.OPERATING_SYSTEM == 'Darwin' and os.path.exists(os.path.join(config.PRECONF_CONTROLS_PATH, 'keyboard_macos.json')):
++                    kb_name = 'keyboard_macos.json'
++                src = os.path.join(config.PRECONF_CONTROLS_PATH, kb_name)
+@@ -590 +593 @@ def load_controls_config(path=CONTROLS_CONFIG_PATH):
+-                            logging.getLogger(__name__).info("Chargement des contrôles préréglés: keyboard.json")
++                            logging.getLogger(__name__).info(f"Chargement des contrôles préréglés: {kb_name}")
+@@ -2887 +2890 @@ def handle_controls(event, sources, joystick, screen):
+-            show_display_mode = getattr(config, 'OPERATING_SYSTEM', '') == "Windows"
++            show_display_mode = getattr(config, 'OPERATING_SYSTEM', '') in ("Windows", "Darwin")
+diff --git a/ports/RGSX/network.py b/ports/RGSX/network.py
+index 8b4e340..cfbe250 100644
+--- a/ports/RGSX/network.py
++++ b/ports/RGSX/network.py
+@@ -11,0 +12 @@ from config import HEADLESS
++from esde_folders import map_rom_folder
+@@ -1119,0 +1121,5 @@ def _resolve_lolroms_external_command() -> tuple[str | None, str | None]:
++    if config.OPERATING_SYSTEM == 'Darwin':
++        # macOS ships curl but not wget
++        resolved = shutil.which('curl')
++        return ('curl', resolved) if resolved else (None, None)
++
+@@ -3100 +3106 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
+-                        platform_folder = platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform)
++                        platform_folder = map_rom_folder(platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform))
+@@ -3105 +3111 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
+-                    platform_folder = resolve_platform_folder(platform)
++                    platform_folder = map_rom_folder(resolve_platform_folder(platform))
+@@ -4295 +4301 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
+-                        platform_folder = platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform)
++                        platform_folder = map_rom_folder(platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform))
+@@ -4300 +4306 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
+-                    platform_folder = resolve_platform_folder(platform)
++                    platform_folder = map_rom_folder(resolve_platform_folder(platform))
+diff --git a/ports/RGSX/qbittorrent_backend.py b/ports/RGSX/qbittorrent_backend.py
+index 2026ff2..eef26eb 100644
+--- a/ports/RGSX/qbittorrent_backend.py
++++ b/ports/RGSX/qbittorrent_backend.py
+@@ -230,0 +231,4 @@ def _find_qbittorrent_executable() -> str | None:
++    # macOS : le binaire embarqué est un ELF Linux, ne jamais le retourner
++    if config.OPERATING_SYSTEM == "Darwin":
++        return shutil.which("qbittorrent-nox")
++
+diff --git a/ports/RGSX/rgsx_web.py b/ports/RGSX/rgsx_web.py
+index 2d83555..ac72f76 100644
+--- a/ports/RGSX/rgsx_web.py
++++ b/ports/RGSX/rgsx_web.py
+@@ -22,0 +23 @@ import config
++from esde_folders import map_rom_folder
+@@ -609 +610 @@ class RGSXHandler(BaseHTTPRequestHandler):
+-                            expected_dir = os.path.join(config.ROMS_FOLDER, folder)
++                            expected_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
+@@ -667 +668 @@ class RGSXHandler(BaseHTTPRequestHandler):
+-                                expected_dir = os.path.join(config.ROMS_FOLDER, folder)
++                                expected_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
+diff --git a/ports/RGSX/utils.py b/ports/RGSX/utils.py
+index 5be0246..872538f 100644
+--- a/ports/RGSX/utils.py
++++ b/ports/RGSX/utils.py
+@@ -14,0 +15 @@ from config import HEADLESS, Game
++from esde_folders import map_rom_folder
+@@ -582 +583,3 @@ def _resolve_7z_command():
+-    bundled = getattr(config, 'SEVEN_Z_LINUX', '')
++    is_mac = config.OPERATING_SYSTEM == "Darwin"
++    # macOS: the bundled 7zz is a Linux ELF binary, use Homebrew/PATH instead
++    bundled = '' if is_mac else getattr(config, 'SEVEN_Z_LINUX', '')
+@@ -588,0 +592,5 @@ def _resolve_7z_command():
++    if is_mac:
++        # Apps launched from Finder get a minimal PATH: try Homebrew locations explicitly
++        for fallback in ("/opt/homebrew/bin/7zz", "/usr/local/bin/7zz", "/opt/homebrew/bin/7z", "/usr/local/bin/7z"):
++            if fallback not in candidates:
++                candidates.append(fallback)
+@@ -2303 +2311 @@ def is_extension_supported(filename, platform_key, extensions_data):
+-            dest_dir = os.path.join(config.ROMS_FOLDER, platform_dict.get("folder"))
++            dest_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(platform_dict.get("folder")))
+@@ -2330 +2338 @@ def _get_dest_folder_name(platform_key: str) -> str:
+-                dest_dir = os.path.join(config.ROMS_FOLDER, folder)
++                dest_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
+@@ -2460 +2468 @@ def load_sources(allow_torrent_manifest_fetch: bool | None = None):
+-                expected_dir = os.path.join(config.ROMS_FOLDER, folder)
++                expected_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
+@@ -3088,0 +3097,4 @@ def extract_rar(rar_path, dest_dir, url):
++
++        # macOS: no unrar formula in Homebrew, 7-Zip reads RAR natively
++        if config.OPERATING_SYSTEM == "Darwin" and shutil.which("unrar") is None:
++            return extract_7z(rar_path, dest_dir, url)
+@@ -3212 +3224 @@ def extract_7z(archive_path, dest_dir, url):
+-            return False, "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs"
++            return False, ("7zz not found - run: brew install sevenzip" if config.OPERATING_SYSTEM == "Darwin" else "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs")
+@@ -3475,0 +3488,3 @@ def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archi
++            if config.OPERATING_SYSTEM == "Darwin":
++                return False, "PS3 Redump decryption is not supported on macOS (no native ps3dec)"
++
+@@ -3563 +3578 @@ def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archi
+-                return False, "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs"
++                return False, ("7zz not found - run: brew install sevenzip" if config.OPERATING_SYSTEM == "Darwin" else "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs")
+@@ -3914,0 +3930,8 @@ def handle_xbox(dest_dir, iso_files, url=None):
++    elif config.OPERATING_SYSTEM == "Darwin":
++        # macOS : extract-xiso depuis le PATH (pas de binaire fourni)
++        xiso_path = shutil.which("extract-xiso")
++        if not xiso_path:
++            logger.warning("extract-xiso introuvable dans le PATH (macOS)")
++            return False, "extract-xiso not found (build it from github.com/XboxDev/extract-xiso and put it on PATH)"
++        extract_xiso_cmd = [xiso_path, "-r"]
++
+@@ -4459 +4482 @@ def resolve_platform_folder(platform):
+-                    return folder
++                    return map_rom_folder(folder)
+@@ -4473 +4496 @@ def resolve_platform_folder(platform):
+-                            return folder
++                            return map_rom_folder(folder)
+@@ -4478 +4501 @@ def resolve_platform_folder(platform):
+-    return normalize_platform_name(platform)
++    return map_rom_folder(normalize_platform_name(platform))

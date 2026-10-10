@@ -1,0 +1,8 @@
+# Hand-written: libtorrent publishes arm64 wheels only for macosx_14_0 and macosx_15_0 (cp312), so
+# `pip download --platform macosx_11_0_arm64` cannot resolve it. Hashes taken from
+# https://pypi.org/pypi/libtorrent/2.1.1/json (checked against the review's prefix cross-check).
+# libtorrent-2.1.1-cp312-cp312-macosx_14_0_arm64.whl
+# libtorrent-2.1.1-cp312-cp312-macosx_15_0_arm64.whl
+libtorrent==2.1.1 \
+    --hash=sha256:768375f62631acd298a118d6e4f3e288af8220880d6432a49125f0539ce446d4 \
+    --hash=sha256:188aa0f03a2d6e967956a45534cbfd04d81641deb7b92b816e56723fc7ae5078

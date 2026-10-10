@@ -5,6 +5,7 @@ import re
 import threading
 import time
 import config
+from esde_folders import map_rom_folder
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -392,7 +393,7 @@ def scan_roms_for_downloaded_games():
         if not platform_name or not folder_name:
             continue
 
-        roms_path = os.path.join(config.ROMS_FOLDER, folder_name)
+        roms_path = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder_name))
         if not os.path.isdir(roms_path):
             continue
 

@@ -153,6 +153,13 @@ _platform_torrent_support_cache: dict[str, bool] = {}
 
 
 def _is_arm_device() -> bool:
+    if getattr(config, "OPERATING_SYSTEM", "") == "Darwin":
+        try:
+            import qbittorrent_backend as _qb  # lazy: avoids import cycles at module load
+            if _qb.is_available():
+                return False  # libtorrent backend usable: this Mac is not "torrent-blocked ARM"
+        except Exception:
+            pass  # fall through to the original detection
     architecture = str(getattr(config, 'SYSTEM_INFO', {}).get('architecture') or '').lower().strip()
     if not architecture:
         try:
@@ -582,12 +589,15 @@ def load_controls_config(path=CONTROLS_CONFIG_PATH):
 
             # Fallback préréglage explicite clavier si pas de joystick
             if not getattr(config, 'joystick', False) or getattr(config, 'keyboard', False):
-                src = os.path.join(config.PRECONF_CONTROLS_PATH, 'keyboard.json')
+                kb_name = 'keyboard.json'
+                if config.OPERATING_SYSTEM == 'Darwin' and os.path.exists(os.path.join(config.PRECONF_CONTROLS_PATH, 'keyboard_macos.json')):
+                    kb_name = 'keyboard_macos.json'
+                src = os.path.join(config.PRECONF_CONTROLS_PATH, kb_name)
                 if os.path.exists(src):
                     with open(src, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                         if isinstance(data, dict) and data:
-                            logging.getLogger(__name__).info("Chargement des contrôles préréglés: keyboard.json")
+                            logging.getLogger(__name__).info(f"Chargement des contrôles préréglés: {kb_name}")
                             return data
         except Exception as e:
             logging.getLogger(__name__).warning(f"Échec du chargement des contrôles préréglés: {e}")
@@ -2884,7 +2894,7 @@ def handle_controls(event, sources, joystick, screen):
             from rgsx_settings import get_available_monitors
             monitors = get_available_monitors()
             show_monitor = len(monitors) > 1
-            show_display_mode = getattr(config, 'OPERATING_SYSTEM', '') == "Windows"
+            show_display_mode = getattr(config, 'OPERATING_SYSTEM', '') in ("Windows", "Darwin")
 
             monitor_index = 3 if show_monitor else None
             display_mode_index = 4 if show_monitor else 3

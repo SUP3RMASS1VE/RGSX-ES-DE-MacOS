@@ -228,6 +228,10 @@ def _find_qbittorrent_executable() -> str | None:
             logger.debug("qbittorrent_backend: lecture registre échouée: %s", exc)
         return None
 
+    # macOS : le binaire embarqué est un ELF Linux, ne jamais le retourner
+    if config.OPERATING_SYSTEM == "Darwin":
+        return shutil.which("qbittorrent-nox")
+
     # Linux/Batocera : binaire headless embarqué (statique) en priorité.
     if os.path.isfile(_NOX_LINUX):
         try:
@@ -1319,3 +1323,27 @@ def shutdown() -> None:
             except Exception:
                 pass
     _qbt_process = None
+# macOS: in-process libtorrent backend (libtorrent_backend.py). Lazy trampolines resolve at call time, so
+# neither module needs the other fully initialised at import time. Other platforms keep the functions above.
+if config.OPERATING_SYSTEM == "Darwin":
+    def is_available() -> bool:
+        import libtorrent_backend as _lt
+        return _lt.is_available()
+    def download_torrent_via_qbittorrent(*args, **kwargs):
+        import libtorrent_backend as _lt
+        return _lt.download_torrent_via_qbittorrent(*args, **kwargs)
+    def has_active_seed(task_id=None, original_history_url=None) -> bool:
+        import libtorrent_backend as _lt
+        return _lt.has_active_seed(task_id, original_history_url)
+    def stop_seed(task_id=None, original_history_url=None) -> bool:
+        import libtorrent_backend as _lt
+        return _lt.stop_seed(task_id, original_history_url)
+    def prewarm_startup_async() -> None:
+        import libtorrent_backend as _lt
+        return _lt.prewarm_startup_async()
+    def is_process_running() -> bool:
+        import libtorrent_backend as _lt
+        return _lt.is_process_running()
+    def shutdown() -> None:
+        import libtorrent_backend as _lt
+        return _lt.shutdown()

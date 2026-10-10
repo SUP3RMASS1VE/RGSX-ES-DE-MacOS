@@ -1,4 +1,47 @@
 #!/bin/bash
+# >>> RGSX-MACOS-BEGIN
+# macOS: hand off to the self-bootstrapping launcher. Shell-agnostic (POSIX sh, bash 3.2, zsh): no arrays, no double-bracket tests.
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+	# shellcheck disable=SC3028
+	_rgsx_src="${BASH_SOURCE:-$0}"
+	_rgsx_dir="$(cd "$(dirname "$_rgsx_src")" 2>/dev/null && pwd -L)"
+	if [ -n "$_rgsx_dir" ]; then
+		RGSX_LAUNCHER_PATH="$_rgsx_dir/$(basename "$_rgsx_src")"
+		export RGSX_LAUNCHER_PATH
+	fi
+	# Resolve file-level symlinks to find the helper (BSD readlink has no -f). Capped: loops fall through to the dialog.
+	_rgsx_real="$_rgsx_src"
+	_rgsx_n=0
+	_rgsx_ok=1
+	while [ -L "$_rgsx_real" ]; do
+		_rgsx_n=$((_rgsx_n + 1))
+		if [ "$_rgsx_n" -gt 20 ]; then
+			_rgsx_ok=0
+			break
+		fi
+		_rgsx_ld="$(cd "$(dirname "$_rgsx_real")" 2>/dev/null && pwd -L)"
+		_rgsx_t="$(readlink "$_rgsx_real" 2>/dev/null)"
+		if [ -z "$_rgsx_t" ] || [ -z "$_rgsx_ld" ]; then
+			_rgsx_ok=0
+			break
+		fi
+		case "$_rgsx_t" in
+			/*) _rgsx_real="$_rgsx_t" ;;
+			*) _rgsx_real="$_rgsx_ld/$_rgsx_t" ;;
+		esac
+	done
+	_rgsx_real_dir=""
+	if [ "$_rgsx_ok" = 1 ]; then
+		_rgsx_real_dir="$(cd "$(dirname "$_rgsx_real")" 2>/dev/null && pwd -P)"
+	fi
+	if [ -n "$_rgsx_real_dir" ] && [ -r "$_rgsx_real_dir/macos/rgsx-macos" ]; then
+		exec /bin/bash "$_rgsx_real_dir/macos/rgsx-macos" "$@"
+	fi
+	echo "RGSX is incomplete: macos/rgsx-macos is missing. Re-copy the whole ports folder." >&2
+	osascript -e 'display dialog "RGSX is incomplete: macos/rgsx-macos is missing. Re-copy the whole ports folder." buttons {"OK"} default button 1 with icon stop' >/dev/null 2>&1
+	exit 1
+fi
+# <<< RGSX-MACOS-END
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

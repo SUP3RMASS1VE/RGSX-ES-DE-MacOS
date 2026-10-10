@@ -1,0 +1,528 @@
+#!/bin/bash
+# RGSX macOS (Apple Silicon) bootstrap. Started by RGSX.sh via "/bin/bash". Not listed by ES-DE (no .sh extension).
+#
+# First launch downloads a pinned CPython (python-build-standalone), the pip packages (hash-locked) and 7zz into
+# ~/Library/Application Support/RGSX/runtime, then starts the app. Later launches only check stamp files.
+# bash 3.2 compatible. No Apple Events: progress uses Terminal via "open", plus
+# 'display dialog' / 'display notification', none of which need an Automation consent prompt.
+#
+# Environment (all optional):
+#   RGSX_RUNTIME_DIR  runtime location          RGSX_CONFIG_DIR  config/log location
+#   RGSX_PROGRESS     both|dialog|terminal|none (default from macos/pins, else both)
+#   RGSX_BOOTSTRAP_ONLY=1  stop after the stages     RGSX_SELFTEST=1  run macos/selftest.py instead of the app
+#   RGSX_OPEN_WEB=1   open the web UI in the browser once it is up
+#   RGSX_PYTHON       developer escape hatch: arm64 CPython 3.12 used instead of the pinned download
+#   Test hooks: RGSX_PINS_FILE, RGSX_LOCK_DIR, RGSX_EXTRA_PATH (dir prepended to PATH), RGSX_RETRY_SLEEP
+set -u
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
+APP_DIR="$(dirname "$HERE")"
+CFG="${RGSX_CONFIG_DIR:-$HOME/Library/Application Support/RGSX}"
+RT="${RGSX_RUNTIME_DIR:-$CFG/runtime}"
+LOGDIR="$CFG/logs"
+LOG="$LOGDIR/bootstrap.log"
+PINS="${RGSX_PINS_FILE:-$HERE/pins}"
+LOCK_DIR="${RGSX_LOCK_DIR:-$HERE}"
+RETRY_SLEEP="${RGSX_RETRY_SLEEP:-5}"
+
+PATH="$RT/bin:${RGSX_EXTRA_PATH:+$RGSX_EXTRA_PATH:}/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+unset DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_INSERT_LIBRARIES
+
+PBS_URL="" PBS_SHA256="" SEVENZIP_URL="" SEVENZIP_SHA256="" PROGRESS_MODE="both"
+
+LOCK_HELD=0
+PROGRESS_STARTED=0
+DIALOG_PID=""
+FAIL_CLASS="" FAIL_HOST="" FAIL_MSG=""
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
+
+esc() { local s="$1"; s="${s//\\/}"; s="${s//\"/\'}"; printf '%s' "$s"; }
+
+# Blocking error dialog (stderr is invisible under ES-DE). Never uses Apple Events.
+fail_dialog() {
+	local msg
+	msg="$(esc "$1")"
+	log "ERROR: $1"
+	echo "RGSX: $1" >&2
+	kill_dialog
+	osascript -e "display dialog \"$msg\" buttons {\"OK\"} default button 1 with icon stop" >/dev/null 2>&1
+}
+
+notify() {
+	[ "$PROGRESS_STARTED" = 1 ] || return 0
+	case "$PROGRESS_MODE" in none) return 0 ;; esac
+	osascript -e "display notification \"$(esc "$1")\" with title \"RGSX\"" >/dev/null 2>&1 &
+}
+
+kill_dialog() {
+	if [ -n "$DIALOG_PID" ]; then
+		kill "$DIALOG_PID" 2>/dev/null
+		DIALOG_PID=""
+	fi
+	if [ -f "$RT/tmp/dialog.pid" ]; then
+		rm -f "$RT/tmp/dialog.pid"
+	fi
+}
+
+release_lock() {
+	if [ "$LOCK_HELD" = 1 ]; then
+		rm -rf "$RT/lock"
+		LOCK_HELD=0
+	fi
+}
+
+cleanup() {
+	kill_dialog
+	if [ "$PROGRESS_STARTED" = 1 ]; then
+		: >"$RT/tmp/done" 2>/dev/null
+	fi
+	release_lock
+}
+trap cleanup EXIT
+
+die() { # die <message>: dialog + exit 1
+	fail_dialog "$1"
+	exit 1
+}
+
+sha_file() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# --- argument handling -------------------------------------------------------------------------------------
+REINSTALL=0
+APP_ARGS=()
+for arg in "$@"; do
+	case "$arg" in
+		--reinstall) REINSTALL=1 ;;
+		-h|--help)
+			echo "Usage: RGSX.sh [--reinstall]   (RGSX_PROGRESS, RGSX_BOOTSTRAP_ONLY, RGSX_SELFTEST: see header of macos/rgsx-macos)"
+			exit 0 ;;
+		*) APP_ARGS+=("$arg") ;;
+	esac
+done
+
+# --- preflight ---------------------------------------------------------------------------------------------
+mkdir -p "$LOGDIR" 2>/dev/null
+if [ "$(uname -s)" != "Darwin" ]; then
+	echo "RGSX: macos/rgsx-macos is for macOS only." >&2
+	exit 1
+fi
+if [ "$(uname -m)" != "arm64" ]; then
+	die "RGSX for macOS needs an Apple Silicon Mac (arm64). This Mac is $(uname -m)."
+fi
+if ! mkdir -p "$RT/state" "$RT/tmp" "$RT/bin" "$RT/pycache" 2>/dev/null; then
+	die "RGSX cannot create its runtime folder: $RT"
+fi
+if [ ! -r "$PINS" ]; then
+	die "RGSX is incomplete: macos/pins is missing. Re-copy the whole ports folder."
+fi
+# shellcheck disable=SC1090
+. "$PINS"
+[ -n "${RGSX_PROGRESS:-}" ] && PROGRESS_MODE="$RGSX_PROGRESS"
+case "$PROGRESS_MODE" in both|dialog|terminal|none) ;; *) PROGRESS_MODE="both" ;; esac
+MACOS_VERSION="$(sw_vers -productVersion 2>/dev/null)"
+MACOS_MAJOR="${MACOS_VERSION%%.*}"
+case "$MACOS_MAJOR" in ''|*[!0-9]*) MACOS_MAJOR=0 ;; esac
+log "---- launch: \$0=$0 RGSX_LAUNCHER_PATH=${RGSX_LAUNCHER_PATH:-<unset>} macOS=$MACOS_VERSION app=$APP_DIR runtime=$RT progress=$PROGRESS_MODE"
+
+VENV="$RT/venv"
+if [ -n "${RGSX_PYTHON:-}" ]; then
+	PY="$RGSX_PYTHON"
+	if ! "$PY" -c 'import sys, platform; sys.exit(0 if (sys.version_info[:2] == (3, 12) and platform.machine() == "arm64" and platform.python_implementation() == "CPython") else 1)' >/dev/null 2>&1; then
+		die "RGSX_PYTHON must be an arm64 CPython 3.12 interpreter: $PY"
+	fi
+	PYKEY="ext|$(cd "$(dirname "$PY")" && pwd -P)/$(basename "$PY")"
+else
+	PY="$RT/python/bin/python3"
+	PYKEY="$PBS_SHA256"
+fi
+
+# --- single-instance lock (mkdir is atomic; stale owners are stolen with an atomic mv) -----------------------
+lock_owner_alive() { # 0 = a live process owns the lock
+	local pid start tries=0
+	while [ ! -f "$RT/lock/owner" ] && [ "$tries" -lt 5 ]; do sleep 1; tries=$((tries + 1)); done
+	[ -f "$RT/lock/owner" ] || return 1
+	pid="$(sed -n 1p "$RT/lock/owner")"
+	start="$(sed -n 2p "$RT/lock/owner")"
+	case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+	kill -0 "$pid" 2>/dev/null || return 1
+	[ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$start" ]
+}
+
+acquire_lock() {
+	local waited=0 seen moved
+	while :; do
+		if mkdir "$RT/lock" 2>/dev/null; then
+			printf '%s\n%s\n' "$$" "$(ps -o lstart= -p $$ 2>/dev/null)" >"$RT/lock/owner"
+			LOCK_HELD=1
+			return 0
+		fi
+		if lock_owner_alive; then
+			if [ "$waited" -ge 600 ]; then
+				die "Another RGSX setup has been running for over 10 minutes. Close it or delete $RT/lock and try again."
+			fi
+			[ "$waited" = 0 ] && log "another RGSX instance holds the lock, waiting"
+			sleep 2
+			waited=$((waited + 2))
+		else
+			seen="$(cat "$RT/lock/owner" 2>/dev/null)"
+			moved="$RT/lock.stale.$$"
+			if mv "$RT/lock" "$moved" 2>/dev/null; then
+				if [ "$(cat "$moved/owner" 2>/dev/null)" = "$seen" ]; then
+					log "stole stale lock"
+					rm -rf "$moved"
+				else
+					mv "$moved" "$RT/lock" 2>/dev/null || rm -rf "$moved"  # we grabbed a live lock: put it back
+				fi
+			fi
+		fi
+	done
+}
+acquire_lock
+
+# --- quarantine: strip once per (folder, inode) --------------------------------------------------------------
+QKEY="$APP_DIR|$(stat -f %i "$APP_DIR/__main__.py" 2>/dev/null)"
+if [ "$(cat "$RT/state/quarantine" 2>/dev/null)" != "$QKEY" ]; then
+	xattr -dr com.apple.quarantine "$APP_DIR" >/dev/null 2>&1
+	printf '%s' "$QKEY" >"$RT/state/quarantine"
+fi
+
+if [ "$REINSTALL" = 1 ]; then
+	log "--reinstall: removing venv and state"
+	rm -rf "$RT/venv" "$RT/state"
+	mkdir -p "$RT/state"
+fi
+
+# --- progress UI -------------------------------------------------------------------------------------------
+progress_start() {
+	[ "$PROGRESS_STARTED" = 1 ] && return 0
+	PROGRESS_STARTED=1
+	rm -f "$RT/tmp/done"
+	local offset cmd
+	offset="$(stat -f %z "$LOG" 2>/dev/null || echo 0)"
+	case "$PROGRESS_MODE" in
+		both|terminal)
+			# The tail starts at the current end of the log, so earlier runs are never replayed.
+			cmd="$RT/tmp/progress.command"
+			{
+				printf '#!/bin/bash\n'
+				printf 'clear\n'
+				printf 'echo "RGSX is setting up (first launch only). You can close this window at any time."\n'
+				printf 'echo\n'
+				printf 'tail -c +%s -f %q &\n' "$((offset + 1))" "$LOG"
+				printf 'TP=$!\n'
+				printf 'while [ ! -e %q ]; do sleep 1; done\n' "$RT/tmp/done"
+				# shellcheck disable=SC2016
+				printf 'sleep 1\nkill $TP 2>/dev/null\n'
+				printf 'echo\necho "RGSX is starting. This window can be closed."\n'
+			} >"$cmd"
+			chmod 755 "$cmd"
+			open -a Terminal "$cmd" >/dev/null 2>&1 &
+			;;
+	esac
+	case "$PROGRESS_MODE" in
+		both|dialog)
+			osascript -e 'display dialog "RGSX is setting up (first launch only, about 1-4 minutes). Keep your Mac online." buttons {"Hide"} default button 1 giving up after 1800' >/dev/null 2>&1 &
+			DIALOG_PID=$!
+			echo "$DIALOG_PID" >"$RT/tmp/dialog.pid"
+			;;
+	esac
+}
+
+# --- helpers: download, checksum, stamps ---------------------------------------------------------------------
+# fetch <url> <dest.part>; return code is curl's. Resumes a previous .part.
+fetch() {
+	local url="$1" dest="$2" rc ticker
+	log "download: $url"
+	curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 -C - -sS -o "$dest" "$url" >>"$LOG" 2>&1 &
+	local cpid=$!
+	(
+		while kill -0 "$cpid" 2>/dev/null; do
+			sleep 5
+			log "  ... $(stat -f %z "$dest" 2>/dev/null || echo 0) bytes"
+		done
+	) >/dev/null 2>&1 &
+	ticker=$!
+	wait "$cpid"
+	rc=$?
+	kill "$ticker" 2>/dev/null
+	wait "$ticker" 2>/dev/null
+	if [ "$rc" = 33 ]; then # server refused the range: restart from scratch
+		rm -f "$dest"
+		curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 -sS -o "$dest" "$url" >>"$LOG" 2>&1
+		rc=$?
+	fi
+	return "$rc"
+}
+
+curl_class() { # curl exit code -> offline | other
+	case "$1" in 6|7|28|35|52|56) echo offline ;; *) echo other ;; esac
+}
+
+verify_sha256() { # <file> <expected>
+	local got
+	got="$(sha_file "$1")"
+	if [ "$got" != "$2" ]; then
+		log "checksum mismatch for $1: got $got expected $2"
+		rm -f "$1"
+		return 1
+	fi
+	return 0
+}
+
+stamp() { printf '%s\n' "$2" >"$RT/state/$1"; }
+
+# pip stage helper: install <lockname>; sets FAIL_* ; 0 on success
+pip_lock() {
+	local lock="$1" out="$RT/tmp/pip.out" rc
+	"$VENV/bin/python" -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: --no-deps \
+		--retries 5 --timeout 30 -r "$LOCK_DIR/requirements-$lock.lock" >"$out" 2>&1
+	rc=$?
+	cat "$out" >>"$LOG"
+	[ "$rc" = 0 ] && return 0
+	FAIL_HOST="pypi.org / files.pythonhosted.org"
+	if grep -Eqi 'No matching distribution|Could not find a version|not a supported wheel' "$out"; then
+		FAIL_CLASS="nowheel"
+	elif grep -Eqi 'Failed to establish|Connection (aborted|refused|reset)|Name or service not known|Temporary failure in name|Max retries exceeded|timed out|NewConnectionError|ProxyError|SSLError' "$out"; then
+		FAIL_CLASS="offline"
+	else
+		FAIL_CLASS="other"
+	fi
+	FAIL_MSG="pip failed for requirements-$lock.lock ($(tail -n 1 "$out"))"
+	return 1
+}
+
+# run a freshly installed binary; on a signal death re-sign ad hoc and retry once
+smoke_bin() { # <binary> <args...>
+	local bin="$1" rc
+	shift
+	"$bin" "$@" >/dev/null 2>&1
+	rc=$?
+	if [ "$rc" -ge 128 ]; then
+		log "smoke test of $bin died with signal ($rc), re-signing ad hoc"
+		codesign --force --sign - "$bin" >>"$LOG" 2>&1
+		"$bin" "$@" >/dev/null 2>&1
+		rc=$?
+	fi
+	return "$rc"
+}
+
+# --- stage keys, probes, need check --------------------------------------------------------------------------
+key_python()   { printf '%s' "$PYKEY"; }
+key_core()     { printf '%s|%s' "$(sha_file "$LOCK_DIR/requirements-core.lock")" "$PYKEY"; }
+key_optional() { printf '%s|%s' "$(sha_file "$LOCK_DIR/requirements-optional.lock")" "$PYKEY"; }
+key_torrent()  { printf '%s|%s' "$(sha_file "$LOCK_DIR/requirements-torrent.lock")" "$PYKEY"; }
+key_7zz()      { printf '%s' "$SEVENZIP_SHA256"; }
+probe_python()   { "$PY" -c 'import ssl, venv' >/dev/null 2>&1; }
+probe_core()     { "$VENV/bin/python" -c 'import pygame, requests' >/dev/null 2>&1; }
+probe_optional() { "$VENV/bin/python" -c 'import PIL, watchdog' >/dev/null 2>&1; }
+probe_torrent()  { "$VENV/bin/python" -c 'import libtorrent' >/dev/null 2>&1; }
+probe_7zz()      { "$RT/bin/7zz" i >/dev/null 2>&1; }
+
+need_stage() { # 0 = work needed
+	local st="$1" key stampline epoch rkey
+	if [ "$st" = python ] && [ -n "${RGSX_PYTHON:-}" ]; then return 1; fi
+	if [ "$st" = torrent ] && [ "$MACOS_MAJOR" -lt 14 ]; then
+		if [ "$(cat "$RT/state/torrent" 2>/dev/null)" != "unavailable|$(key_torrent)|macos$MACOS_MAJOR" ]; then
+			stamp torrent "unavailable|$(key_torrent)|macos$MACOS_MAJOR"
+			log "torrents disabled: libtorrent needs macOS 14 or newer (this Mac: $MACOS_VERSION)"
+		fi
+		return 1
+	fi
+	key="$(key_"$st")"
+	stampline="$(cat "$RT/state/$st" 2>/dev/null)"
+	case "$stampline" in
+		"ok|$key") if "probe_$st"; then return 1; fi ;;
+		"unavailable|$key|macos$MACOS_MAJOR") return 1 ;;
+		retry\|*)
+			epoch="${stampline#retry|}"
+			epoch="${epoch%%|*}"
+			rkey="${stampline#retry|*|}"
+			if [ "$rkey" = "$key" ] && [ "$(date +%s)" -lt "$epoch" ] 2>/dev/null; then return 1; fi ;;
+	esac
+	return 0
+}
+
+# --- stages ------------------------------------------------------------------------------------------------
+stage_python() {
+	local part="$RT/tmp/pbs.tar.gz.part" stage="$RT/tmp/pbs-stage" rc
+	FAIL_HOST="github.com (python-build-standalone)"
+	fetch "$PBS_URL" "$part"
+	rc=$?
+	if [ "$rc" != 0 ]; then
+		FAIL_CLASS="$(curl_class "$rc")"
+		FAIL_MSG="download of Python failed (curl exit $rc)"
+		return 1
+	fi
+	verify_sha256 "$part" "$PBS_SHA256" || { FAIL_CLASS=other; FAIL_MSG="Python download is corrupt (checksum mismatch)"; return 1; }
+	rm -rf "$stage"
+	mkdir -p "$stage"
+	tar -xzf "$part" -C "$stage" >>"$LOG" 2>&1 || { FAIL_CLASS=other; FAIL_MSG="could not unpack Python"; return 1; }
+	[ -x "$stage/python/bin/python3" ] || { FAIL_CLASS=other; FAIL_MSG="unexpected Python archive layout"; return 1; }
+	rm -rf "$RT/python.old"
+	[ -d "$RT/python" ] && mv "$RT/python" "$RT/python.old"
+	mv "$stage/python" "$RT/python" || { FAIL_CLASS=other; FAIL_MSG="could not install Python"; return 1; }
+	rm -rf "$RT/python.old" "$stage" "$part"
+	if ! smoke_python; then
+		FAIL_CLASS=other
+		FAIL_MSG="Python does not start. Try: xattr -dr com.apple.quarantine \"$RT\""
+		return 1
+	fi
+	return 0
+}
+
+smoke_python() {
+	local rc
+	"$PY" -c 'import ssl, venv' >/dev/null 2>&1
+	rc=$?
+	if [ "$rc" -ge 128 ]; then
+		log "Python died with signal $rc, re-signing ad hoc"
+		codesign --force --sign - "$PY" >>"$LOG" 2>&1
+		find "$RT/python/lib" \( -name '*.dylib' -o -name '*.so' \) -exec codesign --force --sign - {} \; >>"$LOG" 2>&1
+		"$PY" -c 'import ssl, venv' >/dev/null 2>&1
+		rc=$?
+	fi
+	return "$rc"
+}
+
+ensure_venv() {
+	if [ "$(cat "$RT/state/venv_py" 2>/dev/null)" != "$PYKEY" ] || ! "$VENV/bin/python" -c 'import sys' >/dev/null 2>&1; then
+		log "creating venv with $PY"
+		rm -rf "$VENV"
+		"$PY" -m venv "$VENV" >>"$LOG" 2>&1 || { FAIL_CLASS=other; FAIL_HOST=""; FAIL_MSG="could not create the Python environment"; return 1; }
+		printf '%s' "$PYKEY" >"$RT/state/venv_py"
+	fi
+	return 0
+}
+
+stage_core() {
+	local attempt=1
+	ensure_venv || return 1
+	while [ "$attempt" -le 3 ]; do
+		if pip_lock core; then return 0; fi
+		log "pip core attempt $attempt failed ($FAIL_CLASS)"
+		[ "$attempt" -lt 3 ] && sleep "$RETRY_SLEEP"
+		attempt=$((attempt + 1))
+	done
+	return 1
+}
+
+stage_optional() {
+	ensure_venv || return 1
+	pip_lock optional || return 1
+	probe_optional || { FAIL_CLASS=other; FAIL_MSG="Pillow/watchdog installed but do not import"; return 1; }
+}
+
+stage_torrent() {
+	ensure_venv || return 1
+	# No explicit --platform: pip picks the wheel matching this macOS (the lock carries the 14_0 and 15_0 hashes)
+	pip_lock torrent || return 1
+	probe_torrent || { FAIL_CLASS=other; FAIL_MSG="libtorrent installed but does not import"; return 1; }
+}
+
+stage_7zz() {
+	local part="$RT/tmp/7zz.tar.xz.part" stage="$RT/tmp/7zz-stage" rc found
+	FAIL_HOST="www.7-zip.org"
+	fetch "$SEVENZIP_URL" "$part"
+	rc=$?
+	if [ "$rc" != 0 ]; then
+		FAIL_CLASS="$(curl_class "$rc")"
+		FAIL_MSG="download of 7-Zip failed (curl exit $rc)"
+		return 1
+	fi
+	verify_sha256 "$part" "$SEVENZIP_SHA256" || { FAIL_CLASS=other; FAIL_MSG="7-Zip download is corrupt (checksum mismatch)"; return 1; }
+	rm -rf "$stage"
+	mkdir -p "$stage"
+	tar -xJf "$part" -C "$stage" >>"$LOG" 2>&1 || { FAIL_CLASS=other; FAIL_MSG="could not unpack 7-Zip"; return 1; }
+	found="$(find "$stage" -name 7zz -type f | head -n 1)"
+	[ -n "$found" ] || { FAIL_CLASS=other; FAIL_MSG="7zz not found in the archive"; return 1; }
+	if ! { cp "$found" "$RT/bin/7zz.new" && chmod 755 "$RT/bin/7zz.new" && mv "$RT/bin/7zz.new" "$RT/bin/7zz"; }; then
+		FAIL_CLASS=other
+		FAIL_MSG="could not install 7zz"
+		return 1
+	fi
+	rm -rf "$stage" "$part"
+	smoke_bin "$RT/bin/7zz" i || { FAIL_CLASS=other; FAIL_MSG="7zz does not start. Try: xattr -dr com.apple.quarantine \"$RT\""; return 1; }
+}
+
+# run_stage <stage> <fatal 1|0> <label> <n>
+run_stage() {
+	local st="$1" fatal="$2" label="$3" n="$4" key now
+	need_stage "$st" || return 0
+	progress_start
+	log "stage $n/5: $label"
+	notify "$label ($n/5)"
+	FAIL_CLASS="" FAIL_HOST="" FAIL_MSG=""
+	key="$(key_"$st")"
+	if "stage_$st"; then
+		stamp "$st" "ok|$key"
+		log "stage $n/5: $label ok"
+		return 0
+	fi
+	log "stage $n/5: $label FAILED ($FAIL_CLASS): $FAIL_MSG"
+	if [ "$fatal" = 1 ]; then
+		if [ "$FAIL_CLASS" = offline ]; then
+			die "Internet is needed for RGSX's first-time setup. Could not reach ${FAIL_HOST:-the download server} ($label). Connect and launch RGSX again. Details: $LOG"
+		fi
+		die "RGSX setup failed at: $label. $FAIL_MSG. Details: $LOG"
+	fi
+	now="$(date +%s)"
+	if [ "$FAIL_CLASS" = nowheel ] && [ "$st" = torrent ]; then
+		stamp "$st" "unavailable|$key|macos$MACOS_MAJOR"
+		log "torrents disabled: no libtorrent wheel for macOS $MACOS_VERSION"
+	elif [ "$FAIL_CLASS" = offline ]; then
+		stamp "$st" "retry|$((now + 3600))|$key"
+		log "$label skipped while offline (could not reach ${FAIL_HOST:-server}); will retry in 1 hour"
+	else
+		stamp "$st" "retry|$((now + 86400))|$key"
+		log "$label unavailable, will retry in 24 hours"
+	fi
+	return 0
+}
+
+run_stage python 1 "Python runtime" 1
+run_stage core 1 "App libraries" 2
+run_stage optional 0 "Optional libraries" 3
+run_stage torrent 0 "Torrent support" 4
+run_stage 7zz 0 "7-Zip" 5
+
+if [ ! -x "$VENV/bin/python" ]; then
+	die "RGSX setup is incomplete (no Python environment). Details: $LOG"
+fi
+
+# --- launch ------------------------------------------------------------------------------------------------
+export RGSX_RUNTIME_DIR="$RT"
+export RGSX_SEVENZIP="$RT/bin/7zz"
+export PYTHONPYCACHEPREFIX="$RT/pycache"
+export PYTHONNOUSERSITE=1
+[ -n "${RGSX_LAUNCHER_PATH:-}" ] && export RGSX_LAUNCHER_PATH
+
+if [ "${RGSX_BOOTSTRAP_ONLY:-0}" = 1 ]; then
+	echo "OK python=$PY venv=$VENV 7zz=$RT/bin/7zz"
+	exit 0
+fi
+
+if [ "${RGSX_OPEN_WEB:-0}" = 1 ]; then
+	rm -f "$CFG/web_port.txt"
+	(
+		i=0
+		while [ "$i" -lt 30 ]; do
+			if [ -s "$CFG/web_port.txt" ]; then
+				open "http://localhost:$(cat "$CFG/web_port.txt")" >/dev/null 2>&1
+				exit 0
+			fi
+			i=$((i + 1))
+			sleep 1
+		done
+	) >/dev/null 2>&1 &
+fi
+
+log "starting app"
+cleanup
+trap - EXIT
+cd "$APP_DIR" || exit 1
+if [ "${RGSX_SELFTEST:-0}" = 1 ]; then
+	exec "$VENV/bin/python" "$HERE/selftest.py"
+fi
+exec "$VENV/bin/python" __main__.py ${APP_ARGS[@]+"${APP_ARGS[@]}"}

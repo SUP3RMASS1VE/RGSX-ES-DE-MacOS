@@ -1,0 +1,7 @@
+# Pinned downloads for the RGSX macOS runtime (sourced by macos/rgsx-macos). KEY=VALUE only.
+PBS_TAG=20261009
+PBS_URL=https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.12.15%2B20261009-aarch64-apple-darwin-install_only.tar.gz
+PBS_SHA256=83dcb04777c798bd95f3687acf9ae84b09860272ee6bdfb05be8bcf9447f75b8
+SEVENZIP_URL=https://www.7-zip.org/a/7z2604-mac.tar.xz
+SEVENZIP_SHA256=bee04358cbcbc7106273cee0e8d72916db2696c48067a3538c34d8cd6fd16578
+PROGRESS_MODE=both

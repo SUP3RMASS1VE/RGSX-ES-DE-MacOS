@@ -473,6 +473,52 @@ def _apply_joystick_controls(js, reason: str) -> None:
 # ===== GESTION DU SERVEUR WEB =====
 web_server_process = None
 
+def _pick_web_port(host="127.0.0.1", preferred=5000):
+    """macOS: first bindable port in preferred..preferred+10 on the server's own host (AirPlay Receiver owns 5000)."""
+    import socket as _socket
+    for candidate in range(preferred, preferred + 11):
+        probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        try:
+            probe.bind((host, candidate))
+            return candidate
+        except OSError:
+            continue
+        finally:
+            probe.close()
+    probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        probe.bind((host, 0))
+        return probe.getsockname()[1]
+    finally:
+        probe.close()
+def _log_roms_source():
+    """macOS: record where ROMS_FOLDER came from (config logs before logging is configured)."""
+    src = getattr(config, "ROMS_FOLDER_SOURCE", "n/a")
+    launcher = os.environ.get("RGSX_LAUNCHER_PATH", "")
+    logger.info(f"ROMS_FOLDER={config.ROMS_FOLDER} (source: {src}) launcher={launcher or '<unset>'}")
+    if launcher and src in ("home_default", "data_default"):
+        logger.warning(f"ROMs folder not derived from launcher {launcher} (expected <ROMs>/ports/RGSX/RGSX.sh)")
+def _maybe_show_roms_warning():
+    """macOS: one-time non-blocking dialog when launched from ES-DE but the ROMs folder could not be derived."""
+    try:
+        launcher = os.environ.get("RGSX_LAUNCHER_PATH", "")
+        if not launcher or getattr(config, "ROMS_FOLDER_SOURCE", "") not in ("home_default", "data_default"):
+            return
+        marker = os.path.join(config.CONFIG_FOLDER, "roms_warning_shown")
+        if os.path.isfile(marker):
+            with open(marker, "r", encoding="utf-8") as fh:
+                if fh.read().strip() == launcher:
+                    return
+        text = (f"RGSX could not find your ES-DE ROMs folder; downloads go to {config.ROMS_FOLDER}. "
+                "Keep RGSX inside <ROMs>/ports/ or set roms_folder in rgsx_settings.json.").replace('"', "'")
+        subprocess.Popen(["/usr/bin/osascript", "-e",
+                          f'display dialog "{text}" buttons {{"OK"}} default button 1 with icon caution giving up after 60'],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.makedirs(config.CONFIG_FOLDER, exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write(launcher)
+    except Exception as exc:
+        logger.debug(f"ROMs warning dialog skipped: {exc}")
 def start_web_server():
     """Démarre le serveur web en arrière-plan dans un processus séparé."""
     global web_server_process
@@ -508,9 +554,21 @@ def start_web_server():
                 )
         else:
             logger.info(f"🚀 Lancement du serveur web (mode Linux/Unix)...")
+            web_server_cmd = [exe, web_server_script]
+            if config.OPERATING_SYSTEM == "Darwin":
+                # macOS: local only by default (the web UI has no authentication); RGSX_WEB_HOST overrides
+                web_server_cmd += ["--host", os.environ.get("RGSX_WEB_HOST", "127.0.0.1")]
+                _web_host = os.environ.get("RGSX_WEB_HOST", "127.0.0.1")
+                _web_port = _pick_web_port(_web_host if _web_host not in ("0.0.0.0", "") else "127.0.0.1")
+                web_server_cmd += ["--port", str(_web_port)]
+                try:
+                    with open(os.path.join(config.CONFIG_FOLDER, "web_port.txt"), "w", encoding="utf-8") as _pf:
+                        _pf.write(str(_web_port))
+                except OSError:
+                    pass
             with open(web_server_log, 'w', encoding='utf-8') as log_file:
                 web_server_process = subprocess.Popen(
-                    [exe, web_server_script],
+                    web_server_cmd,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                     cwd=config.APP_FOLDER
@@ -518,6 +576,8 @@ def start_web_server():
         
         logger.info(f"✅ Serveur web démarré (PID: {web_server_process.pid})")
         logger.info(f"🌐 Serveur accessible sur http://localhost:5000")
+        if config.OPERATING_SYSTEM == "Darwin":
+            logger.info(f"🌐 Web UI port on macOS: http://localhost:{_web_port}")
         
         # Attendre un peu pour voir si le processus crash immédiatement
         import time
@@ -609,6 +669,9 @@ async def main():
     
     # Démarrer le serveur web en arrière-plan
     start_web_server()
+    if config.OPERATING_SYSTEM == "Darwin":
+        _log_roms_source()
+        _maybe_show_roms_warning()
 
     # Reprendre les téléchargements interrompus (statut "Téléchargement"/"Downloading")
     # Ces entrées proviennent d'une session précédente fermée proprement sans annulation.
@@ -1863,6 +1926,8 @@ async def main():
                 print(f"Arret Python ko")
         except FileNotFoundError:
             logger.debug("taskkill introuvable, saut de l'étape d'arrêt d'emulatorLauncher.exe")
+    elif config.OPERATING_SYSTEM == "Darwin":
+        logger.debug("Mise à jour liste des jeux EmulationStation ignorée sur macOS")
     else:
         # Exécuter la mise à jour de la liste des jeux d'EmulationStation UNIQUEMENT sur Batocera
         resp = requests.get("http://127.0.0.1:1234/reloadgames", timeout=2)

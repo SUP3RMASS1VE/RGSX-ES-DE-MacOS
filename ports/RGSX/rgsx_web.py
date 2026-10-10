@@ -20,6 +20,7 @@ import mimetypes
 from datetime import datetime, timezone
 from email.utils import formatdate, parsedate_to_datetime
 import config
+from esde_folders import map_rom_folder
 from history import load_history, save_history
 from utils import load_sources, load_games, extract_data, get_clean_display_name, parse_torrent_download_url, request_torrent_manifest_refresh, _resolve_platform_image_path
 from network import download_rom, download_from_1fichier
@@ -606,7 +607,7 @@ class RGSXHandler(BaseHTTPRequestHandler):
                         folder = platform.get('folder', '')
                         # Garder BIOS même sans dossier
                         if platform_name and folder and platform_name not in ["- BIOS by TMCTV -", "- BIOS"]:
-                            expected_dir = os.path.join(config.ROMS_FOLDER, folder)
+                            expected_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
                             if not os.path.isdir(expected_dir):
                                 hidden_platforms.add(platform_name)
 
@@ -664,7 +665,7 @@ class RGSXHandler(BaseHTTPRequestHandler):
                             folder = platform.get('folder', '')
                             # Garder BIOS même sans dossier
                             if platform_name and folder and platform_name not in ["- BIOS by TMCTV -", "- BIOS"]:
-                                expected_dir = os.path.join(config.ROMS_FOLDER, folder)
+                                expected_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
                                 if not os.path.isdir(expected_dir):
                                     hidden_platforms.add(platform_name)
                     
@@ -2075,6 +2076,8 @@ DO NOT share this file publicly as it may contain sensitive information.
 </body>
 </html>
         '''
+        if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin':
+            html = html.replace('</head>', '<style>[onclick="openQbittorrentWebUi()"]{display:none !important}</style></head>', 1)
         return (html
                 .replace('__CSS_VERSION__', css_version)
                 .replace('__JS_VERSION__', js_version)
@@ -2119,6 +2122,8 @@ def run_server(host='0.0.0.0', port=5000):
                         logger.warning(f"Impossible de tuer le processus {pid}: {e}")
             except Exception as e:
                 logger.debug(f"Windows port release check failed: {e}")
+        elif getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin':
+            pass  # never kill whatever owns the port on macOS (AirPlay Receiver)
         else:
             # Unix-like: utiliser lsof + kill
             result = subprocess.run(['lsof', '-ti', f':{port}'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=2)

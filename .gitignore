@@ -24,3 +24,9 @@ data/
 docker-compose.test.yml
 config/
 pyrightconfig.json
+
+.venv-macos-port/
+.agents/
+dist/
+.DS_Store
+__pycache__/

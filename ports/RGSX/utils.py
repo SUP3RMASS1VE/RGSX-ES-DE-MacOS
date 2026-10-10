@@ -12,6 +12,7 @@ import subprocess
 import urllib.parse
 import config
 from config import HEADLESS, Game
+from esde_folders import map_rom_folder
 try:
     if not HEADLESS:
         import pygame  # type: ignore
@@ -578,14 +579,23 @@ def _resolve_7z_command():
     if config.OPERATING_SYSTEM == "Windows":
         return config.SEVEN_Z_EXE
 
+    if config.OPERATING_SYSTEM == "Darwin" and os.path.isfile(config.SEVEN_Z_DARWIN) and os.access(config.SEVEN_Z_DARWIN, os.X_OK):
+        return config.SEVEN_Z_DARWIN  # 7zz installed by macos/rgsx-macos
     candidates = []
-    bundled = getattr(config, 'SEVEN_Z_LINUX', '')
+    is_mac = config.OPERATING_SYSTEM == "Darwin"
+    # macOS: the bundled 7zz is a Linux ELF binary, use Homebrew/PATH instead
+    bundled = '' if is_mac else getattr(config, 'SEVEN_Z_LINUX', '')
     if bundled:
         candidates.append(bundled)
     for binary_name in ("7zz", "7z", "7zr"):
         resolved = shutil.which(binary_name)
         if resolved and resolved not in candidates:
             candidates.append(resolved)
+    if is_mac:
+        # Apps launched from Finder get a minimal PATH: try Homebrew locations explicitly
+        for fallback in ("/opt/homebrew/bin/7zz", "/usr/local/bin/7zz", "/opt/homebrew/bin/7z", "/usr/local/bin/7z"):
+            if fallback not in candidates:
+                candidates.append(fallback)
 
     last_error = None
     for candidate in candidates:
@@ -2239,6 +2249,9 @@ def check_extension_before_download(url, platform, game_name):
         # Déterminer si le système (dossier) est connu dans extensions_data
         dest_folder_name = _get_dest_folder_name(platform)
         system_known = any(s.get("folder") == dest_folder_name for s in extensions_data)
+        if config.OPERATING_SYSTEM == "Darwin" and not system_known:
+            # macOS: extensions.json keys use the RGSX folder name, not the ES-DE-mapped one
+            system_known = any(s.get("folder") == _get_rgsx_folder_name(platform) for s in extensions_data)
 
         # Traitement spécifique BIOS: forcer extraction des archives même si le système n'est pas connu
         try:
@@ -2300,7 +2313,7 @@ def is_extension_supported(filename, platform_key, extensions_data):
     for platform_dict in config.platform_dicts:
         # Nouveau schéma: platform_name
         if platform_dict.get("platform_name") == platform_key:
-            dest_dir = os.path.join(config.ROMS_FOLDER, platform_dict.get("folder"))
+            dest_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(platform_dict.get("folder")))
             break
 
     if not dest_dir:
@@ -2316,6 +2329,12 @@ def is_extension_supported(filename, platform_key, extensions_data):
             logger.debug(f"Système trouvé: {dest_folder_name}, extensions: {system['extensions']}, résultat: {result}")
             return result
     
+    if config.OPERATING_SYSTEM == "Darwin":
+        # macOS: the folder may be ES-DE-mapped (gamecube -> gc) while extensions.json uses the RGSX name
+        _raw_folder = _get_rgsx_folder_name(platform_key)
+        for system in extensions_data:
+            if system["folder"] == _raw_folder:
+                return extension in system["extensions"]
     logger.warning(f"Aucun système trouvé pour le dossier {dest_dir}")
     return False
 
@@ -2327,7 +2346,7 @@ def _get_dest_folder_name(platform_key: str) -> str:
         if platform_dict.get("platform_name") == platform_key:
             folder = platform_dict.get("folder")
             if folder:
-                dest_dir = os.path.join(config.ROMS_FOLDER, folder)
+                dest_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
             break
     if not dest_dir:
         dest_dir = os.path.join(os.path.dirname(os.path.dirname(config.APP_FOLDER)), platform_key)
@@ -2336,6 +2355,12 @@ def _get_dest_folder_name(platform_key: str) -> str:
 
 
 
+def _get_rgsx_folder_name(platform_key: str) -> str:
+    """Nom du dossier RGSX (non mappé ES-DE) pour une plateforme; utilisé sur macOS."""
+    for platform_dict in config.platform_dicts:
+        if platform_dict.get("platform_name") == platform_key:
+            return platform_dict.get("folder") or ""
+    return ""
 # Fonction pour charger sources.json
 def load_sources(allow_torrent_manifest_fetch: bool | None = None):
     try:
@@ -2457,7 +2482,7 @@ def load_sources(allow_torrent_manifest_fetch: bool | None = None):
                 bios_name = name.strip()
                 if not folder or bios_name == "- BIOS by TMCTV -" or bios_name == "- BIOS":
                     continue
-                expected_dir = os.path.join(config.ROMS_FOLDER, folder)
+                expected_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
                 if not os.path.isdir(expected_dir):
                     unsupported.append(name)
             if show_unsupported:
@@ -3086,6 +3111,10 @@ def extract_rar(rar_path, dest_dir, url):
     """Extrait le contenu du fichier RAR dans le dossier cible."""
     try:
         os.makedirs(dest_dir, exist_ok=True)
+
+        # macOS: no unrar formula in Homebrew, 7-Zip reads RAR natively
+        if config.OPERATING_SYSTEM == "Darwin" and shutil.which("unrar") is None:
+            return extract_7z(rar_path, dest_dir, url)
         
         # Configuration commande unrar selon l'OS
         if config.OPERATING_SYSTEM == "Windows":
@@ -3209,7 +3238,9 @@ def extract_7z(archive_path, dest_dir, url):
         seven_z_cmd = _resolve_7z_command()
 
         if not seven_z_cmd or (os.path.isabs(seven_z_cmd) and not os.path.exists(seven_z_cmd)):
-            return False, "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs"
+            if config.OPERATING_SYSTEM == "Darwin":
+                return False, "7-Zip is missing: relaunch RGSX with internet to repair it (see bootstrap.log)"
+            return False, ("7zz not found - run: brew install sevenzip" if config.OPERATING_SYSTEM == "Darwin" else "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs")
 
         # Capture état initial
         before_dirs = _capture_directories_before_extraction(dest_dir)
@@ -3473,6 +3504,9 @@ def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archi
             logger.info("Décryptage de l'ISO...")
             decrypted_iso_path = iso_path.replace('.iso', '_decrypted.iso')
             
+            if config.OPERATING_SYSTEM == "Darwin":
+                return False, "PS3 Redump decryption is not supported on macOS (no native ps3dec)"
+
             # Vérifier et corriger les permissions de ps3dec sur Linux
             if config.OPERATING_SYSTEM != "Windows":
                 ps3dec_tool = config.PS3DEC_LINUX
@@ -3560,7 +3594,9 @@ def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archi
                 logger.info(f"ISO extrait dans: {game_folder_path}")
                 
             except FileNotFoundError:
-                return False, "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs"
+                if config.OPERATING_SYSTEM == "Darwin":
+                    return False, "7-Zip is missing: relaunch RGSX with internet to repair it (see bootstrap.log)"
+                return False, ("7zz not found - run: brew install sevenzip" if config.OPERATING_SYSTEM == "Darwin" else "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs")
             except Exception as e:
                 return False, f"Erreur lors de l'extraction ISO: {str(e)}"
             
@@ -3911,6 +3947,14 @@ def handle_xbox(dest_dir, iso_files, url=None):
         # Sur Windows; telecharger le fichier exe
         XISO_EXE = config.XISO_EXE
         extract_xiso_cmd = [XISO_EXE, "-r"]  # Liste avec 2 éléments
+
+    elif config.OPERATING_SYSTEM == "Darwin":
+        # macOS : extract-xiso depuis le PATH (pas de binaire fourni)
+        xiso_path = shutil.which("extract-xiso")
+        if not xiso_path:
+            logger.warning("extract-xiso introuvable dans le PATH (macOS)")
+            return False, "extract-xiso not found (build it from github.com/XboxDev/extract-xiso and put it on PATH)"
+        extract_xiso_cmd = [xiso_path, "-r"]
 
     else:
         # Linux/Batocera : télécharger le fichier xdvdfs  
@@ -4456,7 +4500,7 @@ def resolve_platform_folder(platform):
             if platform_dict.get("platform_name") == platform:
                 folder = platform_dict.get("folder") or platform_dict.get("dossier")
                 if folder:
-                    return folder
+                    return map_rom_folder(folder)
     except Exception as e:
         logger.debug(f"resolve_platform_folder: erreur lecture config.platform_dicts: {e}")
 
@@ -4470,12 +4514,12 @@ def resolve_platform_folder(platform):
                     if isinstance(entry, dict) and entry.get("platform_name") == platform:
                         folder = entry.get("folder") or entry.get("dossier")
                         if folder:
-                            return folder
+                            return map_rom_folder(folder)
     except Exception as e:
         logger.debug(f"resolve_platform_folder: erreur lecture {getattr(config, 'SOURCES_FILE', '')}: {e}")
 
     logger.warning(f"resolve_platform_folder: aucun dossier trouvé pour '{platform}', repli sur normalize_platform_name")
-    return normalize_platform_name(platform)
+    return map_rom_folder(normalize_platform_name(platform))
 
 
 def find_matching_files(base_path, filename):

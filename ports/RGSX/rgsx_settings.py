@@ -2,6 +2,7 @@
 import json
 import os
 import logging
+import platform
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -10,6 +11,9 @@ import requests
 import config
 
 logger = logging.getLogger(__name__)
+
+# macOS: windowed by default, all platforms listed (no EmulationStation to define supported systems)
+_IS_MACOS = platform.system() == "Darwin"
 
 
 
@@ -67,7 +71,7 @@ def load_rgsx_settings():
             "grid": "3x4",
             "font_family": "pixel",
             "monitor": 0,
-            "fullscreen": True,
+            "fullscreen": not _IS_MACOS,
             "light_mode": False
         },
         "symlink": {
@@ -78,8 +82,8 @@ def load_rgsx_settings():
             "mode": "rgsx",       
             "custom_url": ""      
     },
-    "show_unsupported_platforms": False,
-    "allow_unknown_extensions": False,
+    "show_unsupported_platforms": _IS_MACOS,
+    "allow_unknown_extensions": _IS_MACOS,
     "nintendo_layout": False,
     "roms_folder": "",
     "web_service_at_boot": False,
@@ -362,7 +366,7 @@ def get_show_unsupported_platforms(settings=None):
     """Retourne True si l'affichage des systèmes non supportés est activé."""
     if settings is None:
         settings = load_rgsx_settings()
-    return bool(settings.get("show_unsupported_platforms", False))
+    return bool(settings.get("show_unsupported_platforms", _IS_MACOS))
 
 
 def set_show_unsupported_platforms(enabled: bool):
@@ -378,7 +382,7 @@ def get_allow_unknown_extensions(settings=None) -> bool:
     """Retourne True si le téléchargement des extensions inconnues est autorisé."""
     if settings is None:
         settings = load_rgsx_settings()
-    return bool(settings.get("allow_unknown_extensions", False))
+    return bool(settings.get("allow_unknown_extensions", _IS_MACOS))
 
 
 def set_allow_unknown_extensions(enabled: bool) -> bool:
@@ -465,7 +469,7 @@ def get_display_fullscreen(settings=None):
     """Retourne True si le mode plein écran est activé."""
     if settings is None:
         settings = load_rgsx_settings()
-    return settings.get("display", {}).get("fullscreen", True)
+    return settings.get("display", {}).get("fullscreen", not _IS_MACOS)
 
 def set_display_fullscreen(fullscreen: bool):
     """Définit et sauvegarde le mode plein écran."""

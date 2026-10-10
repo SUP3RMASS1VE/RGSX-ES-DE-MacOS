@@ -9,6 +9,7 @@ import shutil
 from collections import deque
 import config
 from config import HEADLESS
+from esde_folders import map_rom_folder
 try:
     if not HEADLESS:
         import pygame  # type: ignore
@@ -50,6 +51,13 @@ class InsufficientDiskSpaceError(RuntimeError):
 
 
 def _is_arm_device() -> bool:
+    if getattr(config, "OPERATING_SYSTEM", "") == "Darwin":
+        try:
+            import qbittorrent_backend as _qb  # lazy: avoids import cycles at module load
+            if _qb.is_available():
+                return False  # libtorrent backend usable: this Mac is not "torrent-blocked ARM"
+        except Exception:
+            pass  # fall through to the original detection
     architecture = str(getattr(config, "SYSTEM_INFO", {}).get("architecture") or "").lower().strip()
     if not architecture:
         try:
@@ -214,6 +222,8 @@ def _postprocess_downloaded_file(dest_path: str, dest_dir: str, url: str, game_n
 
 def _should_prefer_qbittorrent_backend() -> bool:
     """Indique si le backend qBittorrent doit être essayé en priorité pour un torrent."""
+    if config.OPERATING_SYSTEM == "Darwin":
+        return qbittorrent_backend.is_available()
     if config.OPERATING_SYSTEM not in ("Windows", "Linux"):
         return False
     return qbittorrent_backend.is_available()
@@ -510,6 +520,15 @@ def _download_torrent_with_aria2(
     # en place avant que l'utilisateur ne mette en pause depuis l'UI.
     pause_ev = pause_events.setdefault(task_id, threading.Event())
 
+    if config.OPERATING_SYSTEM == "Darwin" and _should_prefer_qbittorrent_backend():
+        logger.info("Téléchargement torrent via libtorrent (macOS)")
+        try:
+            return qbittorrent_backend.download_torrent_via_qbittorrent(
+                torrent_meta, dest_dir, dest_path, task_id, cancel_ev, progress_queue, original_history_url,
+                pause_ev=pause_ev,
+            )
+        except qbittorrent_backend.BackendUnavailableError as exc:
+            raise qbittorrent_backend.BackendUnavailableError(str(exc)) from exc
     if _should_prefer_qbittorrent_backend():
         platform_label = "Windows" if config.OPERATING_SYSTEM == "Windows" else "Linux/Batocera"
         logger.info("Téléchargement torrent via qBittorrent sur %s", platform_label)
@@ -1116,6 +1135,11 @@ def _resolve_lolroms_external_command() -> tuple[str | None, str | None]:
             if resolved:
                 return 'curl', resolved
         return None, None
+
+    if config.OPERATING_SYSTEM == 'Darwin':
+        # macOS ships curl but not wget
+        resolved = shutil.which('curl')
+        return ('curl', resolved) if resolved else (None, None)
 
     for candidate in ('wget',):
         resolved = shutil.which(candidate)
@@ -3097,12 +3121,12 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
                 for platform_dict in config.platform_dicts:
                     if platform_dict.get("platform_name") == platform:
                         # Priorité: clé 'folder'; fallback legacy: 'dossier'; sinon normalisation du nom de plateforme
-                        platform_folder = platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform)
+                        platform_folder = map_rom_folder(platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform))
                         dest_dir = apply_symlink_path(config.ROMS_FOLDER, platform_folder)
                         logger.debug(f"Répertoire de destination trouvé pour {platform}: {dest_dir}")
                         break
                 if not dest_dir:
-                    platform_folder = resolve_platform_folder(platform)
+                    platform_folder = map_rom_folder(resolve_platform_folder(platform))
                     dest_dir = apply_symlink_path(config.ROMS_FOLDER, platform_folder)
 
             # Spécifique: si le système est "BIOS" on force le dossier BIOS
@@ -4292,12 +4316,12 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
                 platform_folder = None
                 for platform_dict in config.platform_dicts:
                     if platform_dict.get("platform_name") == platform:
-                        platform_folder = platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform)
+                        platform_folder = map_rom_folder(platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform))
                         dest_dir = apply_symlink_path(config.ROMS_FOLDER, platform_folder)
                         break
                 if not dest_dir:
                     logger.warning(f"Aucun dossier 'folder'/'dossier' trouvé pour la plateforme {platform}")
-                    platform_folder = resolve_platform_folder(platform)
+                    platform_folder = map_rom_folder(resolve_platform_folder(platform))
                     dest_dir = apply_symlink_path(config.ROMS_FOLDER, platform_folder)
             logger.debug(f"Répertoire destination déterminé: {dest_dir}")
 

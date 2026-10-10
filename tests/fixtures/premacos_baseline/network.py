@@ -1,0 +1,5490 @@
+import requests  # type: ignore
+import subprocess
+import os
+import sys
+import threading
+import zipfile
+import asyncio
+import shutil
+from collections import deque
+import config
+from config import HEADLESS
+from esde_folders import map_rom_folder
+try:
+    if not HEADLESS:
+        import pygame  # type: ignore
+    else:
+        pygame = None  # type: ignore
+except Exception:
+    pygame = None  # type: ignore
+from config import OTA_VERSION_ENDPOINT,APP_FOLDER, UPDATE_FOLDER, OTA_UPDATE_ZIP, OTA_UPDATE_WINDOWS_ZIP
+from utils import sanitize_filename, extract_zip, extract_rar, extract_7z, handle_ps3, load_api_key_1fichier, load_api_key_alldebrid, normalize_platform_name, resolve_platform_folder, load_api_keys, load_archive_org_cookie, get_clean_display_name, parse_torrent_download_url, load_games, get_disk_usage
+from history import save_history, check_history_write_access, get_history_write_status
+from display import show_toast
+import qbittorrent_backend
+import logging
+import datetime
+from datetime import datetime
+from history import load_history
+
+import queue
+import time
+import os
+import json
+from pathlib import Path
+from language import _  # Import de la fonction de traduction
+import re
+import html as html_module
+from urllib.parse import urljoin, unquote
+import urllib.parse
+import tempfile
+import unicodedata
+import socket
+
+
+
+logger = logging.getLogger(__name__)
+
+
+class InsufficientDiskSpaceError(RuntimeError):
+    """Raised when there is not enough free disk space for the expected download size."""
+
+
+def _is_arm_device() -> bool:
+    architecture = str(getattr(config, "SYSTEM_INFO", {}).get("architecture") or "").lower().strip()
+    if not architecture:
+        try:
+            import platform as _platform
+            architecture = (_platform.machine() or "").lower().strip()
+        except Exception:
+            architecture = ""
+    return any(token in architecture for token in ("arm", "aarch64", "arm64", "armv7", "armv8"))
+
+
+
+def _warn_history_write_issue(context=""):
+    status = get_history_write_status() or {}
+    message = status.get("message") or "Erreur ecriture history.json. Le telechargement continue sans historique temps reel."
+    if context:
+        logger.error(f"[{context}] {message}")
+    else:
+        logger.error(message)
+
+    try:
+        config.history_write_ok = False
+        config.history_write_error = message
+    except Exception:
+        pass
+
+    now = time.time()
+    last_toast = float(getattr(config, "history_write_last_toast_at", 0.0) or 0.0)
+    if now - last_toast >= 8.0:
+        try:
+            show_toast(message, duration=5000)
+        except Exception:
+            pass
+        try:
+            config.history_write_last_toast_at = now
+        except Exception:
+            pass
+
+
+def _save_history_with_feedback(context=""):
+    saved = save_history(config.history)
+    if not saved:
+        _warn_history_write_issue(context)
+    return saved
+
+
+def _check_history_access_before_download(context="download"):
+    ok, _ = check_history_write_access(force=True)
+    if not ok:
+        _warn_history_write_issue(f"{context}:precheck")
+    return ok
+
+
+def _update_history_local_target(url: str, task_id: str, dest_path: str) -> None:
+    if not isinstance(config.history, list) or not dest_path:
+        return
+
+    absolute_path = os.path.abspath(dest_path)
+    basename = os.path.basename(absolute_path)
+    normalized_task_id = str(task_id or "")
+
+    for entry in config.history:
+        if entry.get("url") != url:
+            continue
+        entry_task_id = str(entry.get("task_id") or "")
+        if normalized_task_id and entry_task_id and entry_task_id != normalized_task_id:
+            continue
+
+        entry["local_path"] = absolute_path
+        entry["local_filename"] = basename
+
+        moved_paths = entry.get("moved_paths")
+        if not isinstance(moved_paths, list):
+            moved_paths = []
+        if absolute_path not in moved_paths:
+            moved_paths.insert(0, absolute_path)
+        entry["moved_paths"] = moved_paths
+        _save_history_with_feedback("download:local_target")
+        break
+
+
+def _is_ps3_redump_target(platform_folder, platform) -> bool:
+    try:
+        ps3_platforms = {"ps3", "PlayStation 3"}
+        return platform_folder == "ps3" or platform in ps3_platforms
+    except Exception:
+        return False
+
+
+def _postprocess_downloaded_file(dest_path: str, dest_dir: str, url: str, game_name: str, is_ps3_target: bool):
+    extension = os.path.splitext(dest_path)[1].lower()
+    is_vimm_source = 'vimm.net' in str(url or '').lower()
+
+    def _append_ps3_suffix_for_vimm_folder() -> tuple[bool, str]:
+        archive_base = os.path.splitext(os.path.basename(dest_path))[0].strip()
+        if not archive_base:
+            return False, ""
+
+        direct_candidate = os.path.join(dest_dir, archive_base)
+        source_dir = ""
+        if os.path.isdir(direct_candidate):
+            source_dir = direct_candidate
+        else:
+            try:
+                for entry in os.listdir(dest_dir):
+                    candidate = os.path.join(dest_dir, entry)
+                    if os.path.isdir(candidate) and entry.lower() == archive_base.lower():
+                        source_dir = candidate
+                        break
+            except Exception:
+                source_dir = ""
+
+        if not source_dir:
+            return False, ""
+
+        if source_dir.lower().endswith('.ps3'):
+            return False, source_dir
+
+        target_dir = source_dir + '.ps3'
+        if os.path.exists(target_dir):
+            logger.warning(f"Suffixe .ps3 non appliqué: dossier cible déjà existant ({target_dir})")
+            return False, target_dir
+
+        os.replace(source_dir, target_dir)
+        return True, target_dir
+
+    if extension == ".zip":
+        success, msg = extract_zip(dest_path, dest_dir, url)
+    elif extension == ".rar":
+        success, msg = extract_rar(dest_path, dest_dir, url)
+    elif extension == ".7z":
+        success, msg = extract_7z(dest_path, dest_dir, url)
+    elif extension == ".iso" and is_ps3_target:
+        logger.debug(f"Traitement PS3 direct ISO déclenché pour {dest_path}")
+        success, msg = handle_ps3(
+            dest_dir=dest_dir,
+            new_dirs=[],
+            extracted_basename=os.path.splitext(os.path.basename(dest_path))[0],
+            url=url,
+            archive_name=os.path.basename(dest_path),
+        )
+    else:
+        logger.warning(f"Type d'archive non supporté: {extension}")
+        return True, _("network_download_ok").format(game_name)
+
+    if success:
+        if is_ps3_target and is_vimm_source and extension in {'.zip', '.rar', '.7z'}:
+            try:
+                renamed, renamed_path = _append_ps3_suffix_for_vimm_folder()
+                if renamed:
+                    logger.info(f"PS3 Vimm: dossier extrait renommé avec suffixe .ps3 -> {renamed_path}")
+                else:
+                    logger.debug("PS3 Vimm: aucun renommage .ps3 nécessaire (dossier introuvable, déjà suffixé, ou cible existante)")
+            except Exception as rename_exc:
+                logger.warning(f"PS3 Vimm: impossible d'ajouter le suffixe .ps3: {rename_exc}")
+
+        logger.debug(f"Post-traitement réussi pour {dest_path}: {msg}")
+        return True, _("network_download_extract_ok").format(game_name)
+
+    logger.error(f"Erreur post-traitement pour {dest_path}: {msg}")
+    return False, _("network_extraction_failed").format(msg)
+
+
+def _should_prefer_qbittorrent_backend() -> bool:
+    """Indique si le backend qBittorrent doit être essayé en priorité pour un torrent."""
+    if config.OPERATING_SYSTEM not in ("Windows", "Linux"):
+        return False
+    return qbittorrent_backend.is_available()
+
+
+def _download_torrent_manifest_to_file(source_url: str) -> str:
+    headers = _build_browser_download_headers(referer="https://archive.org/", accept="*/*")
+    response = requests.get(source_url, timeout=30, headers=headers)
+    response.raise_for_status()
+    fd, temp_path = tempfile.mkstemp(prefix="rgsx_torrent_", suffix=".torrent")
+    with os.fdopen(fd, 'wb') as handle:
+        handle.write(response.content)
+    return temp_path
+
+
+def _find_torrent_downloaded_file(download_root: str, relative_path: str, fallback_name: str) -> str | None:
+    normalized_parts = [p for p in relative_path.replace('\\', '/').split('/') if p not in ('', '.')]
+    expected = os.path.join(download_root, *normalized_parts) if normalized_parts else os.path.join(download_root, fallback_name)
+    if os.path.exists(expected):
+        return expected
+
+    # Recherche stricte sur le nom exact (avec extension)
+    exact_filename = os.path.basename(relative_path) or fallback_name
+    for current_root, _, files in os.walk(download_root):
+        for file_name in files:
+            if file_name == exact_filename:
+                return os.path.join(current_root, file_name)
+    return None
+
+
+def _strip_ansi_escape_codes(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r'\x1B\[[0-?]*[ -/]*[@-~]', '', text)
+
+
+def _reserve_ephemeral_tcp_port() -> int:
+    """Reserve and return a free local TCP port number for aria2 listen-port."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("", 0))
+        return int(sock.getsockname()[1])
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# UPnP IGD – implémentation pure stdlib (socket + urllib + xml.etree)
+# Compatible Windows, Linux, Batocera – aucun module tiers requis.
+# ---------------------------------------------------------------------------
+
+def _get_local_ip_for_route(dest_ip: str = "8.8.8.8", dest_port: int = 80) -> str | None:
+    """Détermine l'IP locale utilisée pour joindre `dest_ip` (sans envoyer de données),
+    afin de forcer la découverte UPnP sur la bonne interface réseau (utile quand
+    plusieurs adaptateurs sont actifs : VPN, Docker/Hyper-V, VMware, etc., qui font
+    parfois échouer la sélection d'interface multicast par défaut sur Windows)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((dest_ip, dest_port))
+        return s.getsockname()[0]
+    except Exception:
+        return None
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _upnp_discover_igd(timeout: float = 3.0) -> tuple[str, str] | None:
+    """
+    Découverte SSDP de l'IGD (Internet Gateway Device) sur le réseau local.
+    Retourne (location_url, local_ip) ou None si aucun dispositif trouvé.
+    """
+    SSDP_ADDR = "239.255.255.250"
+    SSDP_PORT = 1900
+    SSDP_ST   = "urn:schemas-upnp-org:device:InternetGatewayDevice:1"
+    msg = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
+        "MAN: \"ssdp:discover\"\r\n"
+        "MX: 2\r\n"
+        f"ST: {SSDP_ST}\r\n"
+        "\r\n"
+    ).encode()
+
+    # Sur Windows, avec plusieurs adaptateurs réseau actifs (VPN, Docker/Hyper-V,
+    # VMware, etc.), le système peut envoyer le paquet multicast sur la mauvaise
+    # interface, ce qui fait que la box ne le reçoit jamais et qu'aucune réponse
+    # ne revient. On détermine explicitement l'IP locale utilisée pour joindre
+    # Internet (donc la vraie interface réseau) et on force la socket à l'utiliser
+    # via bind() + IP_MULTICAST_IF.
+    preferred_local_ip = _get_local_ip_for_route()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if preferred_local_ip:
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(preferred_local_ip))
+                sock.bind((preferred_local_ip, 0))
+                logger.debug(f"UPnP: interface locale forcée pour la découverte SSDP: {preferred_local_ip}")
+            except Exception as e:
+                logger.debug(f"UPnP: impossible de forcer l'interface locale {preferred_local_ip}: {e}")
+        sock.settimeout(timeout)
+
+        deadline = time.time() + timeout
+        # Renvoyer la requête M-SEARCH une seconde fois après un court délai :
+        # les paquets UDP/multicast peuvent se perdre, un seul essai n'est pas fiable.
+        sock.sendto(msg, (SSDP_ADDR, SSDP_PORT))
+        resent = False
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            if not resent and remaining < timeout - 0.5:
+                try:
+                    sock.sendto(msg, (SSDP_ADDR, SSDP_PORT))
+                except Exception:
+                    pass
+                resent = True
+            sock.settimeout(max(0.1, remaining))
+            try:
+                data, addr = sock.recvfrom(4096)
+            except OSError:
+                break
+            text = data.decode(errors="replace")
+            logger.debug(f"UPnP: réponse SSDP reçue de {addr[0]}")
+            for line in text.splitlines():
+                if line.upper().startswith("LOCATION:"):
+                    location = line.split(":", 1)[1].strip()
+                    local_ip = preferred_local_ip or addr[0]
+                    if not preferred_local_ip:
+                        # addr[0] est l'IP de la box; on veut notre propre IP locale.
+                        # On la déduit en ouvrant une socket UDP vers la box.
+                        deduced = _get_local_ip_for_route(addr[0], 1900)
+                        if deduced:
+                            local_ip = deduced
+                    return location, local_ip
+    finally:
+        sock.close()
+    logger.debug("UPnP: aucune réponse SSDP reçue (vérifier pare-feu Windows / bonne interface réseau)")
+    return None
+
+
+def _upnp_get_control_url(location: str) -> str | None:
+    """
+    Récupère l'URL de contrôle WANIPConnection (ou WANPPPConnection) depuis
+    le XML de description de l'IGD.
+    """
+    import xml.etree.ElementTree as _ET
+    import urllib.request as _req
+
+    try:
+        with _req.urlopen(location, timeout=5) as resp:
+            xml_data = resp.read()
+    except Exception as e:
+        logger.debug("UPnP: impossible de récupérer la description IGD: %s", e)
+        return None
+
+    try:
+        root = _ET.fromstring(xml_data)
+    except Exception as e:
+        logger.debug("UPnP: XML IGD invalide: %s", e)
+        return None
+
+    # Supprimer les namespaces pour simplifier la recherche
+    for el in root.iter():
+        if "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+
+    base = location.rsplit("/", 1)[0]
+    for service in root.iter("service"):
+        st = (service.findtext("serviceType") or "").lower()
+        if "wanipconnection" in st or "wanpppconnection" in st:
+            ctrl = service.findtext("controlURL") or ""
+            if ctrl.startswith("/"):
+                from urllib.parse import urlparse as _up
+                p = _up(location)
+                return f"{p.scheme}://{p.netloc}{ctrl}"
+            return f"{base}/{ctrl.lstrip('/')}"
+    return None
+
+
+def _upnp_soap(control_url: str, service_type: str, action: str, args: dict) -> bool:
+    """Envoie une requête SOAP UPnP. Retourne True si succès (HTTP 200)."""
+    import urllib.request as _req
+
+    args_xml = "".join(f"<{k}>{v}</{k}>" for k, v in args.items())
+    body = (
+        '<?xml version="1.0"?>'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+        '<s:Body>'
+        f'<u:{action} xmlns:u="{service_type}">'
+        f'{args_xml}'
+        f'</u:{action}>'
+        '</s:Body>'
+        '</s:Envelope>'
+    ).encode()
+    headers = {
+        "Content-Type": 'text/xml; charset="utf-8"',
+        "SOAPAction": f'"{service_type}#{action}"',
+        "Content-Length": str(len(body)),
+    }
+    try:
+        req = _req.Request(control_url, data=body, headers=headers, method="POST")
+        with _req.urlopen(req, timeout=5) as resp:
+            return resp.status == 200
+    except Exception as e:
+        logger.debug("UPnP SOAP %s: %s", action, e)
+        return False
+
+
+def _upnp_open_port(port: int, description: str = "RGSX-BT") -> dict | None:
+    """
+    Ouvre le port TCP+UDP via UPnP (pure stdlib, compatible Batocera/Windows/Linux).
+    Retourne un dict de contexte pour la fermeture, ou None si UPnP indisponible.
+    """
+    result = _upnp_discover_igd()
+    if result is None:
+        logger.debug("UPnP: aucun IGD trouvé sur le réseau local")
+        return None
+    location, local_ip = result
+    control_url = _upnp_get_control_url(location)
+    if control_url is None:
+        logger.debug("UPnP: URL de contrôle WANIPConnection introuvable")
+        return None
+
+    # Déterminer le serviceType réel depuis l'URL de contrôle
+    service_type = "urn:schemas-upnp-org:service:WANIPConnection:1"
+    if "ppp" in control_url.lower():
+        service_type = "urn:schemas-upnp-org:service:WANPPPConnection:1"
+
+    opened = []
+    for proto in ("TCP", "UDP"):
+        ok = _upnp_soap(control_url, service_type, "AddPortMapping", {
+            "NewRemoteHost": "",
+            "NewExternalPort": port,
+            "NewProtocol": proto,
+            "NewInternalPort": port,
+            "NewInternalClient": local_ip,
+            "NewEnabled": 1,
+            "NewPortMappingDescription": description,
+            "NewLeaseDuration": 0,
+        })
+        if ok:
+            opened.append(proto)
+            logger.info("UPnP: port %s/%s ouvert → %s:%s", port, proto, local_ip, port)
+        else:
+            logger.debug("UPnP: échec ouverture port %s/%s", port, proto)
+
+    if not opened:
+        return None
+    return {"control_url": control_url, "service_type": service_type, "opened": opened}
+
+
+def _upnp_close_port(ctx: dict | None, port: int) -> None:
+    """Ferme le port TCP+UDP précédemment ouvert via UPnP."""
+    if not ctx:
+        return
+    for proto in ctx.get("opened", []):
+        ok = _upnp_soap(ctx["control_url"], ctx["service_type"], "DeletePortMapping", {
+            "NewRemoteHost": "",
+            "NewExternalPort": port,
+            "NewProtocol": proto,
+        })
+        if ok:
+            logger.info("UPnP: port %s/%s fermé", port, proto)
+        else:
+            logger.debug("UPnP: impossible de fermer port %s/%s", port, proto)
+
+
+def _download_torrent_with_aria2(
+    torrent_meta: dict[str, str | int],
+    dest_dir: str,
+    dest_path: str,
+    task_id: str,
+    cancel_ev,
+    progress_queue,
+    original_history_url: str = "",
+    allow_resume: bool = True,
+    stall_retries_left: int | None = None,
+) -> tuple[bool, str]:
+    source_url = str(torrent_meta.get("source_url") or "")
+    relative_path = str(torrent_meta.get("relative_path") or "").strip() or os.path.basename(dest_path)
+    fallback_name = os.path.basename(relative_path) or os.path.basename(dest_path)
+    file_index = int(torrent_meta.get("file_index") or 1)
+    total_size = int(torrent_meta.get("size_bytes") or 0)
+    # Créé ici (pas seulement dans toggle_pause_download) pour que l'objet Event soit déjà
+    # en place avant que l'utilisateur ne mette en pause depuis l'UI.
+    pause_ev = pause_events.setdefault(task_id, threading.Event())
+
+    if _should_prefer_qbittorrent_backend():
+        platform_label = "Windows" if config.OPERATING_SYSTEM == "Windows" else "Linux/Batocera"
+        logger.info("Téléchargement torrent via qBittorrent sur %s", platform_label)
+        try:
+            return qbittorrent_backend.download_torrent_via_qbittorrent(
+                torrent_meta, dest_dir, dest_path, task_id, cancel_ev, progress_queue, original_history_url,
+                pause_ev=pause_ev,
+            )
+        except qbittorrent_backend.BackendUnavailableError as exc:
+            raise qbittorrent_backend.BackendUnavailableError(str(exc)) from exc
+
+    raise qbittorrent_backend.BackendUnavailableError("qBittorrent introuvable, non démarré ou non disponible")
+
+
+def _update_seeding_status(original_history_url: str, peers: int, ul_speed: float = 0.0) -> None:
+    """Met à jour l'entrée historique avec le statut Seeding, le nombre de peers et la vitesse UL."""
+    if not isinstance(config.history, list):
+        return
+    for entry in config.history:
+        if entry.get("url") == original_history_url:
+            entry["status"] = "Seeding"
+            entry["seeds"] = peers
+            entry["ul_speed"] = ul_speed
+            config.needs_redraw = True
+            break
+
+
+def _stop_seeding_status(original_history_url: str) -> None:
+    """Restaure le statut Download_OK une fois le seed terminé."""
+    if not isinstance(config.history, list):
+        return
+    for entry in config.history:
+        if entry.get("url") == original_history_url:
+            if entry.get("status") == "Seeding":
+                entry["status"] = "Download_OK"
+                entry["seeds"] = 0
+                config.needs_redraw = True
+                _save_history_with_feedback("seeder:done")
+            break
+
+
+def _start_pending_torrent_seed_if_any(task_id: str) -> None:
+    return
+
+
+def _discard_pending_torrent_seed(task_id: str) -> None:
+    return
+
+
+
+def _build_browser_download_headers(referer: str | None = None, accept: str = 'application/octet-stream,*/*;q=0.8') -> dict:
+    """Build browser-like headers for file downloads that reject minimal clients."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': accept,
+        'Accept-Language': 'en-US,en;q=0.9,fr;q=0.8',
+        'Accept-Encoding': 'identity',
+        'Connection': 'keep-alive',
+        'DNT': '1',
+    }
+    if referer:
+        headers['Referer'] = referer
+    return headers
+
+
+def _default_referer_for_url(url: str) -> str | None:
+    """Return a sensible same-site referer instead of stale provider-specific values."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        host = (parsed.netloc or '').lower()
+        if 'archive.org' in host and '/download/' in (parsed.path or ''):
+            identifier = parsed.path.split('/download/', 1)[1].split('/', 1)[0]
+            if identifier:
+                return f"https://archive.org/details/{identifier}"
+            return 'https://archive.org/'
+        return f"{parsed.scheme}://{parsed.netloc}/"
+    except Exception:
+        return None
+
+
+def _is_browser_challenge_response(response) -> bool:
+    """Detect browser-only challenge pages (e.g. Cloudflare) to fail fast with a clear message."""
+    if response is None:
+        return False
+    try:
+        status_code = int(getattr(response, 'status_code', 0) or 0)
+    except Exception:
+        status_code = 0
+    if status_code not in (403, 429, 503):
+        return False
+    try:
+        text = (getattr(response, 'text', '') or '')[:4000].lower()
+    except Exception:
+        text = ''
+    markers = (
+        'just a moment',
+        'cf_chl_opt',
+        'challenge-platform',
+        'enable javascript and cookies to continue',
+        'checking your browser before accessing',
+    )
+    return any(marker in text for marker in markers)
+
+
+def _redact_headers(headers: dict) -> dict:
+    """Return a copy of headers with sensitive fields redacted for logs."""
+    if not isinstance(headers, dict):
+        return {}
+    safe = headers.copy()
+    if 'Cookie' in safe and safe['Cookie']:
+        safe['Cookie'] = '<redacted>'
+    return safe
+
+
+def _parse_known_size_to_bytes(value) -> int:
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if not isinstance(value, str):
+        return 0
+
+    text = value.strip().replace(',', '.')
+    if not text:
+        return 0
+
+    match = re.match(r'^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)?$', text)
+    if not match:
+        return 0
+
+    amount = float(match.group(1))
+    unit = (match.group(2) or 'B').strip().lower()
+    multipliers = {
+        'b': 1,
+        'byte': 1,
+        'bytes': 1,
+        'octet': 1,
+        'octets': 1,
+        'kb': 1024,
+        'kib': 1024,
+        'ko': 1024,
+        'mb': 1024 ** 2,
+        'mib': 1024 ** 2,
+        'mo': 1024 ** 2,
+        'gb': 1024 ** 3,
+        'gib': 1024 ** 3,
+        'go': 1024 ** 3,
+        'tb': 1024 ** 4,
+        'tib': 1024 ** 4,
+        'to': 1024 ** 4,
+        'pb': 1024 ** 5,
+        'pib': 1024 ** 5,
+        'po': 1024 ** 5,
+    }
+    return int(amount * multipliers.get(unit, 0)) if unit in multipliers else 0
+
+
+def _resolve_existing_path_for_usage(path: str) -> str:
+    resolved_path = os.path.abspath(path or "")
+    while resolved_path and not os.path.exists(resolved_path):
+        parent_path = os.path.dirname(resolved_path)
+        if not parent_path or parent_path == resolved_path:
+            break
+        resolved_path = parent_path
+    return resolved_path
+
+
+def _get_free_disk_bytes(path: str) -> int | None:
+    try:
+        usage_path = _resolve_existing_path_for_usage(path)
+        if not usage_path or not os.path.exists(usage_path):
+            return None
+        usage = get_disk_usage(usage_path)
+        return int(usage.free) if usage else None
+    except Exception as exc:
+        logger.debug(f"Impossible de lire l'espace disque libre pour {path}: {exc}")
+        return None
+
+
+def _build_low_disk_space_message(free_bytes: int, required_bytes: int, popup: bool = False) -> str:
+    free_text = _format_size(max(0, int(free_bytes or 0)))
+    required_text = _format_size(max(0, int(required_bytes or 0)))
+    key = "popup_low_disk_space" if popup else "error_low_disk_space"
+    template = _(key) if _ else ""
+    if template and template != key:
+        try:
+            return template.format(free=free_text, required=required_text)
+        except Exception:
+            try:
+                return template.format(free_text, required_text)
+            except Exception:
+                pass
+    if popup:
+        return f"Download blocked: low disk space ({free_text} free / {required_text} required)"
+    return f"Low disk space ({free_text} free / {required_text} required)"
+
+
+def _notify_low_disk_space(required_bytes: int, free_bytes: int) -> str:
+    popup_message = _build_low_disk_space_message(free_bytes, required_bytes, popup=True)
+    history_message = _build_low_disk_space_message(free_bytes, required_bytes, popup=False)
+    try:
+        config.popup_message = popup_message
+        config.popup_timer = 5000
+        config.needs_redraw = True
+    except Exception:
+        pass
+    try:
+        show_toast(popup_message, duration=5000)
+    except Exception:
+        pass
+    return history_message
+
+
+def _ensure_sufficient_disk_space(dest_dir: str, required_bytes: int) -> tuple[bool, str | None]:
+    # Unit safety: both required_bytes and free bytes are compared in raw bytes.
+    required = max(0, int(required_bytes or 0))
+    if required <= 0:
+        return True, None
+
+    free_bytes = _get_free_disk_bytes(dest_dir)
+    if free_bytes is None:
+        return True, None
+
+    try:
+        from utils import get_disk_usage as _get_disk_usage_for_log
+        _get_disk_usage_for_log(dest_dir, log=True)
+    except Exception:
+        pass
+
+    if free_bytes < required:
+        return False, _notify_low_disk_space(required, free_bytes)
+
+    return True, None
+
+
+def _extract_vimm_download_info(html_text: str, page_url: str) -> dict[str, str | int] | None:
+    """Extract Vimm download form data using the regex parser path."""
+    if not html_text:
+        return None
+
+    action = ''
+    media_id = ''
+    size_hint = 0
+
+    form_tag_match = re.search(r'<form\b(?=[^>]*\bid\s*=\s*(["\'])dl_form\1)[^>]*>', html_text, re.IGNORECASE | re.DOTALL)
+    if form_tag_match:
+        form_tag = form_tag_match.group(0)
+        action_match = re.search(r'\baction\s*=\s*(["\'])(.*?)\1', form_tag, re.IGNORECASE | re.DOTALL)
+        if action_match:
+            action = html_module.unescape(action_match.group(2)).strip()
+
+    form_block_match = re.search(r'<form\b(?=[^>]*\bid\s*=\s*(["\'])dl_form\1)[^>]*>(.*?)</form>', html_text, re.IGNORECASE | re.DOTALL)
+    form_block = form_block_match.group(2) if form_block_match else html_text
+
+    media_match = re.search(r'<input\b[^>]*\bname\s*=\s*(["\'])mediaId\1[^>]*\bvalue\s*=\s*(["\'])(.*?)\2', form_block, re.IGNORECASE | re.DOTALL)
+    if media_match:
+        media_id = html_module.unescape(media_match.group(3)).strip()
+    else:
+        media_match = re.search(r'<input\b[^>]*\bvalue\s*=\s*(["\'])(\d+)\1[^>]*\bname\s*=\s*(["\'])mediaId\3', form_block, re.IGNORECASE | re.DOTALL)
+        if media_match:
+            media_id = html_module.unescape(media_match.group(2)).strip()
+
+    if size_hint <= 0:
+        size_match = re.search(r'\bid\s*=\s*(["\'])dl_size\1[^>]*>\s*([^<]+?)\s*<', html_text, re.IGNORECASE | re.DOTALL)
+        if size_match:
+            size_hint = _parse_known_size_to_bytes(html_module.unescape(size_match.group(2)).strip())
+
+    if not media_id:
+        js_media_match = re.search(r'\blet\s+media\s*=\s*\[\{"ID":(\d+)', html_text)
+        if js_media_match:
+            media_id = js_media_match.group(1)
+
+    if size_hint <= 0:
+        js_size_match = re.search(r'"ZippedText":"([^"]+)"', html_text)
+        if js_size_match:
+            size_hint = _parse_known_size_to_bytes(html_module.unescape(js_size_match.group(1)).strip())
+
+    if not action or not media_id:
+        return None
+
+    base_download_url = urljoin(page_url, action)
+    separator = '&' if '?' in base_download_url else '?'
+    download_url = base_download_url + separator + urllib.parse.urlencode({'mediaId': media_id})
+    return {
+        'media_id': media_id,
+        'base_download_url': base_download_url,
+        'download_url': download_url,
+        'size_hint': max(0, int(size_hint or 0)),
+    }
+
+
+def _fetch_vimm_download_info(url: str, session: requests.Session) -> dict[str, str | int] | None:
+    try:
+        if 'vimm.net' not in url:
+            return None
+        resp = session.get(url, timeout=30)
+        resp.raise_for_status()
+        info = _extract_vimm_download_info(resp.text, url)
+        if info:
+            logger.debug("Analyse vimm.net via parser regex")
+        return info
+    except Exception as e:
+        logger.debug(f"Erreur lors de la récupération des informations vimm.net: {e}")
+        return None
+
+
+def _get_vimm_file_size(url: str, session: requests.Session, download_info: dict[str, str | int] | None = None) -> int:
+    """Récupère la taille du fichier pour les URLs vimm.net avant téléchargement."""
+    try:
+        if 'vimm.net' not in url:
+            return 0
+            
+        logger.debug("Récupération de la taille du fichier vimm.net...")
+
+        if download_info is None:
+            download_info = _fetch_vimm_download_info(url, session)
+        if not download_info:
+            logger.debug("Informations de téléchargement introuvables pour vimm.net")
+            return 0
+
+        media_id = str(download_info.get('media_id') or '').strip()
+        download_url = str(download_info.get('download_url') or '').strip()
+        if not media_id or not download_url:
+            logger.debug("mediaId ou URL de téléchargement vimm.net introuvable")
+            return 0
+
+        logger.debug(f"mediaId trouvé pour taille: {media_id}")
+
+        # Faire un HEAD request pour récupérer la taille
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Referer': url
+        }
+        
+        head_resp = session.head(download_url, timeout=10, headers=headers, allow_redirects=True)
+        if head_resp.status_code == 200:
+            # Extraire le nom réel depuis Content-Disposition
+            cd = head_resp.headers.get('content-disposition', '')
+            if cd and isinstance(download_info, dict):
+                fn_match = re.search(r'filename\*?=\"([^\"]+)\"|filename\*?=\'([^\']+)\'|filename\*?=([^\s;]+)', cd, re.IGNORECASE)
+                if fn_match:
+                    real_filename = unquote((fn_match.group(1) or fn_match.group(2) or fn_match.group(3)).strip())
+                    if real_filename:
+                        download_info['real_filename'] = real_filename
+                        logger.debug(f"Nom de fichier réel Vimm: {real_filename}")
+            content_length = head_resp.headers.get('content-length')
+            if content_length:
+                size = int(content_length)
+                logger.debug(f"Taille du fichier vimm.net récupérée: {size} octets")
+                return size
+
+        size_hint = int(download_info.get('size_hint') or 0)
+        if size_hint > 0:
+            logger.debug(f"Taille du fichier vimm.net récupérée depuis la page: {size_hint} octets")
+            return size_hint
+
+        logger.debug("Impossible de récupérer la taille du fichier vimm.net")
+        return 0
+        
+    except Exception as e:
+        logger.debug(f"Erreur lors de la récupération de la taille vimm.net: {e}")
+        return 0
+
+
+def _lookup_known_game_size(platform: str, game_name: str, url: str | None = None) -> int:
+    try:
+        for game in load_games(platform):
+            if url and game.url == url:
+                return _parse_known_size_to_bytes(game.size)
+            if game.name == game_name:
+                return _parse_known_size_to_bytes(game.size)
+    except Exception as exc:
+        logger.debug(f"Impossible de déterminer la taille connue pour {platform}/{game_name}: {exc}")
+    return 0
+
+
+def _stream_response_to_path(response, dest_path: str, task_id: str | None, cancel_ev, progress_queue_obj, fallback_total_size: int = 0) -> dict[str, int | float | bool]:
+    total_size = int(response.headers.get('content-length', 0) or 0) or max(0, int(fallback_total_size or 0))
+    downloaded = 0
+    chunk_size = 4096
+    last_update_time = time.time()
+    last_downloaded = 0
+    update_interval = 0.1
+    download_canceled = False
+
+    if progress_queue_obj is not None and task_id is not None:
+        progress_queue_obj.put((task_id, 0, total_size))
+
+    with open(dest_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            while True:
+                pause_ev = pause_events.get(task_id)
+                if pause_ev is None or not pause_ev.is_set():
+                    break
+                if cancel_ev is not None and cancel_ev.is_set():
+                    break
+                time.sleep(0.1)
+
+            if cancel_ev is not None and cancel_ev.is_set():
+                logger.debug(f"Annulation détectée, arrêt du téléchargement pour task_id={task_id}")
+                download_canceled = True
+                try:
+                    f.close()
+                except Exception:
+                    pass
+                try:
+                    if os.path.exists(dest_path):
+                        os.remove(dest_path)
+                except Exception:
+                    pass
+                break
+
+            if chunk:
+                size_received = len(chunk)
+                f.write(chunk)
+                downloaded += size_received
+                current_time = time.time()
+                
+                # Calculer le pourcentage actuel
+                current_percent = int(downloaded / total_size * 100) if total_size > 0 else 0
+                last_percent = int(last_downloaded / total_size * 100) if total_size > 0 else 0
+                
+                # Mettre à jour la progression si l'intervalle est atteint OU si le pourcentage a changé (ou si total_size est inconnu)
+                should_update = (progress_queue_obj is not None and task_id is not None and 
+                               (current_time - last_update_time >= update_interval or 
+                                current_percent != last_percent or 
+                                total_size == 0))
+                
+                if should_update:
+                    delta = downloaded - last_downloaded
+                    speed = delta / (current_time - last_update_time) / (1024 * 1024) if current_time > last_update_time else 0
+                    # logger.debug(f"[STREAM] Mise à jour progression: {downloaded}/{total_size} octets ({current_percent}%), speed={speed:.2f} MB/s, task_id={task_id}")
+                    last_downloaded = downloaded
+                    last_update_time = current_time
+                    progress_queue_obj.put((task_id, downloaded, total_size, speed))
+
+    return {
+        'total_size': total_size,
+        'downloaded': downloaded,
+        'last_downloaded': last_downloaded,
+        'last_update_time': last_update_time,
+        'download_canceled': download_canceled,
+    }
+
+
+def _try_archive_org_alternate_urls(session, archive_alt_urls: list[str], active_url: str, download_headers: dict, dest_path: str, task_id: str | None, cancel_ev, progress_queue_obj, fallback_total_size: int = 0):
+    seen_urls = {active_url}
+    for alt_url in archive_alt_urls:
+        if not alt_url or alt_url in seen_urls:
+            continue
+        seen_urls.add(alt_url)
+        alt_response = None
+        try:
+            logger.debug(f"Réponse vide, tentative Archive.org alternative: {alt_url}")
+            alt_headers = download_headers.copy()
+            alt_host = urllib.parse.urlsplit(alt_url).netloc
+            if alt_host.startswith('ia') and alt_host.endswith('.archive.org'):
+                alt_headers['Referer'] = f"https://{alt_host}/"
+                alt_headers['Origin'] = 'https://archive.org'
+
+            alt_response = session.get(alt_url, stream=True, timeout=(45, 90), allow_redirects=True, headers=alt_headers)
+            alt_response.raise_for_status()
+            transfer = _stream_response_to_path(alt_response, dest_path, task_id, cancel_ev, progress_queue_obj, fallback_total_size=fallback_total_size)
+            if transfer['downloaded'] > 0:
+                return alt_response, alt_url, transfer
+
+            try:
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.debug(f"Fallback Archive.org vide échoué pour {alt_url}: {exc}")
+            try:
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+            except Exception:
+                pass
+        finally:
+            try:
+                if alt_response is not None:
+                    alt_response.close()
+            except Exception:
+                pass
+
+    return None, active_url, None
+
+
+def _is_lolroms_url(url: str | None) -> bool:
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        host = (urllib.parse.urlsplit(url).netloc or '').lower()
+        return host.endswith('lolroms.com')
+    except Exception:
+        return False
+
+
+def _normalize_lolroms_url(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    normalized_path = urllib.parse.quote(
+        urllib.parse.unquote(parsed.path or '/'),
+        safe="/@:$&'()*+,;=-._~",
+    )
+    normalized_query = urllib.parse.quote_plus(
+        urllib.parse.unquote_plus(parsed.query),
+        safe="=&:$,;+-._~!*'()",
+    ) if parsed.query else ''
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, normalized_path, normalized_query, parsed.fragment))
+
+
+def _extract_reported_total_size(output_text: str) -> int:
+    if not output_text:
+        return 0
+    patterns = [
+        r'(?im)^content-length:\s*(\d+)\s*$',
+        r'(?im)^length:\s*(\d+)(?:\s|$)',
+        r'(?im)\bcontent-length:\s*(\d+)\b',
+        r'(?im)\blength:\s*(\d+)\b',
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, output_text)
+        if matches:
+            try:
+                return int(matches[-1])
+            except Exception:
+                continue
+    return 0
+
+
+def _build_lolroms_parent_url(url: str) -> str:
+    parsed = urllib.parse.urlsplit(_normalize_lolroms_url(url))
+    path = parsed.path or '/'
+    parent_path = path.rsplit('/', 1)[0].rstrip('/') + '/'
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parent_path, '', ''))
+
+
+def _looks_like_html_or_challenge(file_path: str) -> bool:
+    try:
+        with open(file_path, 'rb') as handle:
+            head = handle.read(2048).lower()
+        markers = (b'<html', b'<!doctype html', b'cloudflare', b'just a moment', b'cf-chl', b'challenge-platform')
+        return any(marker in head for marker in markers)
+    except Exception:
+        return True
+
+
+def _should_accept_partial_archive(downloaded: int, total_size: int, file_path: str) -> tuple[bool, str]:
+    if total_size <= 0 or downloaded >= total_size:
+        return True, "archive complete"
+
+    difference = max(0, total_size - downloaded)
+    if difference <= 0:
+        return True, "archive complete"
+
+    extension = os.path.splitext(file_path)[1].lower()
+    if extension not in {'.7z', '.zip', '.rar'}:
+        return True, "non-archive payload"
+
+    if not _matches_expected_archive_signature(file_path):
+        return False, "invalid archive signature"
+
+    if difference <= 16:
+        return True, f"small size mismatch tolerated ({downloaded}/{total_size} bytes)"
+
+    ratio = difference / total_size if total_size > 0 else 0.0
+    if ratio <= 0.0005 and difference <= 64:
+        return True, f"tiny size mismatch tolerated ({downloaded}/{total_size} bytes)"
+
+    if extension == '.zip':
+        try:
+            with zipfile.ZipFile(file_path) as archive:
+                archive.testzip()
+                return True, f"archive validates despite partial size mismatch ({downloaded}/{total_size} bytes)"
+        except Exception:
+            pass
+
+    return False, f"incomplete archive payload downloaded ({downloaded}/{total_size} bytes)"
+
+
+def _matches_expected_archive_signature(file_path: str) -> bool:
+    extension = os.path.splitext(file_path)[1].lower()
+    if extension not in {'.7z', '.zip', '.rar'}:
+        return True
+    try:
+        with open(file_path, 'rb') as handle:
+            head = handle.read(8)
+    except Exception:
+        return False
+    if extension == '.7z':
+        return head.startswith(bytes.fromhex('377abcaf271c'))
+    if extension == '.zip':
+        return head.startswith(b'PK\x03\x04') or head.startswith(b'PK\x05\x06') or head.startswith(b'PK\x07\x08')
+    if extension == '.rar':
+        return head.startswith(b'Rar!\x1a\x07\x00') or head.startswith(b'Rar!\x1a\x07\x01\x00')
+    return True
+
+
+def _resolve_lolroms_external_command() -> tuple[str | None, str | None]:
+    if config.OPERATING_SYSTEM == 'Windows':
+        candidates = [r'C:\Windows\System32\curl.exe', 'curl.exe', 'curl']
+        for candidate in candidates:
+            resolved = candidate if os.path.isabs(candidate) and os.path.exists(candidate) else shutil.which(candidate)
+            if resolved:
+                return 'curl', resolved
+        return None, None
+
+    if config.OPERATING_SYSTEM == 'Darwin':
+        # macOS ships curl but not wget
+        resolved = shutil.which('curl')
+        return ('curl', resolved) if resolved else (None, None)
+
+    for candidate in ('wget',):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return 'wget', resolved
+    return None, None
+
+
+def _probe_lolroms_remote_size(url: str) -> int:
+    tool_kind, tool_cmd = _resolve_lolroms_external_command()
+    if not tool_kind or not tool_cmd:
+        return 0
+
+    url = _normalize_lolroms_url(url)
+    parent_url = _build_lolroms_parent_url(url)
+    browser_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+    cookie_fd, cookie_path = tempfile.mkstemp(prefix='rgsx_lolroms_probe_', suffix='.cookies')
+    os.close(cookie_fd)
+    parent_fd, parent_output = tempfile.mkstemp(prefix='rgsx_lolroms_probe_parent_', suffix='.html')
+    os.close(parent_fd)
+
+    try:
+        if tool_kind == 'curl':
+            parent_cmd = [
+                tool_cmd,
+                '-L',
+                '--connect-timeout', '20',
+                '--silent',
+                '--show-error',
+                '--insecure',
+                '-A', browser_ua,
+                '-H', 'Accept: application/octet-stream,*/*',
+                '-H', 'Accept-Language: fr-FR,fr;q=0.9,en;q=0.8',
+                '-H', 'Referer: https://lolroms.com/',
+                '-c', cookie_path,
+                '-b', cookie_path,
+                '-o', parent_output,
+                parent_url,
+            ]
+            probe_cmd = [
+                tool_cmd,
+                '-I',
+                '-L',
+                '--connect-timeout', '20',
+                '--silent',
+                '--show-error',
+                '--insecure',
+                '-A', browser_ua,
+                '-H', 'Accept: application/octet-stream,*/*',
+                '-H', 'Accept-Language: fr-FR,fr;q=0.9,en;q=0.8',
+                '-H', f'Referer: {parent_url}',
+                '-c', cookie_path,
+                '-b', cookie_path,
+                url,
+            ]
+        else:
+            parent_cmd = [
+                tool_cmd,
+                '--timeout=60',
+                '--tries=2',
+                '--max-redirect=10',
+                '--no-verbose',
+                '--no-hsts',
+                f'--user-agent={browser_ua}',
+                '--referer=https://lolroms.com/',
+                '--header=Accept: application/octet-stream,*/*',
+                '--header=Accept-Language: fr-FR,fr;q=0.9,en;q=0.8',
+                '--no-check-certificate',
+                '--save-cookies', cookie_path,
+                '--load-cookies', cookie_path,
+                '--keep-session-cookies',
+                '-O', parent_output,
+                parent_url,
+                '--quiet',
+            ]
+            probe_cmd = [
+                tool_cmd,
+                '--spider',
+                '--server-response',
+                '--timeout=60',
+                '--tries=1',
+                '--max-redirect=10',
+                '--no-verbose',
+                '--no-hsts',
+                f'--user-agent={browser_ua}',
+                f'--referer={parent_url}',
+                '--header=Accept: application/octet-stream,*/*',
+                '--header=Accept-Language: fr-FR,fr;q=0.9,en;q=0.8',
+                '--no-check-certificate',
+                '--save-cookies', cookie_path,
+                '--load-cookies', cookie_path,
+                '--keep-session-cookies',
+                url,
+            ]
+
+        try:
+            subprocess.run(parent_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=65)
+        except Exception:
+            pass
+
+        probe = subprocess.run(
+            probe_cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=65,
+        )
+        probe_text = '\n'.join(part for part in (probe.stdout, probe.stderr) if part)
+        return _extract_reported_total_size(probe_text)
+    except Exception as exc:
+        logger.debug(f"Impossible de sonder la taille lolroms via {tool_kind}: {exc}")
+        return 0
+    finally:
+        _safe_remove_file(parent_output)
+        _safe_remove_file(cookie_path)
+
+
+def _download_lolroms_with_external_tool(url: str, dest_path: str, task_id: str | None, cancel_ev=None, progress_queue=None) -> tuple[bool | None, str | None]:
+    tool_kind, tool_cmd = _resolve_lolroms_external_command()
+    if not tool_kind or not tool_cmd:
+        return None, None
+
+    url = _normalize_lolroms_url(url)
+    parent_url = _build_lolroms_parent_url(url)
+    browser_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+    cookie_fd, cookie_path = tempfile.mkstemp(prefix='rgsx_lolroms_', suffix='.cookies')
+    os.close(cookie_fd)
+    parent_fd, parent_output = tempfile.mkstemp(prefix='rgsx_lolroms_parent_', suffix='.html')
+    os.close(parent_fd)
+    parent_fetch_attempted = False
+
+    def _build_cmd(target_url: str, output_path: str, referer: str, quiet_parent: bool = False, resume: bool = False):
+        if tool_kind == 'curl':
+            cmd = [
+                tool_cmd,
+                '-L',
+                '--connect-timeout', '20',
+                '--speed-time', '120',
+                '--speed-limit', '1024',
+                '--silent',
+                '--show-error',
+                '--insecure',
+                '-A', browser_ua,
+                '-H', 'Accept: application/octet-stream,*/*',
+                '-H', 'Accept-Language: fr-FR,fr;q=0.9,en;q=0.8',
+                '-H', f'Referer: {referer}',
+                '-c', cookie_path,
+                '-b', cookie_path,
+            ]
+            if resume:
+                cmd.extend(['-C', '-'])
+            cmd.extend([
+                '-o', output_path,
+                target_url,
+            ])
+            return cmd
+        cmd = [
+            tool_cmd,
+            '--timeout=60',
+            '--tries=3',
+            '--max-redirect=10',
+            '--no-verbose',
+            '--no-hsts',
+            f'--user-agent={browser_ua}',
+            f'--referer={referer}',
+            '--header=Accept: application/octet-stream,*/*',
+            '--header=Accept-Language: fr-FR,fr;q=0.9,en;q=0.8',
+            '--no-check-certificate',
+            '--save-cookies', cookie_path,
+            '--load-cookies', cookie_path,
+            '--keep-session-cookies',
+        ]
+        if resume:
+            cmd.append('--continue')
+        cmd.extend([
+            '-O', output_path,
+            target_url,
+        ])
+        if quiet_parent:
+            cmd.append('--quiet')
+        return cmd
+
+    def _should_retry_partial_download(return_code: int, stderr_text: str, stdout_text: str, current_size: int, expected_size: int) -> bool:
+        if current_size <= 0:
+            return False
+        if expected_size > 0 and current_size >= expected_size:
+            return False
+        combined = f"{stderr_text or ''}\n{stdout_text or ''}".lower()
+        if tool_kind == 'curl':
+            return return_code in {18, 28, 56} or 'end of response' in combined or 'transfer closed' in combined
+        return return_code in {4} or 'connection closed' in combined or 'read error' in combined or 'timed out' in combined
+
+    def _probe_total_size(target_url: str, referer: str) -> int:
+        try:
+            if tool_kind == 'curl':
+                probe_cmd = [
+                    tool_cmd,
+                    '-I',
+                    '-L',
+                    '--connect-timeout', '20',
+                    '--silent',
+                    '--show-error',
+                    '--insecure',
+                    '-A', browser_ua,
+                    '-H', 'Accept: application/octet-stream,*/*',
+                    '-H', 'Accept-Language: fr-FR,fr;q=0.9,en;q=0.8',
+                    '-H', f'Referer: {referer}',
+                    '-c', cookie_path,
+                    '-b', cookie_path,
+                    target_url,
+                ]
+            else:
+                probe_cmd = [
+                    tool_cmd,
+                    '--spider',
+                    '--server-response',
+                    '--timeout=60',
+                    '--tries=1',
+                    '--max-redirect=10',
+                    '--no-verbose',
+                    '--no-hsts',
+                    f'--user-agent={browser_ua}',
+                    f'--referer={referer}',
+                    '--header=Accept: application/octet-stream,*/*',
+                    '--header=Accept-Language: fr-FR,fr;q=0.9,en;q=0.8',
+                    '--no-check-certificate',
+                    '--save-cookies', cookie_path,
+                    '--load-cookies', cookie_path,
+                    '--keep-session-cookies',
+                    target_url,
+                ]
+            logger.debug(f"lolroms size probe via {tool_kind}: {' '.join(probe_cmd)}")
+            probe = subprocess.run(
+                probe_cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=65,
+            )
+            probe_text = '\n'.join(part for part in (probe.stdout, probe.stderr) if part)
+            reported_total = _extract_reported_total_size(probe_text)
+            if reported_total > 0:
+                return reported_total
+        except Exception as exc:
+            logger.debug(f"lolroms size probe failed via {tool_kind}: {exc}")
+        return 0
+
+    def _run_command(cmd, watch_output: str | None = None, known_total_size: int = 0):
+        logger.debug(f"lolroms external fallback via {tool_kind}: {' '.join(cmd)}")
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        total_size_state = {"value": known_total_size}
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+        )
+
+        def _drain_stream(stream, collector: list[str]):
+            if stream is None:
+                return
+            try:
+                for line in iter(stream.readline, ''):
+                    if not line:
+                        break
+                    collector.append(line)
+                    if total_size_state["value"] <= 0:
+                        reported_total = _extract_reported_total_size(line)
+                        if reported_total > 0:
+                            total_size_state["value"] = reported_total
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        stdout_thread = threading.Thread(target=_drain_stream, args=(process.stdout, stdout_lines), daemon=True)
+        stderr_thread = threading.Thread(target=_drain_stream, args=(process.stderr, stderr_lines), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
+        last_size = 0
+        last_time = time.time()
+        while process.poll() is None:
+            if cancel_ev is not None and cancel_ev.is_set():
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                raise RuntimeError(_("download_canceled") if _ else 'Download canceled')
+            if watch_output and progress_queue is not None and task_id:
+                current_size = os.path.getsize(watch_output) if os.path.exists(watch_output) else 0
+                current_time = time.time()
+                elapsed = max(current_time - last_time, 0.001)
+                speed = max(0.0, (current_size - last_size) / elapsed / (1024 * 1024))
+                last_size = current_size
+                last_time = current_time
+                progress_queue.put((task_id, current_size, total_size_state["value"], speed))
+            time.sleep(0.2)
+        process.wait()
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+        stdout = ''.join(stdout_lines)
+        stderr = ''.join(stderr_lines)
+        return process.returncode, stdout, stderr
+
+    def _fetch_parent_page_if_needed(force: bool = False) -> bool:
+        nonlocal parent_fetch_attempted
+        if parent_fetch_attempted and not force:
+            return False
+
+        parent_fetch_attempted = True
+        parent_cmd = _build_cmd(parent_url, parent_output, 'https://lolroms.com/', quiet_parent=True)
+        parent_code, parent_stdout, parent_stderr = _run_command(parent_cmd)
+        if parent_code != 0:
+            logger.debug(f"lolroms parent fetch fallback failed via {tool_kind}: {parent_stderr[:300]}")
+            return False
+
+        logger.debug(f"lolroms parent fetch fallback succeeded via {tool_kind}")
+        return True
+
+    try:
+        total_size = _probe_total_size(url, parent_url)
+        if total_size <= 0:
+            logger.debug(f"lolroms size probe returned 0 via {tool_kind}, trying parent fetch fallback")
+            if _fetch_parent_page_if_needed():
+                total_size = _probe_total_size(url, parent_url)
+
+        if total_size > 0 and progress_queue is not None and task_id:
+            progress_queue.put((task_id, 0, total_size, 0.0))
+
+        file_code = 1
+        file_stdout = ''
+        file_stderr = ''
+        max_attempts = 3
+        for attempt_index in range(max_attempts):
+            resume_download = attempt_index > 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
+            if resume_download:
+                current_size = os.path.getsize(dest_path)
+                logger.debug(f"lolroms external retry via {tool_kind}: reprise tentative {attempt_index + 1}/{max_attempts} a {current_size} octets")
+            file_cmd = _build_cmd(url, dest_path, parent_url, resume=resume_download)
+            file_code, file_stdout, file_stderr = _run_command(file_cmd, watch_output=dest_path, known_total_size=total_size)
+            current_size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+            if file_code == 0:
+                break
+            if current_size <= 0 and not parent_fetch_attempted:
+                logger.debug(f"lolroms direct download failed via {tool_kind} without parent fetch, trying parent fetch fallback before retry")
+                _fetch_parent_page_if_needed()
+            if _should_retry_partial_download(file_code, file_stderr, file_stdout, current_size, total_size) and attempt_index < max_attempts - 1:
+                logger.debug(
+                    f"lolroms external partial transfer via {tool_kind}: tentative {attempt_index + 1} interrompue a {current_size}/{total_size or 0} octets, reprise"
+                )
+                continue
+            break
+
+        if file_code != 0:
+            if os.path.exists(dest_path):
+                current_size = os.path.getsize(dest_path)
+                if total_size > 0 and current_size >= total_size:
+                    logger.debug(f"lolroms external {tool_kind} returned code {file_code} but file size reached expected total ({current_size})")
+                else:
+                    _safe_remove_file(dest_path)
+            return False, f"lolroms external download failed via {tool_kind}: {file_stderr[:300].strip() or file_stdout[:300].strip() or 'unknown error'}"
+
+        if not os.path.exists(dest_path):
+            return False, f"lolroms external download failed via {tool_kind}: output file missing"
+        if _looks_like_html_or_challenge(dest_path):
+            _safe_remove_file(dest_path)
+            return False, f"lolroms external download via {tool_kind} returned HTML/challenge content"
+        if not _matches_expected_archive_signature(dest_path):
+            _safe_remove_file(dest_path)
+            return False, f"lolroms external download via {tool_kind} returned an invalid archive payload"
+        if total_size > 0 and progress_queue is not None and task_id:
+            final_size = os.path.getsize(dest_path)
+            progress_queue.put((task_id, final_size, max(total_size, final_size), 0.0))
+        return True, None
+    except RuntimeError as exc:
+        if cancel_ev is not None and cancel_ev.is_set():
+            _safe_remove_file(dest_path)
+            logger.debug(f"lolroms external download canceled, partial file removed: {dest_path}")
+            return False, str(exc)
+        raise
+    finally:
+        _safe_remove_file(parent_output)
+        _safe_remove_file(cookie_path)
+
+
+def _split_archive_org_path(url: str):
+    """Parse archive.org download URL and return (identifier, archive_name, inner_path)."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        parts = parsed.path.split('/download/', 1)
+        if len(parts) != 2:
+            return None, None, None
+        after = parts[1]
+        identifier = after.split('/', 1)[0]
+        rest = after[len(identifier):]
+        if rest.startswith('/'):
+            rest = rest[1:]
+        rest_decoded = urllib.parse.unquote(rest)
+        if '/' not in rest_decoded:
+            return identifier, None, None
+        first_seg, remainder = rest_decoded.split('/', 1)
+        if first_seg.lower().endswith(('.zip', '.rar', '.7z')):
+            return identifier, first_seg, remainder
+        return identifier, None, None
+    except Exception:
+        return None, None, None
+
+
+def _normalize_archive_org_download_path(identifier: str, rest: str) -> str:
+    """Normalize archive.org download paths while preserving encoded inner archive members."""
+    if not rest:
+        return f"/download/{identifier}"
+
+    rest = rest.lstrip('/')
+    first_sep = rest.find('/')
+    if first_sep == -1:
+        encoded_rest = urllib.parse.quote(urllib.parse.unquote(rest), safe="%:@$&'()*+,;=-._~")
+        return f"/download/{identifier}/{encoded_rest}"
+
+    archive_name_raw = rest[:first_sep]
+    member_raw = rest[first_sep + 1:]
+    archive_name = urllib.parse.unquote(archive_name_raw)
+
+    if archive_name.lower().endswith(('.zip', '.rar', '.7z')):
+        encoded_archive_name = urllib.parse.quote(archive_name, safe="%:@$&'()*+,;=-._~")
+        encoded_member = urllib.parse.quote(urllib.parse.unquote(member_raw), safe="%:@$&'()*+,;=-._~")
+        return f"/download/{identifier}/{encoded_archive_name}/{encoded_member}"
+
+    normalized_rest = urllib.parse.quote(
+        urllib.parse.unquote(rest),
+        safe="/@:$&'()*+,;=-._~",
+    )
+    return f"/download/{identifier}/{normalized_rest}"
+
+# --- File d'attente de téléchargements (worker) ---
+def download_queue_worker():
+    """Worker qui surveille la file d'attente et lance des téléchargements dans la limite des slots disponibles."""
+    import time
+    while True:
+        try:
+            max_dl = getattr(config, 'max_simultaneous_downloads', 5)
+            active = getattr(config, 'active_download_count', 0)
+            if active < max_dl and config.download_queue:
+                job = config.download_queue.pop(0)
+                config.active_download_count = active + 1
+                config.download_active = True
+                logger.info(f"[QUEUE] Lancement téléchargement (slot {active+1}/{max_dl}): {job.get('game_name','?')}")
+                url = job['url']
+                platform = job['platform']
+                game_name = job['game_name']
+                is_zip_non_supported = job.get('is_zip_non_supported', False)
+                task_id = job.get('task_id') or f"queue_{int(time.time()*1000)}"
+                if is_1fichier_url(url):
+                    t = threading.Thread(target=lambda: asyncio.run(download_from_1fichier(url, platform, game_name, is_zip_non_supported, task_id)), daemon=True)
+                else:
+                    t = threading.Thread(target=lambda: asyncio.run(download_rom(url, platform, game_name, is_zip_non_supported, task_id)), daemon=True)
+                t.start()
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"[QUEUE] Erreur dans le worker de file d'attente: {e}")
+            time.sleep(2)
+
+# Hook à appeler à la fin de chaque téléchargement pour libérer le slot
+def notify_download_finished():
+    config.active_download_count = max(0, getattr(config, 'active_download_count', 1) - 1)
+    config.download_active = config.active_download_count > 0
+
+# ================== TÉLÉCHARGEMENT 1FICHIER GRATUIT ==================
+# Fonction pour télécharger depuis 1fichier sans API key (mode gratuit)
+# Compatible RGSX - Sans dépendances HTML externes ni httpx
+
+# Regex pour détecter le compte à rebours
+WAIT_REGEXES_1F = [
+    # Patterns avec multiplication par 60 (minutes -> secondes)
+    r'var\s+ct\s*=\s*(\d+)\s*\*\s*60',  # var ct = X * 60;
+    r'var\s+ct\s*=\s*(\d+)\s*\*60',     # var ct = X*60;
+    # Patterns avec temps en minutes explicite
+    r'(?:veuillez\s+)?patiente[rz]\s*(\d+)\s*(?:min|minute)s?\b',
+    r'please\s+wait\s*(\d+)\s*(?:min|minute)s?\b',
+    # Patterns avec temps en secondes
+    r'(?:veuillez\s+)?patiente[rz]\s*(\d+)\s*(?:sec|secondes?|s)\b',
+    r'please\s+wait\s*(\d+)\s*(?:sec|seconds?)\b',
+    r'var\s+ct\s*=\s*(\d+)\s*;',  # var ct = X;
+]
+
+def extract_wait_seconds_1f(html_text):
+    """Extrait le temps d'attente depuis le HTML 1fichier"""
+    for i, pattern in enumerate(WAIT_REGEXES_1F):
+        match = re.search(pattern, html_text, re.IGNORECASE)
+        if match:
+            value = int(match.group(1))
+            # Les deux premiers patterns sont en minutes (avec *60)
+            if i < 2 or 'min' in pattern.lower():
+                seconds = value * 60
+            else:
+                seconds = value
+            logger.debug(f"1fichier wait time detected: {value} ({'minutes' if i < 2 or 'min' in pattern.lower() else 'seconds'}) = {seconds}s total")
+            return seconds
+    return 0
+
+
+def _extract_visible_text_from_html(html_text: str) -> str:
+    if not html_text:
+        return ""
+    text = re.sub(r'(?is)<script[^>]*>.*?</script>', ' ', html_text)
+    text = re.sub(r'(?is)<style[^>]*>.*?</style>', ' ', text)
+    text = re.sub(r'(?is)<[^>]+>', ' ', text)
+    text = html_module.unescape(text).replace('\xa0', ' ')
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _normalize_1fichier_text(text: str) -> str:
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKD", text)
+    normalized = normalized.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r'\s+', ' ', normalized).strip().lower()
+
+
+def _translate_free_mode_message(key: str, fallback: str) -> str:
+    try:
+        translated = _(key)
+        if translated and translated != key:
+            return translated
+    except Exception:
+        pass
+    return fallback
+
+
+def _append_1fichier_upgrade_advice(message: str) -> str:
+    advice = _translate_free_mode_message(
+        "free_mode_premium_advice",
+        "For unlimited, on-demand, full-speed downloads, you need a premium account or debrid service and must enter its API key in RGSX.",
+    )
+    base_message = (message or "").strip()
+    if not base_message:
+        return advice
+    return f"{base_message}\n{advice}"
+
+
+def _extract_1fichier_free_mode_block_reason(html_text: str) -> str | None:
+    visible_text = _extract_visible_text_from_html(html_text)
+    normalized = _normalize_1fichier_text(visible_text)
+    if not normalized:
+        return None
+
+    if (
+        "telechargement gratuit est temporairement limite" in normalized
+        and "identifiez-vous immediatement" in normalized
+    ):
+        return _append_1fichier_upgrade_advice(
+            _translate_free_mode_message(
+                "free_mode_guest_slots_unavailable",
+                "1fichier: free guest download is temporarily unavailable (all slots are currently in use). Please try again later.",
+            )
+        )
+
+    if (
+        "free download is temporarily limited" in normalized
+        and "all free slots for guests are currently used" in normalized
+    ):
+        return _append_1fichier_upgrade_advice(
+            _translate_free_mode_message(
+                "free_mode_guest_slots_unavailable",
+                "1fichier: free guest download is temporarily unavailable (all slots are currently in use). Please try again later.",
+            )
+        )
+
+    if "identifiez-vous immediatement pour continuer votre telechargement" in normalized:
+        return _append_1fichier_upgrade_advice(
+            _translate_free_mode_message(
+                "free_mode_unavailable_in_app",
+                "1fichier: this download is not available in the application right now. Please try again later.",
+            )
+        )
+
+    if "sign in immediately to continue your download" in normalized:
+        return _append_1fichier_upgrade_advice(
+            _translate_free_mode_message(
+                "free_mode_unavailable_in_app",
+                "1fichier: this download is not available in the application right now. Please try again later.",
+            )
+        )
+
+    return None
+
+def download_1fichier_free_mode(url, dest_dir, session, log_callback=None, progress_callback=None, wait_callback=None, cancel_event=None):
+    """
+    Télécharge un fichier depuis 1fichier.com en mode gratuit (sans API key).
+    Compatible RGSX - Sans dépendances HTML externes ni httpx.
+    
+    Args:
+        url: URL 1fichier
+        dest_dir: Dossier de destination
+        session: Session requests
+        log_callback: Fonction appelée avec les messages de log
+        progress_callback: Fonction appelée avec (filename, downloaded, total, percent)
+        wait_callback: Fonction appelée avec (remaining_seconds, total_seconds)
+        cancel_event: threading.Event pour annuler le téléchargement
+        
+    Returns:
+        (success: bool, filepath: str|None, error_message: str|None)
+    """
+    
+    def _log(msg):
+        if log_callback:
+            try:
+                log_callback(msg)
+            except Exception:
+                pass
+        logger.info(msg)
+    
+    def _progress(filename, downloaded, total, pct):
+        if progress_callback:
+            try:
+                progress_callback(filename, downloaded, total, pct)
+            except Exception:
+                pass
+    
+    def _wait(remaining, total_wait):
+        if wait_callback:
+            try:
+                wait_callback(remaining, total_wait)
+            except Exception:
+                pass
+    
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        _log(_("free_mode_download").format(url))
+        
+        # 1. GET page initiale
+        if cancel_event and cancel_event.is_set():
+            return (False, None, "Annulé")
+        
+        r = session.get(url, allow_redirects=True, timeout=30)
+        r.raise_for_status()
+        html = r.text
+        page_url = str(r.url)
+        
+        # 2. Détection compte à rebours
+        wait_s = extract_wait_seconds_1f(html)
+        
+        if wait_s > 0:
+            _log(f"{wait_s}s...")
+            for remaining in range(wait_s, 0, -1):
+                if cancel_event and cancel_event.is_set():
+                    return (False, None, "Annulé")
+                _wait(remaining, wait_s)
+                time.sleep(1)
+        
+        # 3. Chercher formulaire et soumettre
+        if cancel_event and cancel_event.is_set():
+            return (False, None, "Annulé")
+            
+        form_match = re.search(r'<form[^>]*id=[\"\']f1[\"\'][^>]*>(.*?)</form>', html, re.DOTALL | re.IGNORECASE)
+        
+        if form_match:
+            form_html = form_match.group(1)
+            
+            # Extraire les champs
+            data = {}
+            for inp_match in re.finditer(r'<input[^>]+>', form_html, re.IGNORECASE):
+                inp = inp_match.group(0)
+                
+                name_m = re.search(r'name=[\"\']([^\"\']+)', inp)
+                value_m = re.search(r'value=[\"\']([^\"\']*)', inp)
+                type_m = re.search(r'type=["\']([^"\']+)', inp, re.IGNORECASE)
+                
+                if name_m:
+                    input_type = type_m.group(1).strip().lower() if type_m else 'text'
+                    if input_type in {'checkbox', 'radio'} and 'checked' not in inp.lower():
+                        continue
+                    name = name_m.group(1)
+                    value = value_m.group(1) if value_m else ''
+                    data[name] = html_module.unescape(value)
+            
+            # POST formulaire
+            _log(_("free_mode_submitting"))
+            html = None
+            # Parfois la soumission renvoie une page demandant d'attendre encore (rate-limit) --
+            # on retry jusqu'à 3 fois en respectant le temps indiqué dans la page de réponse.
+            max_post_attempts = 3
+            post_attempt = 0
+            while post_attempt < max_post_attempts:
+                post_attempt += 1
+                try:
+                    parsed_page = urllib.parse.urlparse(page_url)
+                    post_headers = {
+                        'Referer': page_url,
+                        'Origin': f"{parsed_page.scheme}://{parsed_page.netloc}" if parsed_page.scheme and parsed_page.netloc else page_url,
+                    }
+                    r2 = session.post(page_url, data=data, headers=post_headers, allow_redirects=True, timeout=30)
+                    r2.raise_for_status()
+                    html = r2.text
+                    page_url = str(r2.url)
+                except Exception as pe:
+                    logger.debug(f"1fichier: POST attempt {post_attempt} failed: {pe}")
+                    if post_attempt >= max_post_attempts:
+                        raise
+                    time.sleep(1)
+                    continue
+
+                # Vérifier si la page de réponse contient un nouveau compteur d'attente
+                extra_wait = extract_wait_seconds_1f(html)
+                if extra_wait and extra_wait > 0:
+                    logger.info(f"1fichier: Response requests extra wait: {extra_wait}s (attempt {post_attempt})")
+                    # Attendre proprement en appelant le callback si fourni
+                    for remaining in range(extra_wait, 0, -1):
+                        if cancel_event and cancel_event.is_set():
+                            return (False, None, "Annulé")
+                        _wait(remaining, extra_wait)
+                        time.sleep(1)
+                    # essayer de soumettre à nouveau après la temporisation
+                    continue
+                # Pas d'attente supplémentaire demandée, on peut continuer
+                break
+
+            if html is None:
+                return (False, None, "Erreur lors de la soumission du formulaire")
+
+            blocked_reason = _extract_1fichier_free_mode_block_reason(html)
+            if blocked_reason:
+                logger.warning(f"1fichier: free mode blocked after form submit: {blocked_reason}")
+                return (False, None, blocked_reason)
+        
+        # 4. Chercher lien de téléchargement
+        if cancel_event and cancel_event.is_set():
+            return (False, None, "Annulé")
+            
+        patterns = [
+            r'href=[\"\']([^\"\']+)[\"\'][^>]*>(?:cliquer|click|télécharger|download)',
+            r'href=[\"\']([^\"\']*/dl/[^\"\']+)',
+            r'(https?://[a-z0-9.-]*1fichier\.com/[A-Za-z0-9]{8,})'
+        ]
+        
+        direct_link = None
+        candidate_entries: list[tuple[int, str]] = []
+        seen_candidates: set[str] = set()
+
+        for anchor_match in re.finditer(r'<a[^>]+href=[\"\']([^\"\']+)[\"\'][^>]*>(.*?)</a>', html, re.IGNORECASE | re.DOTALL):
+            href = html_module.unescape(anchor_match.group(1).strip())
+            anchor_text = re.sub(r'<[^>]+>', ' ', anchor_match.group(2))
+            normalized_anchor_text = _normalize_1fichier_text(anchor_text)
+            if not href or not normalized_anchor_text:
+                continue
+            if not any(token in normalized_anchor_text for token in ('download', 'telecharg', 'tlcharg', 'click', 'cliquer')):
+                continue
+            candidate = href if href.startswith(('http://', 'https://')) else urljoin(page_url, href)
+            if candidate in seen_candidates:
+                continue
+            seen_candidates.add(candidate)
+            candidate_entries.append((0, candidate))
+
+        for idx, pattern in enumerate(patterns):
+            for match in re.finditer(pattern, html, re.IGNORECASE):
+                try:
+                    captured_link = html_module.unescape(match.group(1).strip())
+                except (IndexError, AttributeError):
+                    logger.warning(f"1fichier: Pattern {idx} matched but no usable capture group(1)")
+                    continue
+                if not captured_link:
+                    continue
+                candidate = captured_link if captured_link.startswith(('http://', 'https://')) else urljoin(page_url, captured_link)
+                if candidate in seen_candidates:
+                    continue
+                seen_candidates.add(candidate)
+                candidate_entries.append((idx, candidate))
+
+        # Examine each pattern and validate the candidate link via HEAD/GET to avoid landing pages (/register, /login)
+        for idx, candidate in candidate_entries:
+            logger.debug(f"1fichier: Pattern {idx} matched, candidate link: {candidate}")
+
+            # Quick heuristic: skip known non-download endpoints
+            lower = candidate.lower()
+            if any(x in lower for x in ['/register', '/login', '/inscription', '/compte', '/subscribe']):
+                logger.debug(f"1fichier: Skipping candidate because it looks like a landing page: {candidate}")
+                continue
+
+            # Validate with HEAD first to check content-type and status
+            try:
+                head = session.head(candidate, allow_redirects=True, timeout=10)
+                if head.status_code >= 400:
+                    logger.debug(f"1fichier: HEAD returned status {head.status_code} for {candidate}, skipping")
+                    continue
+                ctype = head.headers.get('content-type', '')
+                if 'text/html' in ctype.lower():
+                    logger.debug(f"1fichier: HEAD content-type is HTML for {candidate}, skipping")
+                    # as fallback we'll try a quick GET below
+                    raise ValueError('HTML content')
+                # Looks like a direct file
+                direct_link = candidate
+                logger.debug(f"1fichier: Direct link validated via HEAD: {direct_link}")
+                break
+            except Exception as he:
+                # HEAD may be blocked; try a quick GET without streaming
+                try:
+                    logger.debug(f"1fichier: HEAD failed ({he}), trying quick GET for candidate {candidate}")
+                    rtest = session.get(candidate, allow_redirects=True, timeout=10)
+                    if rtest.status_code >= 400:
+                        logger.debug(f"1fichier: quick GET returned status {rtest.status_code} for {candidate}, skipping")
+                        continue
+                    ctype = rtest.headers.get('content-type', '')
+                    if 'text/html' in ctype.lower() or '<html' in (rtest.text or '').lower():
+                        logger.debug(f"1fichier: quick GET appears to be HTML/landing for {candidate}, skipping")
+                        continue
+                    direct_link = candidate
+                    logger.debug(f"1fichier: Direct link validated via quick GET: {direct_link}")
+                    break
+                except Exception as ge:
+                    logger.debug(f"1fichier: quick GET also failed for {candidate}: {ge}")
+                    continue
+
+        if not direct_link:
+            blocked_reason = _extract_1fichier_free_mode_block_reason(html)
+            if blocked_reason:
+                logger.warning(f"1fichier: no direct link because free mode is blocked: {blocked_reason}")
+                return (False, None, blocked_reason)
+            logger.error(f"1fichier: No valid download link found. HTML preview (first 700 chars): {html[:700]}")
+            return (False, None, "Lien de téléchargement introuvable")
+        
+        _log(_("free_mode_link_found").format(direct_link[:60]))
+        
+        # 5. HEAD pour infos fichier
+        if cancel_event and cancel_event.is_set():
+            return (False, None, "Annulé")
+            
+        head = session.head(direct_link, allow_redirects=True, timeout=30)
+        
+        # Nom fichier
+        filename = 'downloaded_file'
+        cd = head.headers.get('content-disposition', '')
+        if cd:
+            fn_match = re.search(r'filename\*?=[\"\']?([^\"\';]+)', cd, re.IGNORECASE)
+            if fn_match:
+                filename = unquote(fn_match.group(1))
+        
+        filename = sanitize_filename(filename)
+        filepath = os.path.join(dest_dir, filename)
+        
+        # 6. Téléchargement
+        _log(_("free_mode_download").format(filename))
+        
+        with session.get(direct_link, stream=True, allow_redirects=True, timeout=30) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get('content-length', 0))
+
+            has_space, low_space_message = _ensure_sufficient_disk_space(dest_dir, total)
+            if not has_space:
+                return (False, None, low_space_message)
+            
+            with open(filepath, 'wb') as f:
+                downloaded = 0
+                for chunk in resp.iter_content(chunk_size=128*1024):
+                    if cancel_event and cancel_event.is_set():
+                        return (False, None, "Annulé")
+                    
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    if total:
+                        pct = downloaded / total * 100
+                        _progress(filename, downloaded, total, pct)
+        
+        _log(_("free_mode_completed").format(filepath))
+        return (True, filepath, None)
+        
+    except Exception as e:
+        error_msg = f"Error Downloading with free mode: {str(e)}"
+        _log(error_msg)
+        logger.error(error_msg, exc_info=True)
+        return (False, None, error_msg)
+
+# ==================== FIN TÉLÉCHARGEMENT GRATUIT ====================
+
+# Plus besoin de web_progress.json - l'interface web lit directement history.json
+# Les fonctions update_web_progress() et remove_web_progress() sont supprimées
+
+cache = {}
+CACHE_TTL = 3600  # 1 heure
+        
+def test_internet():
+    """Teste la connexion Internet de manière complète et portable pour Windows et Linux/Batocera."""
+    logger.debug("=== Début test de connexion Internet complet ===")
+    
+    # Test 1: Ping vers serveurs DNS publics
+    ping_option = '-n' if sys.platform.startswith("win") else '-c'
+    dns_servers = ['8.8.8.8', '1.1.1.1', '208.67.222.222']  # Google, Cloudflare, OpenDNS
+    
+    ping_success = False
+    for dns_server in dns_servers:
+        
+        try:
+            result = subprocess.run(
+                ['ping', ping_option, '2', dns_server],
+                capture_output=True,
+                text=True,
+                timeout=8
+            )
+            if result.returncode == 0:
+                logger.debug(f"[OK] Ping vers {dns_server} réussi")
+                ping_success = True
+                break
+            else:
+                logger.debug(f"[FAIL] Ping vers {dns_server} échoué (code: {result.returncode})")
+                if result.stderr:
+                    logger.debug(f"Erreur ping: {result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            logger.debug(f"[FAIL] Timeout ping vers {dns_server}")
+        except Exception as e:
+            logger.debug(f"[FAIL] Exception ping vers {dns_server}: {str(e)}")
+    
+    # Test 2: Tentative de résolution DNS
+    dns_success = False
+    try:
+        import socket
+       
+        socket.gethostbyname('google.com')
+        logger.debug("[OK] Résolution DNS réussie")
+        dns_success = True
+    except socket.gaierror as e:
+        logger.debug(f"[FAIL] Erreur résolution DNS: {str(e)}")
+    except Exception as e:
+        logger.debug(f"[FAIL] Exception résolution DNS: {str(e)}")
+    
+    # Test 3: Tentative de connexion HTTP
+    http_success = False
+    test_urls = [
+        'http://www.google.com',
+        'http://www.cloudflare.com',
+        'https://httpbin.org/get'
+    ]
+    
+    for test_url in test_urls:
+        try:
+            response = requests.get(test_url, timeout=5, allow_redirects=True)
+            if response.status_code == 200:
+                logger.debug(f"[OK] Connexion HTTP vers {test_url} réussie (code: {response.status_code})")
+                http_success = True
+                break
+            else:
+                logger.debug(f"[FAIL] Connexion HTTP vers {test_url} échouée (code: {response.status_code})")
+        except requests.exceptions.Timeout:
+            logger.debug(f"[FAIL] Timeout connexion HTTP vers {test_url}")
+        except requests.exceptions.ConnectionError as e:
+            logger.debug(f"[FAIL] Erreur connexion HTTP vers {test_url}: {str(e)}")
+        except Exception as e:
+            logger.debug(f"[FAIL] Exception connexion HTTP vers {test_url}: {str(e)}")
+    
+    # Analyse des résultats
+    total_tests = 3
+    passed_tests = sum([ping_success, dns_success, http_success])
+
+    
+    # Diagnostic et conseils
+    if passed_tests == 0:
+        logger.error("Aucune connexion Internet détectée. Vérifiez:")
+        logger.error("- Câble réseau ou WiFi connecté")
+        logger.error("- Configuration proxy/firewall")
+        logger.error("- Paramètres réseau système")
+        return False
+    elif passed_tests < total_tests:
+        logger.warning(f"Connexion Internet partielle ({passed_tests}/{total_tests})")
+        if not ping_success:
+            logger.warning("- Ping échoué: possible blocage ICMP par firewall")
+        if not dns_success:
+            logger.warning("- DNS échoué: problème serveurs DNS")
+        if not http_success:
+            logger.warning("- HTTP échoué: possible blocage proxy/firewall")
+        return True  # Connexion partielle acceptable
+    else:
+        logger.debug("[OK] Connexion Internet complète et fonctionnelle")
+        return True
+
+
+def _normalize_release_notes(raw_notes):
+    if not raw_notes:
+        return ""
+    notes = html_module.unescape(str(raw_notes))
+    notes = notes.replace("\r\n", "\n").replace("\r", "\n")
+    notes = re.sub(r"\n{3,}", "\n\n", notes)
+    return notes.strip()
+
+
+def _extract_changelog_section(raw_text):
+    text = _normalize_release_notes(raw_text)
+    if not text:
+        return ""
+
+    def _is_version_heading(heading_text):
+        normalized = str(heading_text or "").strip()
+        return re.match(
+            r"^(?:release\s+)?(?:v(?:ersion)?\s*)?\d+(?:\.\d+)+(?:\s*[(:-].*)?$",
+            normalized,
+            re.IGNORECASE,
+        ) is not None
+
+    lines = text.split("\n")
+    heading_re = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+    changelog_start = None
+    changelog_level = None
+
+    for index, line in enumerate(lines):
+        match = heading_re.match(line.strip())
+        if not match:
+            continue
+        if "changelog" in match.group(2).lower():
+            changelog_start = index + 1
+            changelog_level = len(match.group(1))
+            break
+
+    if changelog_start is None:
+        return text
+
+    extracted = []
+    for line in lines[changelog_start:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        match = heading_re.match(stripped)
+        if match and len(match.group(1)) <= changelog_level and not _is_version_heading(match.group(2)):
+            break
+        extracted.append(line)
+
+    return _normalize_release_notes("\n".join(extracted))
+
+
+def _fetch_recent_release_changelogs(limit=5):
+    repo = getattr(config, "GITHUB_REPO", "RetroGameSets/RGSX")
+    api_url = f"https://api.github.com/repos/{repo}/releases"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "RGSX",
+    }
+
+    response = requests.get(api_url, headers=headers, timeout=10)
+    response.raise_for_status()
+
+    releases = response.json()
+    if not isinstance(releases, list):
+        return []
+
+    changelogs = []
+    for release in releases:
+        if not isinstance(release, dict) or release.get("draft"):
+            continue
+
+        version_label = (
+            release.get("tag_name")
+            or release.get("name")
+            or release.get("published_at")
+            or "Unknown"
+        )
+        release_body = _extract_changelog_section(release.get("body", ""))
+        if not release_body:
+            release_body = "Changelog unavailable"
+
+        changelogs.append({
+            "version": str(version_label).strip(),
+            "body": release_body,
+        })
+
+        if len(changelogs) >= limit:
+            break
+
+    return changelogs
+
+
+def _build_recent_changelog_text(latest_version, limit=5):
+    changelogs = _fetch_recent_release_changelogs(limit=limit)
+    title = _("network_update_available").format(latest_version) if _ else f"Update available: {latest_version}"
+    intro = f"{title}\n\nLast {len(changelogs) if changelogs else limit} changelogs:\n"
+
+    if not changelogs:
+        return f"{intro}\nChangelog unavailable"
+
+    blocks = []
+    for item in changelogs:
+        blocks.append(f"=== {item['version']} ===\n{item['body']}")
+
+    return intro + "\n\n".join(blocks) + "\n\nPress Confirm to install the update."
+
+
+def _format_size(num_bytes):
+    value = float(max(0, num_bytes))
+    units = ["B", "KB", "MB", "GB"]
+    unit_index = 0
+    while value >= 1024 and unit_index < len(units) - 1:
+        value /= 1024.0
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(value)} {units[unit_index]}"
+    return f"{value:.1f} {units[unit_index]}"
+
+
+def _set_loading_details(*lines):
+    config.loading_detail_lines = [str(line) for line in lines if line]
+    config.needs_redraw = True
+
+
+def _safe_remove_file(file_path, retries=8, delay=0.25):
+    if not file_path or not os.path.exists(file_path):
+        return True
+
+    last_error = None
+    for _ in range(retries):
+        try:
+            os.remove(file_path)
+            return True
+        except PermissionError as error:
+            last_error = error
+            time.sleep(delay)
+        except FileNotFoundError:
+            return True
+        except Exception as error:
+            last_error = error
+            break
+
+    if last_error is not None:
+        logger.warning(f"Impossible de supprimer temporairement {file_path}: {last_error}")
+    return False
+
+
+def _schedule_windows_file_replace_when_unlocked(source_path: str, target_path: str) -> bool:
+    """Planifie un remplacement différé d'un fichier verrouillé (ex: .bat en cours d'exécution)."""
+    if config.OPERATING_SYSTEM != "Windows":
+        return False
+    if not source_path or not target_path:
+        return False
+
+    try:
+        ps_script = (
+            "$src = [IO.Path]::GetFullPath($args[0]); "
+            "$dst = [IO.Path]::GetFullPath($args[1]); "
+            "for ($i = 0; $i -lt 240; $i++) { "
+            "  try { "
+            "    Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop; "
+            "    Remove-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue; "
+            "    exit 0; "
+            "  } catch { Start-Sleep -Milliseconds 500 } "
+            "} "
+            "exit 1"
+        )
+        creationflags = 0
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags = subprocess.CREATE_NO_WINDOW
+        subprocess.Popen(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                ps_script,
+                source_path,
+                target_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(f"Impossible de planifier le remplacement différé de {target_path}: {exc}")
+        return False
+
+
+def _copy_windows_update_tree(source_root: str, target_root: str) -> tuple[int, int, list[str]]:
+    """Copie une arborescence windows update; diffère le .bat s'il est verrouillé."""
+    updated_files = 0
+    deferred_files = 0
+    errors: list[str] = []
+
+    for current_root, _dirs, files in os.walk(source_root):
+        rel_root = os.path.relpath(current_root, source_root)
+        if rel_root == ".":
+            rel_root = ""
+        dest_root = os.path.join(target_root, rel_root) if rel_root else target_root
+        os.makedirs(dest_root, exist_ok=True)
+
+        for filename in files:
+            src_file = os.path.join(current_root, filename)
+            dst_file = os.path.join(dest_root, filename)
+            dst_is_launcher = filename.lower() == "rgsx retrobat.bat"
+
+            try:
+                if os.path.exists(dst_file):
+                    try:
+                        os.chmod(dst_file, 0o666)
+                    except Exception:
+                        pass
+
+                shutil.copy2(src_file, dst_file)
+                updated_files += 1
+                continue
+            except PermissionError:
+                pass
+            except OSError:
+                pass
+            except Exception as exc:
+                errors.append(f"{dst_file}: {exc}")
+                continue
+
+            if dst_is_launcher:
+                pending_path = dst_file + ".pending_update"
+                try:
+                    shutil.copy2(src_file, pending_path)
+                    if _schedule_windows_file_replace_when_unlocked(pending_path, dst_file):
+                        deferred_files += 1
+                    else:
+                        errors.append(f"{dst_file}: impossible de planifier le remplacement différé")
+                except Exception as exc:
+                    errors.append(f"{dst_file}: {exc}")
+            else:
+                errors.append(f"{dst_file}: fichier verrouillé ou inaccessible")
+
+    return updated_files, deferred_files, errors
+
+
+async def _apply_pending_windows_update(latest_version: str) -> tuple[bool, str]:
+    """Applique le ZIP update_windows sur Windows sans bloquer en cas de .bat verrouillé."""
+    if config.OPERATING_SYSTEM != "Windows":
+        return True, "Windows update skipped (non-Windows OS)"
+
+    windows_zip_url = OTA_UPDATE_WINDOWS_ZIP
+    windows_zip_path = os.path.join(UPDATE_FOLDER, f"RGSX_update_windows_v{latest_version}.zip")
+    extract_root = os.path.join(UPDATE_FOLDER, f"RGSX_update_windows_extract_{latest_version}")
+
+    try:
+        logger.debug(f"Téléchargement du ZIP Windows update: {windows_zip_url}")
+        with requests.get(windows_zip_url, stream=True, timeout=10) as r:
+            if r.status_code == 404:
+                logger.info("ZIP update_windows introuvable (404): mise à jour Windows spécifique ignorée")
+                return True, "Windows update zip not published"
+            r.raise_for_status()
+            with open(windows_zip_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+        if os.path.isdir(extract_root):
+            shutil.rmtree(extract_root, ignore_errors=True)
+        os.makedirs(extract_root, exist_ok=True)
+
+        ok_extract, msg_extract = await asyncio.to_thread(extract_update, windows_zip_path, extract_root, windows_zip_url)
+        if not ok_extract:
+            return False, f"Windows update extraction failed: {msg_extract}"
+
+        # The Windows update zip is expected to contain the direct content
+        # of roms/windows at archive root.
+        source_root = extract_root
+
+        target_root = os.path.join(config.ROMS_FOLDER, "windows")
+        os.makedirs(target_root, exist_ok=True)
+
+        updated_count, deferred_count, copy_errors = _copy_windows_update_tree(source_root, target_root)
+        for error_text in copy_errors[:8]:
+            logger.warning(f"Windows update: {error_text}")
+        if len(copy_errors) > 8:
+            logger.warning(f"Windows update: {len(copy_errors) - 8} erreurs supplémentaires omises")
+
+        if copy_errors and updated_count == 0 and deferred_count == 0:
+            return False, "Windows update copy failed"
+
+        return True, f"Windows update applied ({updated_count} fichiers, {deferred_count} différé(s))"
+    except Exception as exc:
+        return False, f"Windows update failed: {exc}"
+    finally:
+        _safe_remove_file(windows_zip_path)
+        try:
+            if os.path.isdir(extract_root):
+                shutil.rmtree(extract_root, ignore_errors=True)
+        except Exception:
+            pass
+
+
+async def apply_pending_update(latest_version):
+    UPDATE_ZIP = OTA_UPDATE_ZIP
+    logger.debug(f"URL de mise à jour : {UPDATE_ZIP} (version {latest_version})")
+
+    config.current_loading_system = _("network_update_available").format(latest_version)
+    config.loading_progress = 10.0
+    _set_loading_details("Preparing update...")
+    logger.debug(f"Téléchargement du ZIP de mise à jour : {UPDATE_ZIP}")
+
+    os.makedirs(UPDATE_FOLDER, exist_ok=True)
+    update_zip_path = os.path.join(UPDATE_FOLDER, f"RGSX_update_v{latest_version}.zip")
+    logger.debug(f"Téléchargement de {UPDATE_ZIP} vers {update_zip_path}")
+
+    with requests.get(UPDATE_ZIP, stream=True, timeout=10) as r:
+        r.raise_for_status()
+        total_size = int(r.headers.get('content-length', 0))
+        downloaded = 0
+        start_time = time.time()
+        with open(update_zip_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    config.loading_progress = 10.0 + (40.0 * downloaded / total_size) if total_size > 0 else 10.0
+                    elapsed = max(time.time() - start_time, 0.001)
+                    speed = downloaded / elapsed
+                    progress_line = f"Download: {_format_size(downloaded)} / {_format_size(total_size)}" if total_size > 0 else f"Download: {_format_size(downloaded)}"
+                    _set_loading_details(progress_line, f"Speed: {_format_size(speed)}/s")
+                    await asyncio.sleep(0)
+    logger.debug(f"ZIP téléchargé : {update_zip_path}")
+
+    config.current_loading_system = _("network_extracting_update")
+    config.loading_progress = 60.0
+    _set_loading_details(f"Archive: {_format_size(os.path.getsize(update_zip_path))}")
+    success, message = await asyncio.to_thread(extract_update, update_zip_path, APP_FOLDER, UPDATE_ZIP)
+    if not success:
+        logger.error(f"Échec de l'extraction : {message}")
+        return False, _("network_extraction_failed").format(message)
+
+    if _safe_remove_file(update_zip_path):
+        logger.debug(f"Fichier ZIP {update_zip_path} supprimé")
+
+    # Mise à jour complémentaire des assets Windows (launcher/scripts), uniquement sous Windows.
+    if config.OPERATING_SYSTEM == "Windows":
+        config.current_loading_system = "Applying Windows launcher update..."
+        config.loading_progress = 85.0
+        _set_loading_details("Applying Windows-specific update package")
+        win_ok, win_msg = await _apply_pending_windows_update(latest_version)
+        if win_ok:
+            logger.info(f"Windows update: {win_msg}")
+        else:
+            # Ne pas annuler l'update principale si le package Windows échoue.
+            logger.warning(f"Windows update non bloquant: {win_msg}")
+
+    config.current_loading_system = _("network_update_completed")
+    config.loading_progress = 100.0
+    _set_loading_details("Update installed successfully")
+    logger.debug("Mise à jour terminée avec succès")
+
+    config.menu_state = "restart_popup"
+    config.update_result_message = _("network_update_success").format(latest_version)
+    config.popup_message = config.update_result_message
+    config.popup_timer = 2000
+    config.update_result_error = False
+    config.update_result_start_time = pygame.time.get_ticks() if pygame is not None else 0
+    config.needs_redraw = True
+    logger.debug("Affichage de la popup de mise à jour réussie, redémarrage imminent")
+
+    try:
+        from utils import restart_application
+        restart_application(2000)
+    except Exception as e:
+        logger.error(f"Erreur lors du redémarrage après mise à jour: {e}")
+
+    return True, _("network_update_success_message")
+
+
+async def check_for_updates():
+    try:
+        logger.debug("Vérification de la version disponible sur le serveur")
+        config.current_loading_system = _("network_checking_updates")
+        config.loading_progress = 5.0
+        config.needs_redraw = True
+
+        # Liste des endpoints à essayer (GitHub principal, puis fallback)
+        endpoints = [
+            OTA_VERSION_ENDPOINT,
+            "https://retrogamesets.fr/softs/version.json"
+        ]
+        
+        response = None
+        last_error = None
+        
+        for endpoint_index, endpoint in enumerate(endpoints):
+            is_fallback = endpoint_index > 0
+            if is_fallback:
+                logger.info(f"Tentative sur endpoint de secours : {endpoint}")
+            
+            # Gestion des erreurs de rate limit GitHub (429) avec retry
+            max_retries = 3 if not is_fallback else 1  # Moins de retries sur fallback
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    response = requests.get(endpoint, timeout=10)
+                    
+                    # Gestion spécifique des erreurs 429 (Too Many Requests) - surtout pour GitHub
+                    if response.status_code == 429:
+                        retry_after = response.headers.get('retry-after')
+                        x_ratelimit_remaining = response.headers.get('x-ratelimit-remaining', '1')
+                        x_ratelimit_reset = response.headers.get('x-ratelimit-reset')
+                        
+                        if retry_after:
+                            # En-tête retry-after présent : attendre le nombre de secondes spécifié
+                            wait_time = int(retry_after)
+                            logger.warning(f"Rate limit atteint (429) sur {endpoint}. Attente de {wait_time}s (retry-after header)")
+                        elif x_ratelimit_remaining == '0' and x_ratelimit_reset:
+                            # x-ratelimit-remaining est 0 : attendre jusqu'à x-ratelimit-reset
+                            import time
+                            reset_time = int(x_ratelimit_reset)
+                            current_time = int(time.time())
+                            wait_time = max(reset_time - current_time, 60)  # Minimum 60s
+                            logger.warning(f"Rate limit atteint (429) sur {endpoint}. Attente de {wait_time}s (x-ratelimit-reset)")
+                        else:
+                            # Pas d'en-têtes spécifiques : attendre au moins 60s
+                            wait_time = 60
+                            logger.warning(f"Rate limit atteint (429) sur {endpoint}. Attente de {wait_time}s par défaut")
+                        
+                        if retry_count < max_retries - 1:
+                            logger.info(f"Nouvelle tentative dans {wait_time}s... ({retry_count + 1}/{max_retries})")
+                            await asyncio.sleep(wait_time)
+                            retry_count += 1
+                            continue
+                        else:
+                            # Si rate limit persistant et qu'on est sur GitHub, essayer le fallback
+                            if not is_fallback:
+                                logger.warning(f"Rate limit GitHub persistant, passage au serveur de secours")
+                                break  # Sortir de la boucle retry pour essayer le prochain endpoint
+                            raise requests.exceptions.HTTPError(
+                                f"Limite de débit atteinte (429). Veuillez réessayer plus tard."
+                            )
+                    
+                    response.raise_for_status()
+                    # Succès, sortir de toutes les boucles
+                    logger.debug(f"Version récupérée avec succès depuis : {endpoint}")
+                    break
+                    
+                except requests.exceptions.HTTPError as e:
+                    last_error = e
+                    if response and response.status_code == 429:
+                        # 429 géré au-dessus, continuer la boucle ou passer au fallback
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            break  # Passer au prochain endpoint
+                    else:
+                        # Erreur HTTP autre que 429
+                        logger.warning(f"Erreur HTTP {response.status_code if response else 'inconnue'} sur {endpoint}")
+                        break  # Passer au prochain endpoint
+                        
+                except requests.exceptions.RequestException as e:
+                    last_error = e
+                    if retry_count < max_retries - 1:
+                        # Erreur réseau, réessayer avec backoff exponentiel
+                        wait_time = 2 ** retry_count  # 1s, 2s, 4s
+                        logger.warning(f"Erreur réseau sur {endpoint}. Nouvelle tentative dans {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        retry_count += 1
+                    else:
+                        logger.warning(f"Erreur réseau persistante sur {endpoint} : {e}")
+                        break  # Passer au prochain endpoint
+            
+            # Si on a une réponse valide, sortir de la boucle des endpoints
+            if response and response.status_code == 200:
+                break
+        
+        # Si aucun endpoint n'a fonctionné
+        if not response or response.status_code != 200:
+            raise last_error if last_error else requests.exceptions.RequestException(
+                "Impossible de vérifier les mises à jour sur tous les serveurs"
+            )
+        
+        # Accepter différents content-types (application/json, text/plain, text/html)
+        content_type = response.headers.get("content-type", "")
+        allowed_types = ["application/json", "text/plain", "text/html"]
+        if not any(allowed in content_type for allowed in allowed_types):
+            raise ValueError(
+                f"Le fichier version.json n'est pas un JSON valide (type de contenu : {content_type})"
+            )
+        
+        version_data = response.json()
+        latest_version = version_data.get("version")
+        logger.debug(f"Version distante : {latest_version}, version locale : {config.app_version}")
+
+        # --- Protection anti-downgrade ---
+        def _parse_version(v: str):
+            try:
+                return [int(p) for p in str(v).strip().split('.') if p.isdigit()]
+            except Exception:
+                return [0]
+
+        local_parts = _parse_version(getattr(config, 'app_version', '0'))
+        remote_parts = _parse_version(latest_version or '0')
+        # Normaliser longueur
+        max_len = max(len(local_parts), len(remote_parts))
+        local_parts += [0] * (max_len - len(local_parts))
+        remote_parts += [0] * (max_len - len(remote_parts))
+        logger.debug(f"Comparaison versions normalisées local={local_parts} remote={remote_parts}")
+        if remote_parts <= local_parts:
+            # Pas de mise à jour si version distante identique ou inférieure (empêche downgrade accidentel)
+            logger.info("Version distante inférieure ou égale – skip mise à jour (anti-downgrade)")
+            return True, _("network_no_update_available") if _ else "No update (local >= remote)"
+
+        if latest_version != config.app_version:
+            try:
+                changelog_text = _build_recent_changelog_text(latest_version, limit=5)
+            except Exception as changelog_error:
+                logger.warning(f"Impossible de récupérer les changelogs récents: {changelog_error}")
+                changelog_text = "Changelog unavailable"
+
+            config.pending_update_version = latest_version
+            config.startup_update_confirmed = False
+            config.text_file_name = f"RGSX {latest_version}"
+            config.text_file_content = changelog_text
+            config.text_file_scroll_offset = 0
+            config.text_file_mode = "ota_update"
+            config.previous_menu_state = "loading"
+            config.menu_state = "text_file_viewer"
+            config.update_checked = True
+            config.needs_redraw = True
+            return True, _("network_update_available").format(latest_version)
+        else:
+            logger.debug("Aucune mise à jour disponible")
+            config.update_checked = True
+            return True, _("network_no_update_available")
+
+    except Exception as e:
+        logger.error(f"Erreur OTA : {str(e)}")
+        config.menu_state = "update_result"
+        config.update_result_message = _("network_update_error").format(str(e))
+        config.popup_message = config.update_result_message
+        config.popup_timer = 5000
+        config.update_result_error = True
+        config.update_result_start_time = pygame.time.get_ticks() if pygame is not None else 0
+        config.needs_redraw = True
+        return False, _("network_check_update_error").format(str(e))
+
+def extract_update(zip_path, dest_dir, source_url):
+    
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        logger.debug(f"Tentative d'ouverture du ZIP : {zip_path}")
+        # Extraire le ZIP
+        skipped_files = []
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            file_infos = [info for info in zip_ref.infolist() if not info.is_dir()]
+            total_bytes = sum(max(0, info.file_size) for info in file_infos)
+            extracted_bytes = 0
+            for file_info in zip_ref.infolist():
+                try:
+                    zip_ref.extract(file_info, dest_dir)
+                    if not file_info.is_dir():
+                        extracted_bytes += max(0, file_info.file_size)
+                        if total_bytes > 0:
+                            config.loading_progress = 60.0 + (40.0 * extracted_bytes / total_bytes)
+                        _set_loading_details(
+                            f"Extracting: {_format_size(extracted_bytes)} / {_format_size(total_bytes)}" if total_bytes > 0 else f"Extracting: {file_info.filename}",
+                            file_info.filename
+                        )
+                except PermissionError as e:
+                    logger.warning(f"Impossible d'extraire {file_info.filename}: {str(e)}")
+                    skipped_files.append(file_info.filename)
+                except Exception as e:
+                    logger.warning(f"Erreur lors de l'extraction de {file_info.filename}: {str(e)}")
+                    skipped_files.append(file_info.filename)
+
+        if skipped_files:
+            message = _("network_extraction_partial").format(', '.join(skipped_files))
+            logger.warning(message)
+            return True, message  # Considérer comme succès si certains fichiers sont extraits
+        return True, _("network_extraction_success")
+
+    except Exception as e:
+        logger.error(f"Erreur critique lors de l'extraction du ZIP {source_url}: {str(e)}")
+        return False, _("network_zip_extraction_error").format(source_url, str(e))
+
+# File d'attente pour la progression - une par tâche
+progress_queues = {}
+# Cancellation and thread tracking per download task
+cancel_events = {}
+# Pause events for downloads
+pause_events = {}  # {task_id: threading.Event} - Event is set when paused
+download_threads = {}
+# Chemins temp_root des téléchargements torrent en cours, indexés par task_id.
+# Permet de nettoyer le dossier temporaire lors d'une annulation même si cancel_events
+# a déjà été supprimé (téléchargement terminé côté thread mais UI encore "Téléchargement").
+torrent_temp_roots: dict[str, str] = {}
+# Flag global : True quand l'application est en cours d'arrêt propre.
+# Permet d'ignorer les signaux d'annulation déclenchés par le shutdown asyncio
+# et de préserver l'état "Téléchargement" en historique pour la reprise.
+_app_shutting_down: bool = False
+# URLs actuellement en cours de téléchargement (pour éviter les doublons)
+urls_in_progress = set()
+urls_lock = threading.Lock()
+# Résultats des URLs en cours de téléchargement (pour les doublons)
+url_results = {}  # {url: (success, message)}
+# Événements pour synchroniser les appels doublons (attendre la fin du premier)
+url_done_events = {}  # {url: threading.Event}
+
+def request_cancel(task_id: str) -> bool:
+    """Request cancellation for a running download task by its task_id."""
+    ev = cancel_events.get(task_id)
+    if ev is not None:
+        try:
+            ev.set()
+            logger.debug(f"Cancel requested for task_id={task_id}")
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to set cancel for task_id={task_id}: {e}")
+            return False
+    logger.debug(f"No cancel event found for task_id={task_id}")
+    return False
+
+
+def _find_stray_torrent_temp_roots(stable_key: str) -> list[str]:
+    """Recherche tous les dossiers '.rgsx_torrent/<stable_key>' existants sous les
+    dossiers de plateformes de ROMS_FOLDER.
+
+    Utile car le dossier de destination résolu pour une plateforme peut varier
+    d'une session à l'autre (ex: bug historique de résolution de dossier avant
+    chargement de config.platform_dicts), laissant des dossiers de reprise
+    orphelins dans un ancien emplacement. On les recherche tous pour un nettoyage
+    complet, plutôt que de se fier uniquement au dernier temp_root connu.
+    """
+    found: list[str] = []
+    if not stable_key:
+        return found
+    roms_root = getattr(config, 'ROMS_FOLDER', '') or ''
+    if not roms_root or not os.path.isdir(roms_root):
+        return found
+    try:
+        for entry in os.listdir(roms_root):
+            platform_dir = os.path.join(roms_root, entry)
+            if not os.path.isdir(platform_dir):
+                continue
+            candidate = os.path.join(platform_dir, ".rgsx_torrent", stable_key)
+            if os.path.isdir(candidate):
+                found.append(candidate)
+    except Exception as e:
+        logger.debug(f"_find_stray_torrent_temp_roots: erreur scan {roms_root}: {e}")
+    return found
+
+
+def cleanup_torrent_temp(task_id: str) -> bool:
+    """Supprime le dossier temporaire torrent associé à task_id.
+    
+    À appeler lors d'une annulation explicite par l'utilisateur (via l'UI),
+    notamment quand cancel_events ne contient plus le task_id (téléchargement
+    terminé côté thread mais statut UI encore 'Téléchargement').
+    Retourne True si un dossier a été supprimé.
+    """
+    temp_root = torrent_temp_roots.pop(task_id, None)
+    removed_any = False
+    if temp_root and os.path.isdir(temp_root):
+        try:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            logger.debug(f"cleanup_torrent_temp: dossier supprimé {temp_root}")
+            removed_any = True
+        except Exception as e:
+            logger.debug(f"cleanup_torrent_temp: erreur suppression {temp_root}: {e}")
+
+    # Nettoyer aussi les éventuels dossiers orphelins du même torrent situés sous
+    # un autre dossier de plateforme (ex: résolution de dossier différente d'une
+    # session à l'autre).
+    if temp_root:
+        stable_key = os.path.basename(temp_root.rstrip("\\/"))
+        for stray_root in _find_stray_torrent_temp_roots(stable_key):
+            if os.path.normcase(os.path.abspath(stray_root)) == os.path.normcase(os.path.abspath(temp_root)):
+                continue
+            try:
+                shutil.rmtree(stray_root, ignore_errors=True)
+                logger.debug(f"cleanup_torrent_temp: dossier orphelin supprimé {stray_root}")
+                removed_any = True
+            except Exception as e:
+                logger.debug(f"cleanup_torrent_temp: erreur suppression orpheline {stray_root}: {e}")
+
+    return removed_any
+
+
+
+def _cleanup_torrent_resume_artifacts(source_url: str | None, file_index: int | None, dest_path: str | None) -> bool:
+    """Supprime les artefacts de reprise torrent (.rgsx_torrent/*) pour un fichier terminé."""
+    if not source_url or not dest_path:
+        return False
+
+    removed_any = False
+    try:
+        import hashlib as _hashlib
+        stable_key = _hashlib.md5(f"{source_url}|{int(file_index or 1)}".encode()).hexdigest()[:12]
+        dest_dir = os.path.dirname(dest_path) or os.path.abspath(config.ROMS_FOLDER)
+        rom_root = os.path.abspath(dest_dir)
+        temp_parent = os.path.join(rom_root, ".rgsx_torrent")
+        temp_root = os.path.join(temp_parent, stable_key)
+
+        if os.path.isdir(temp_root):
+            shutil.rmtree(temp_root, ignore_errors=True)
+            removed_any = True
+            logger.debug(f"_cleanup_torrent_resume_artifacts: dossier supprimé {temp_root}")
+
+        if os.path.isdir(temp_parent):
+            try:
+                if not os.listdir(temp_parent):
+                    os.rmdir(temp_parent)
+                    logger.debug(f"_cleanup_torrent_resume_artifacts: dossier vide supprimé {temp_parent}")
+            except Exception:
+                pass
+
+        # Nettoyer aussi les dossiers orphelins du même torrent sous un autre
+        # dossier de plateforme (résolution de dossier incohérente d'une session
+        # à l'autre).
+        for stray_root in _find_stray_torrent_temp_roots(stable_key):
+            if os.path.normcase(os.path.abspath(stray_root)) == os.path.normcase(os.path.abspath(temp_root)):
+                continue
+            try:
+                shutil.rmtree(stray_root, ignore_errors=True)
+                removed_any = True
+                logger.debug(f"_cleanup_torrent_resume_artifacts: dossier orphelin supprimé {stray_root}")
+                stray_parent = os.path.dirname(stray_root)
+                if os.path.isdir(stray_parent) and not os.listdir(stray_parent):
+                    os.rmdir(stray_parent)
+            except Exception as e:
+                logger.debug(f"_cleanup_torrent_resume_artifacts: erreur suppression orpheline {stray_root}: {e}")
+    except Exception as exc:
+        logger.debug(f"_cleanup_torrent_resume_artifacts: erreur nettoyage: {exc}")
+
+    return removed_any
+
+
+def _cleanup_seeder_local_artifacts(dest_path: str | None, relative_path: str | None, seed_work_dir: str | None, temp_manifest: str | None) -> bool:
+    """Supprime les artefacts locaux d'un seeding (fichiers .aria2, liens et manifest)."""
+    removed_any = False
+
+    candidates: set[str] = set()
+    if dest_path:
+        candidates.add(f"{dest_path}.aria2")
+        if relative_path:
+            torrent_basename = os.path.basename(relative_path)
+            if torrent_basename:
+                candidates.add(os.path.join(os.path.dirname(dest_path), f"{torrent_basename}.aria2"))
+
+    for candidate in candidates:
+        try:
+            if os.path.isfile(candidate):
+                os.remove(candidate)
+                removed_any = True
+                logger.debug(f"_cleanup_seeder_local_artifacts: fichier supprimé {candidate}")
+        except Exception as exc:
+            logger.debug(f"_cleanup_seeder_local_artifacts: erreur suppression {candidate}: {exc}")
+
+    if temp_manifest:
+        try:
+            if os.path.isfile(temp_manifest):
+                os.remove(temp_manifest)
+                removed_any = True
+                logger.debug(f"_cleanup_seeder_local_artifacts: manifest supprimé {temp_manifest}")
+        except Exception as exc:
+            logger.debug(f"_cleanup_seeder_local_artifacts: erreur suppression manifest {temp_manifest}: {exc}")
+
+    if seed_work_dir and os.path.isdir(seed_work_dir):
+        try:
+            shutil.rmtree(seed_work_dir, ignore_errors=True)
+            removed_any = True
+            logger.debug(f"_cleanup_seeder_local_artifacts: dossier seed supprimé {seed_work_dir}")
+        except Exception as exc:
+            logger.debug(f"_cleanup_seeder_local_artifacts: erreur suppression dossier seed {seed_work_dir}: {exc}")
+
+    return removed_any
+
+
+def stop_active_seeder(task_id: str | None = None, original_history_url: str | None = None) -> bool:
+    """Stoppe un seed qBittorrent actif par task_id ou URL historique."""
+    try:
+        if qbittorrent_backend.has_active_seed(task_id, original_history_url):
+            return qbittorrent_backend.stop_seed(task_id=task_id, original_history_url=original_history_url)
+    except Exception as exc:
+        logger.debug(f"stop_active_seeder: arrêt seed qBittorrent échoué: {exc}")
+    return False
+
+def toggle_pause_download(task_id: str) -> bool:
+    """Toggle pause state for a running download task. Returns True if now paused, False if resumed."""
+    ev = pause_events.get(task_id)
+    if ev is None:
+        # Créer l'événement de pause s'il n'existe pas
+        pause_events[task_id] = threading.Event()
+        ev = pause_events[task_id]
+    
+    if ev.is_set():
+        # Actuellement en pause, reprendre
+        ev.clear()
+        logger.debug(f"Download resumed for task_id={task_id}")
+        return False  # Retourne False = pas en pause (repris)
+    else:
+        # Actuellement actif, mettre en pause
+        ev.set()
+        logger.debug(f"Download paused for task_id={task_id}")
+        return True  # Retourne True = en pause
+
+def is_download_paused(task_id: str) -> bool:
+    """Check if a download is currently paused."""
+    ev = pause_events.get(task_id)
+    if ev is not None:
+        return ev.is_set()
+    return False
+
+def cancel_all_downloads():
+    """Cancel all active downloads and queued downloads, and attempt to stop threads quickly."""
+    # Annuler tous les téléchargements actifs via cancel_events
+    for tid, ev in list(cancel_events.items()):
+        try:
+            ev.set()
+        except Exception:
+            pass
+    # Optionally join threads briefly
+    for tid, th in list(download_threads.items()):
+        try:
+            if th.is_alive():
+                th.join(timeout=0.2)
+        except Exception:
+            pass
+    
+    # Vider la file d'attente des téléchargements
+    config.download_queue.clear()
+    config.download_active = False
+    
+    # Mettre à jour l'historique pour annuler les téléchargements en statut "Queued"
+    try:
+        history = load_history()
+        for entry in history:
+            if entry.get("status") == "Queued":
+                entry["status"] = "Canceled"
+                entry["message"] = _("download_canceled")
+                logger.info(f"Téléchargement en attente annulé : {entry.get('game_name', '?')}")
+        save_history(history)
+    except Exception as e:
+        logger.error(f"Erreur lors de l'annulation des téléchargements en attente : {e}")
+
+
+def shutdown_downloads():
+    """Appelée au moment de quitter l'application proprement.
+    Arrête les téléchargements actifs et laisse qBittorrent gérer son propre état de reprise."""
+    global _app_shutting_down
+    _app_shutting_down = True
+    # Vider la file d'attente (pas de téléchargements futurs)
+    config.download_queue.clear()
+    config.download_active = False
+    try:
+        qbittorrent_backend.shutdown()
+    except Exception as exc:
+        logger.debug(f"shutdown_downloads: arrêt qBittorrent échoué: {exc}")
+    logger.debug("shutdown_downloads: _app_shutting_down=True, file d'attente vidée.")
+
+
+
+async def download_rom(url, platform, game_name, is_zip_non_supported=False, task_id=None):
+    logger.debug(f"Début téléchargement: {game_name} depuis {url}, zip non supporté={is_zip_non_supported}, task_id={task_id}")
+    
+    # Sauvegarder l'URL originale pour les mises à jour d'historique
+    original_history_url = url
+    # Correction : détecter les URLs rgsx+torrent même si parse_torrent_download_url retourne None (blocage désactivé)
+    torrent_meta = None
+    if url and isinstance(url, str) and url.startswith("rgsx+torrent://"):
+        # Forcer la reconstruction des métadonnées torrent
+        from utils import is_torrent_download_url
+        if is_torrent_download_url(url):
+            # Recréer le dict attendu par _download_torrent_with_aria2
+            from utils import parse_torrent_download_url as _parse_torrent_download_url
+            torrent_meta = _parse_torrent_download_url.__wrapped__(url) if hasattr(_parse_torrent_download_url, '__wrapped__') else _parse_torrent_download_url(url)
+    else:
+        torrent_meta = parse_torrent_download_url(url)
+
+    result = [None, None]
+    
+    # Vérifier si cette URL est déjà en cours de téléchargement (prévenir les doublons)
+    with urls_lock:
+        if url in urls_in_progress:
+            logger.warning(f"⚠️ Un téléchargement pour cette URL est déjà en cours, attente du résultat: {url}")
+            # Créer un événement d'attente si ce n'est pas déjà fait
+            if url not in url_done_events:
+                url_done_events[url] = threading.Event()
+            done_event = url_done_events[url]
+        else:
+            # Ajouter l'URL au set en cours
+            urls_in_progress.add(url)
+            done_event = None
+    
+    # Si on attendait un doublon, on attend ici
+    if done_event is not None:
+        logger.debug(f"Attente de la fin du téléchargement en doublon pour {url}")
+        # Attendre de manière asynchrone l'événement (timeout de 30 minutes pour les gros fichiers)
+        start_wait = time.time()
+        while not done_event.is_set():
+            if time.time() - start_wait > 1800:  # 30 minutes timeout
+                logger.warning(f"Timeout d'attente pour le doublon de {url}")
+                break
+            await asyncio.sleep(0.1)
+        # Vérifier si on a un résultat en cache
+        if url in url_results:
+            logger.info(f"Résultat en cache pour {url}: {url_results[url]}")
+            try:
+                notify_download_finished()
+            except Exception:
+                pass
+            return url_results[url]
+        else:
+            # Fallback: retourner un message de succès (le premier téléchargement a probablement réussi)
+            try:
+                notify_download_finished()
+            except Exception:
+                pass
+            return (True, _("network_download_ok").format(game_name))
+    
+    # Créer une queue/cancel spécifique pour cette tâche
+    if task_id not in progress_queues:
+        progress_queues[task_id] = queue.Queue()
+    if task_id not in cancel_events:
+        cancel_events[task_id] = threading.Event()
+    
+    def download_thread():
+        nonlocal url
+        nonlocal torrent_meta
+        try:
+            _check_history_access_before_download("download_rom")
+            known_total_size = _lookup_known_game_size(platform, game_name, original_history_url)
+            # IMPORTANT: Créer l'entrée dans config.history dès le début avec status "Downloading"
+            # pour que l'interface web puisse afficher le téléchargement en cours
+            
+            # TOUJOURS charger l'historique existant depuis le fichier pour éviter d'écraser les anciennes entrées
+            config.history = load_history()
+            
+            # Vérifier si l'entrée existe déjà
+            entry_exists = False
+            for entry in config.history:
+                if entry.get("url") == original_history_url:
+                    entry_exists = True
+                    # Réinitialiser le status à "Downloading"
+                    entry["status"] = "Downloading"
+                    entry["progress"] = 0
+                    entry["downloaded_size"] = 0
+                    entry["platform"] = platform
+                    entry["game_name"] = game_name
+                    entry["display_name"] = get_clean_display_name(game_name, platform)
+                    entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    entry["task_id"] = task_id
+                    if int(entry.get("total_size", 0) or 0) <= 0 and known_total_size > 0:
+                        entry["total_size"] = known_total_size
+                    break
+            
+            # Si l'entrée n'existe pas, la créer
+            if not entry_exists:
+                config.history.append({
+                    "platform": platform,
+                    "game_name": game_name,
+                    "display_name": get_clean_display_name(game_name, platform),
+                    "url": original_history_url,
+                    "status": "Downloading",
+                    "progress": 0,
+                    "downloaded_size": 0,
+                    "total_size": known_total_size,
+                    "speed": 0,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "message": f"Téléchargement de {game_name}",
+                    "task_id": task_id
+                })
+            
+            # Sauvegarder history.json immédiatement
+            _save_history_with_feedback("download_rom:init")
+            
+            cancel_ev = cancel_events.get(task_id)
+            # Use symlink path if enabled
+            from rgsx_settings import apply_symlink_path, get_platform_custom_path
+            
+            # Vérifier si un dossier personnalisé est configuré pour cette plateforme
+            custom_path = get_platform_custom_path(platform)
+            if custom_path and os.path.isdir(custom_path):
+                dest_dir = custom_path
+                platform_folder = os.path.basename(dest_dir)
+                logger.debug(f"Utilisation du dossier personnalisé pour {platform}: {dest_dir}")
+            else:
+                dest_dir = None
+                platform_folder = None
+                for platform_dict in config.platform_dicts:
+                    if platform_dict.get("platform_name") == platform:
+                        # Priorité: clé 'folder'; fallback legacy: 'dossier'; sinon normalisation du nom de plateforme
+                        platform_folder = map_rom_folder(platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform))
+                        dest_dir = apply_symlink_path(config.ROMS_FOLDER, platform_folder)
+                        logger.debug(f"Répertoire de destination trouvé pour {platform}: {dest_dir}")
+                        break
+                if not dest_dir:
+                    platform_folder = map_rom_folder(resolve_platform_folder(platform))
+                    dest_dir = apply_symlink_path(config.ROMS_FOLDER, platform_folder)
+
+            # Spécifique: si le système est "BIOS" on force le dossier BIOS
+            if platform_folder == "bios" or platform == "BIOS" or platform == "- BIOS by TMCTV -":
+                dest_dir = config.USERDATA_FOLDER
+                logger.debug(f"Plateforme 'BIOS' détectée, destination forcée vers USERDATA_FOLDER: {dest_dir}")
+            
+            os.makedirs(dest_dir, exist_ok=True)
+            if not os.access(dest_dir, os.W_OK):
+                raise PermissionError(f"Pas de permission d'écriture dans {dest_dir}")
+                
+            sanitized_name = sanitize_filename(game_name)
+            dest_path = os.path.join(dest_dir, f"{sanitized_name}")
+            logger.info(f"Chemin destination: {dest_path}")
+            _update_history_local_target(original_history_url, task_id, dest_path)
+
+            expected_size_before_start = int(torrent_meta.get("size_bytes") or 0) if torrent_meta is not None else int(known_total_size or 0)
+            has_space, low_space_message = _ensure_sufficient_disk_space(dest_dir, expected_size_before_start)
+            if not has_space:
+                raise InsufficientDiskSpaceError(low_space_message)
+
+            torrent_meta = parse_torrent_download_url(url)
+            if torrent_meta is not None:
+                if _is_arm_device():
+                    raise RuntimeError("Les téléchargements torrent ne sont pas encore disponibles sur les appareils ARM pour le moment.")
+                if url not in config.download_progress:
+                    config.download_progress[url] = {
+                        "downloaded_size": 0,
+                        "total_size": int(torrent_meta.get("size_bytes") or 0),
+                        "status": "Downloading",
+                        "progress_percent": 0,
+                        "speed": 0,
+                        "game_name": game_name,
+                        "platform": platform,
+                    }
+
+                if os.path.exists(dest_path):
+                    local_size = os.path.getsize(dest_path)
+                    expected_size = int(torrent_meta.get("size_bytes") or 0)
+                    if expected_size <= 0 or local_size == expected_size:
+                        logger.info(f"Le fichier torrent {dest_path} existe déjà, téléchargement ignoré")
+                        result[0] = True
+                        result[1] = _("network_download_ok").format(game_name) + _("download_already_present")
+                        for entry in config.history:
+                            if entry.get("url") == original_history_url:
+                                entry["status"] = "Download_OK"
+                                entry["progress"] = 100
+                                entry["message"] = result[1]
+                                _save_history_with_feedback("download_rom:torrent_already_present")
+                                break
+                        try:
+                            show_toast(result[1])
+                        except Exception:
+                            pass
+                        with urls_lock:
+                            urls_in_progress.discard(original_history_url)
+                        try:
+                            notify_download_finished()
+                        except Exception:
+                            pass
+                        return result[0], result[1]
+
+                torrent_expected_size = int(torrent_meta.get("size_bytes") or 0)
+                has_space, low_space_message = _ensure_sufficient_disk_space(dest_dir, torrent_expected_size)
+                if not has_space:
+                    raise InsufficientDiskSpaceError(low_space_message)
+
+                if not _should_prefer_qbittorrent_backend():
+                    raise qbittorrent_backend.BackendUnavailableError("qBittorrent introuvable, non démarré ou non disponible")
+
+                logger.info("Téléchargement torrent via qBittorrent")
+                success, message = qbittorrent_backend.download_torrent_via_qbittorrent(
+                    torrent_meta,
+                    dest_dir,
+                    dest_path,
+                    task_id,
+                    cancel_ev,
+                    progress_queues[task_id],
+                    original_history_url,
+                    pause_ev=pause_events.setdefault(task_id, threading.Event()),
+                )
+                result[0] = success
+                result[1] = message
+
+                if success and os.path.exists(dest_path):
+                    os.chmod(dest_path, 0o644)
+                logger.debug(f"Téléchargement torrent terminé: {dest_path}")
+            else:
+            
+                # Créer la session AVANT la vérification du fichier existant
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
+                }
+                
+                session = requests.Session()
+                session.headers.update(headers)
+                
+                # Récupérer la taille du fichier pour vimm.net avant de commencer
+                vimm_file_size = 0
+                vimm_download_info = None
+                if 'vimm.net' in url:
+                    vimm_download_info = _fetch_vimm_download_info(url, session)
+                    vimm_file_size = _get_vimm_file_size(url, session, vimm_download_info)
+                    if vimm_file_size > 0:
+                        logger.info(f"Taille du fichier vimm.net déterminée: {vimm_file_size} octets")
+                        # Mettre à jour l'historique avec la taille connue
+                        for entry in config.history:
+                            if entry.get("url") == original_history_url:
+                                entry["total_size"] = vimm_file_size
+                                _save_history_with_feedback("download_rom:vimm_total_size")
+                                break
+
+                    # Utiliser le nom de fichier réel récupéré via Content-Disposition dans _get_vimm_file_size
+                    if vimm_download_info and vimm_download_info.get('real_filename'):
+                        real_filename = sanitize_filename(vimm_download_info['real_filename'])
+                        if real_filename and real_filename != sanitized_name:
+                            dest_path = os.path.join(dest_dir, real_filename)
+                            logger.debug(f"Nom de fichier Vimm réel utilisé: {real_filename}")
+                            _update_history_local_target(original_history_url, task_id, dest_path)
+                            display_name = os.path.splitext(real_filename)[0]
+                            for entry in config.history:
+                                if entry.get('url') == original_history_url:
+                                    entry['display_name'] = display_name
+                                    _save_history_with_feedback("download_rom:vimm_display_name")
+                                    break
+
+                # Gestion spéciale pour vimm.net
+                vimm_original_referer = None
+                if 'vimm.net' in url:
+                    try:
+                        logger.debug("Détection URL vimm.net, récupération du mediaId...")
+                        vimm_original_referer = url  # Sauvegarder l'URL originale pour le referer
+                        if not vimm_download_info:
+                            vimm_download_info = _fetch_vimm_download_info(url, session)
+                        if not vimm_download_info:
+                            raise ValueError("Formulaire de téléchargement introuvable")
+
+                        media_id = str(vimm_download_info.get('media_id') or '').strip()
+                        download_url = str(vimm_download_info.get('base_download_url') or '').strip()
+                        final_download_url = str(vimm_download_info.get('download_url') or '').strip()
+                        if not media_id:
+                            raise ValueError("mediaId introuvable")
+                        if not download_url or not final_download_url:
+                            raise ValueError("URL de téléchargement vimm.net introuvable")
+
+                        logger.debug(f"mediaId trouvé: {media_id}")
+                        logger.debug(f"URL de téléchargement: {download_url}")
+
+                        # Modifier l'URL pour le téléchargement direct
+                        url = final_download_url
+                        logger.debug(f"URL finale pour téléchargement: {url}")
+                        
+                    except Exception as e:
+                        logger.error(f"Erreur lors du traitement vimm.net: {e}")
+                        raise
+                
+                # Vérifier si le fichier existe déjà (exact ou avec autre extension)
+                file_found = False
+                if os.path.exists(dest_path):
+                    logger.info(f"Le fichier {dest_path} existe déjà, vérification de la taille...")
+                    
+                    # Vérifier la taille du fichier local
+                    local_size = os.path.getsize(dest_path)
+                    logger.debug(f"Taille du fichier local: {local_size} octets")
+                    
+                    # Essayer de récupérer la taille du serveur
+                    remote_size = None
+                    if vimm_file_size > 0:
+                        remote_size = vimm_file_size
+                        logger.debug(f"Taille du fichier serveur via vimm.net: {remote_size} octets")
+                    elif _is_lolroms_url(url):
+                        probed_size = _probe_lolroms_remote_size(url)
+                        if probed_size > 0:
+                            remote_size = probed_size
+                            logger.debug(f"Taille du fichier serveur via lolroms probe: {remote_size} octets")
+                        else:
+                            logger.warning("Impossible de vérifier la taille distante lolroms; le fichier local sera re-téléchargé par sécurité")
+                    else:
+                        try:
+                            head_response = session.head(url, timeout=10, allow_redirects=True)
+                            if head_response.status_code == 200:
+                                content_length = head_response.headers.get('content-length')
+                                if content_length:
+                                    remote_size = int(content_length)
+                                    logger.debug(f"Taille du fichier serveur: {remote_size} octets")
+                        except Exception as e:
+                            logger.debug(f"Impossible de vérifier la taille serveur: {e}")
+                    
+                    # Comparer les tailles si on a obtenu la taille distante
+                    if remote_size is not None and local_size != remote_size:
+                        logger.warning(f"Taille mismatch! Local: {local_size}, Remote: {remote_size} - le fichier sera re-téléchargé")
+                        # Les tailles ne correspondent pas, il faut re-télécharger
+                        try:
+                            if os.path.exists(dest_path):
+                                os.remove(dest_path)
+                                logger.info(f"Fichier incomplet supprimé: {dest_path}")
+                            else:
+                                logger.debug(f"Fichier déjà supprimé par un autre thread: {dest_path}")
+                        except FileNotFoundError:
+                            logger.debug(f"Fichier déjà supprimé (ou n'existe plus): {dest_path}")
+                        except Exception as e:
+                            logger.error(f"Impossible de supprimer le fichier incomplet: {e}")
+                            result[0] = False
+                            result[1] = f"Erreur suppression fichier incomplet: {str(e)}"
+                            with urls_lock:
+                                urls_in_progress.discard(original_history_url)
+                                logger.debug(f"URL supprimée du set des téléchargements en cours: {original_history_url} (URLs restantes: {len(urls_in_progress)})")
+                            return
+                        # Continuer le téléchargement normal (ne pas faire return)
+                    elif _is_lolroms_url(url):
+                        try:
+                            if os.path.exists(dest_path):
+                                os.remove(dest_path)
+                                logger.info(f"Fichier lolroms local non vérifiable supprimé: {dest_path}")
+                        except Exception as e:
+                            logger.error(f"Impossible de supprimer le fichier lolroms non vérifiable: {e}")
+                            result[0] = False
+                            result[1] = f"Erreur suppression fichier incomplet: {str(e)}"
+                            with urls_lock:
+                                urls_in_progress.discard(original_history_url)
+                            return
+                    else:
+                        # Les tailles correspondent ou on ne peut pas vérifier, considérer comme déjà téléchargé
+                        logger.info(f"Le fichier {dest_path} existe déjà et la taille est correcte, téléchargement ignoré")
+                        result[0] = True
+                        result[1] = _("network_download_ok").format(game_name) + _("download_already_present")
+                        
+                        # Mettre à jour l'historique
+                        for entry in config.history:
+                            if entry.get("url") == original_history_url:
+                                entry["status"] = "Download_OK"
+                                entry["progress"] = 100
+                                entry["message"] = result[1]
+                                _save_history_with_feedback("download_rom:file_already_present")
+                                break
+                        
+                        # Afficher un toast au lieu d'ouvrir l'historique
+                        try:
+                            show_toast(result[1])
+                        except Exception as e:
+                            logger.debug(f"Impossible d'afficher le toast: {e}")
+                        with urls_lock:
+                            urls_in_progress.discard(original_history_url)
+                            logger.debug(f"URL supprimée du set des téléchargements en cours: {original_history_url} (URLs restantes: {len(urls_in_progress)})")
+                        
+                        # Libérer le slot de la queue
+                        try:
+                            notify_download_finished()
+                        except Exception:
+                            pass
+                        
+                        return result[0], result[1]
+                    file_found = True
+                
+                # Vérifier si un fichier avec le même nom de base mais extension différente existe (SEULEMENT si fichier exact non trouvé)
+                if not file_found:
+                    base_name_no_ext = os.path.splitext(sanitized_name)[0]
+                    if base_name_no_ext != sanitized_name:  # Seulement si une extension était présente
+                        try:
+                            # Lister tous les fichiers dans le répertoire de destination
+                            if os.path.exists(dest_dir):
+                                for existing_file in os.listdir(dest_dir):
+                                    existing_base = os.path.splitext(existing_file)[0]
+                                    if existing_base == base_name_no_ext:
+                                        existing_path = os.path.join(dest_dir, existing_file)
+                                        logger.info(f"Un fichier avec le même nom de base existe: {existing_path}, vérification de la taille...")
+                                        
+                                        # Vérifier la taille du fichier local
+                                        local_size = os.path.getsize(existing_path)
+                                        logger.debug(f"Taille du fichier local (extension différente): {local_size} octets")
+                                        
+                                        # Essayer de récupérer la taille du serveur
+                                        remote_size = None
+                                        if vimm_file_size > 0:
+                                            remote_size = vimm_file_size
+                                            logger.debug(f"Taille du fichier serveur via vimm.net (extension différente): {remote_size} octets")
+                                        elif _is_lolroms_url(url):
+                                            probed_size = _probe_lolroms_remote_size(url)
+                                            if probed_size > 0:
+                                                remote_size = probed_size
+                                                logger.debug(f"Taille du fichier serveur via lolroms probe: {remote_size} octets")
+                                            else:
+                                                logger.warning("Impossible de vérifier la taille distante lolroms (extension différente); re-téléchargement par sécurité")
+                                        else:
+                                            try:
+                                                head_response = session.head(url, timeout=10, allow_redirects=True)
+                                                if head_response.status_code == 200:
+                                                    content_length = head_response.headers.get('content-length')
+                                                    if content_length:
+                                                        remote_size = int(content_length)
+                                                        logger.debug(f"Taille du fichier serveur: {remote_size} octets")
+                                            except Exception as e:
+                                                logger.debug(f"Impossible de vérifier la taille serveur: {e}")
+                                        
+                                        # Comparer les tailles si on a obtenu la taille distante
+                                        if remote_size is not None and local_size != remote_size:
+                                            logger.warning(f"Taille mismatch (extension différente)! Local: {local_size}, Remote: {remote_size} - re-téléchargement")
+                                            # Continuer le téléchargement normal
+                                            break
+                                        elif _is_lolroms_url(url):
+                                            logger.info(f"Fichier lolroms avec extension différente non vérifiable, re-téléchargement forcé: {existing_path}")
+                                            break
+                                        else:
+                                            # Les tailles correspondent, fichier complet
+                                            logger.info(f"Un fichier avec le même nom de base existe déjà: {existing_path}, téléchargement ignoré")
+                                            result[0] = True
+                                            result[1] = _("network_download_ok").format(game_name) + _("download_already_extracted")
+                                            
+                                            # Mettre à jour l'historique
+                                            for entry in config.history:
+                                                if entry.get("url") == original_history_url:
+                                                    entry["status"] = "Download_OK"
+                                                    entry["progress"] = 100
+                                                    entry["message"] = result[1]
+                                                    _save_history_with_feedback("download_rom:file_already_extracted")
+                                                    break
+                                            
+                                            # Afficher un toast au lieu d'ouvrir l'historique
+                                            try:
+                                                show_toast(result[1])
+                                            except Exception as e:
+                                                logger.debug(f"Impossible d'afficher le toast: {e}")
+                                            with urls_lock:
+                                                urls_in_progress.discard(original_history_url)
+                                                logger.debug(f"URL supprimée du set des téléchargements en cours: {original_history_url} (URLs restantes: {len(urls_in_progress)})")
+                                            
+                                            # Libérer le slot de la queue
+                                            try:
+                                                notify_download_finished()
+                                            except Exception:
+                                                pass
+                                            
+                                            return result[0], result[1]
+                        except Exception as e:
+                            logger.debug(f"Erreur lors de la vérification des fichiers existants: {e}")
+            
+                external_lolroms_downloaded = False
+                total_size = 0
+
+                if _is_lolroms_url(url):
+                    if url not in config.download_progress:
+                        config.download_progress[url] = {
+                            "downloaded_size": 0,
+                            "total_size": known_total_size,
+                            "status": "Connecting",
+                            "progress_percent": 0,
+                            "speed": 0,
+                            "game_name": game_name,
+                            "platform": platform
+                        }
+                    if url in config.download_progress:
+                        config.download_progress[url]["status"] = "lolroms external"
+                        config.needs_redraw = True
+                    external_success, external_message = _download_lolroms_with_external_tool(
+                        url,
+                        dest_path,
+                        task_id,
+                        cancel_ev=cancel_ev,
+                        progress_queue=progress_queues.get(task_id),
+                    )
+                    if external_success is True:
+                        external_lolroms_downloaded = True
+                        total_size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+                        if url in config.download_progress:
+                            config.download_progress[url]["downloaded_size"] = total_size
+                            config.download_progress[url]["total_size"] = total_size
+                            config.download_progress[url]["progress_percent"] = 100
+                            config.download_progress[url]["status"] = "Completed"
+                        if isinstance(config.history, list):
+                            for entry in config.history:
+                                if "url" in entry and entry["url"] == url:
+                                    entry["total_size"] = total_size
+                                    _save_history_with_feedback("download_rom:lolroms_total_size")
+                                    break
+                        logger.info(f"Téléchargement lolroms terminé via outil externe: {dest_path}")
+                    elif external_success is False:
+                        # Sur Windows, curl peut échouer avec schannel
+                        # (ex: SEC_E_LOGON_DENIED). On tente alors le fallback
+                        # requests/stream classique au lieu d'échouer immédiatement.
+                        ext_err = (external_message or "lolroms external download failed").strip()
+                        if url in config.download_progress:
+                            config.download_progress[url]["status"] = "lolroms requests fallback"
+                            config.needs_redraw = True
+                        logger.warning(f"lolroms external tool failed, fallback requests: {ext_err}")
+
+                if not external_lolroms_downloaded:
+                    download_headers = headers.copy()
+                    download_headers['Accept'] = 'application/octet-stream, */*'
+                    # Utiliser le referer spécial pour vimm.net si défini
+                    if vimm_original_referer:
+                        download_headers['Referer'] = vimm_original_referer
+                    else:
+                        default_referer = _default_referer_for_url(url)
+                        if default_referer:
+                            download_headers['Referer'] = default_referer
+                    archive_cookie = load_archive_org_cookie()
+                    archive_alt_urls = []
+                    meta_json = None
+
+                    if 'archive.org/download/' in url:
+                        try:
+                            parsed = urllib.parse.urlsplit(url)
+                            parts = parsed.path.split('/download/', 1)
+                            pre_id = None
+                            if len(parts) == 2:
+                                after = parts[1]
+                                pre_id = after.split('/', 1)[0]
+                                logger.debug(f"URL archive.org conservée: {url}")
+                            if not pre_id:
+                                pre_id = url.split('/download/')[1].split('/')[0]
+
+                            download_headers['Referer'] = f"https://archive.org/details/{pre_id}"
+                            download_headers['Origin'] = 'https://archive.org'
+                            if archive_cookie:
+                                download_headers['Cookie'] = archive_cookie
+                            if archive_cookie:
+                                for pair in archive_cookie.split(';'):
+                                    if '=' in pair:
+                                        name, value = pair.split('=', 1)
+                                        session.cookies.set(name.strip(), value.strip(), domain='.archive.org')
+
+                            session.get('https://archive.org/robots.txt', timeout=20, headers={'Cookie': archive_cookie} if archive_cookie else None)
+                            meta_resp = session.get(f'https://archive.org/metadata/{pre_id}', timeout=20, headers={'Cookie': archive_cookie} if archive_cookie else None)
+                            if meta_resp.status_code == 200:
+                                try:
+                                    meta_json = meta_resp.json()
+                                except Exception:
+                                    meta_json = None
+                            logger.debug(f"Pré-chargement cookies/metadata archive.org pour {pre_id}")
+
+                            identifier, archive_name, inner_path = _split_archive_org_path(url)
+                            if identifier and archive_name and inner_path:
+                                if meta_json:
+                                    server = meta_json.get('server')
+                                    directory = meta_json.get('dir')
+                                    if server and directory:
+                                        archive_path = f"{directory}/{archive_name}"
+                                        view_url = f"https://{server}/view_archive.php?archive=" + urllib.parse.quote(archive_path, safe='/') + "&file=" + urllib.parse.quote(inner_path, safe='/')
+                                        archive_alt_urls.insert(0, view_url)
+                        except Exception as e:
+                            logger.debug(f"Pré-chargement archive.org ignoré: {e}")
+
+                    if url not in config.download_progress:
+                        config.download_progress[url] = {
+                            "downloaded_size": 0,
+                            "total_size": vimm_file_size if vimm_file_size > 0 else known_total_size,
+                            "status": "Connecting",
+                            "progress_percent": 0,
+                            "speed": 0,
+                            "game_name": game_name,
+                            "platform": platform
+                        }
+
+                    header_variants = [download_headers]
+                    if 'archive.org' in url:
+                        header_variants.extend([
+                            {
+                                'User-Agent': headers.get('User-Agent', download_headers.get('User-Agent', 'Mozilla/5.0')),
+                                'Accept': 'application/octet-stream,*/*;q=0.8',
+                                'Accept-Language': headers.get('Accept-Language', 'en-US,en;q=0.5'),
+                                'Connection': 'keep-alive',
+                                **({'Cookie': archive_cookie} if archive_cookie else {})
+                            },
+                            {
+                                'User-Agent': headers.get('User-Agent', download_headers.get('User-Agent', 'Mozilla/5.0')),
+                                'Accept': '*/*',
+                                'Referer': 'https://archive.org/',
+                                **({'Cookie': archive_cookie} if archive_cookie else {})
+                            }
+                        ])
+                    elif 'vimm.net' in url:
+                        # dl2.vimm.net ferme parfois la connexion sans réponse ("RemoteDisconnected")
+                        # de façon transitoire (charge serveur / anti-hotlinking ponctuel), même quand
+                        # le même téléchargement fonctionne l'instant d'après. On retente avec
+                        # Connection: close pour forcer une connexion TCP fraîche plutôt que de
+                        # réutiliser une connexion du pool qui a pu être coupée côté serveur.
+                        vimm_retry_headers = download_headers.copy()
+                        vimm_retry_headers['Connection'] = 'close'
+                        header_variants.extend([vimm_retry_headers, vimm_retry_headers.copy()])
+
+                    response = None
+                    last_status = None
+                    last_error = None
+                    last_error_type = None
+                    browser_challenge_detected = False
+
+                    # Le rate-limit 429 de vimm.net (dl2.vimm.net) peut durer plus longtemps que
+                    # les quelques secondes couvertes par les variantes de headers habituelles ;
+                    # on s'autorise donc des tentatives supplémentaires dédiées, avec un backoff
+                    # exponentiel, spécifiquement en réaction à des 429 répétés.
+                    extra_429_retries = 4 if 'vimm.net' in url else 0
+                    total_max_attempts = len(header_variants) + extra_429_retries
+                    rate_limit_hits = 0
+                    attempt = 0
+                    while attempt < total_max_attempts:
+                        attempt += 1
+                        hv = header_variants[min(attempt - 1, len(header_variants) - 1)]
+                        try:
+                            if url in config.download_progress:
+                                config.download_progress[url]["status"] = f"Try {attempt}/{total_max_attempts}"
+                                config.download_progress[url]["progress_percent"] = 0
+                                config.needs_redraw = True
+
+                            logger.debug(f"Tentative téléchargement {attempt}/{total_max_attempts} avec headers: {_redact_headers(hv)}")
+                            timeout_val = (60, 90) if 'archive.org' in url else 30
+                            r = session.get(url, stream=True, timeout=timeout_val, allow_redirects=True, headers=hv)
+                            last_status = r.status_code
+                            logger.debug(f"Status code tentative {attempt}: {r.status_code}")
+                            if _is_browser_challenge_response(r):
+                                browser_challenge_detected = True
+                                try:
+                                    snippet = r.text[:200]
+                                    logger.debug(f"Challenge navigateur detecte tentative {attempt}: {snippet}")
+                                except Exception:
+                                    pass
+                                break
+                            if r.status_code in (401, 403):
+                                try:
+                                    snippet = r.text[:200]
+                                    logger.debug(f"Réponse {r.status_code} snippet: {snippet}")
+                                except Exception:
+                                    pass
+                                continue
+                            r.raise_for_status()
+                            response = r
+                            break
+                        except requests.Timeout as e:
+                            last_error = str(e)
+                            last_error_type = "timeout"
+                            logger.debug(f"Timeout tentative {attempt}: {e}")
+                        except requests.ConnectionError as e:
+                            last_error = str(e)
+                            last_error_type = "connection"
+                            logger.debug(f"Erreur connexion tentative {attempt}: {e}")
+                            if (('archive.org' in url) or ('vimm.net' in url)) and attempt < total_max_attempts:
+                                time.sleep(2)
+                        except requests.HTTPError as e:
+                            last_error = str(e)
+                            last_error_type = "http"
+                            logger.debug(f"Erreur HTTP tentative {attempt}: {e}")
+                            if last_status == 429:
+                                # Rate limit : on respecte l'en-tête Retry-After si présent, sinon
+                                # on patiente avec un backoff exponentiel (5s, 10s, 20s, 30s...)
+                                # avant de retenter, car ce type de limite est généralement temporaire
+                                # mais peut durer plus que quelques secondes.
+                                retry_after = None
+                                try:
+                                    retry_after = float(r.headers.get('Retry-After', ''))
+                                except Exception:
+                                    retry_after = None
+                                wait_time = min(max(retry_after or (5.0 * (2 ** rate_limit_hits)), 1.0), 30.0)
+                                rate_limit_hits += 1
+                                if attempt < total_max_attempts:
+                                    logger.debug(f"429 Too Many Requests, attente {wait_time:.1f}s avant nouvelle tentative")
+                                    time.sleep(wait_time)
+                                continue
+                            if last_status not in (401, 403):
+                                break
+                        except requests.RequestException as e:
+                            last_error = str(e)
+                            last_error_type = "request"
+                            logger.debug(f"Erreur requête tentative {attempt}: {e}")
+                            if isinstance(e, requests.HTTPError) and last_status not in (401, 403):
+                                break
+                            if 'archive.org' in url and attempt < total_max_attempts:
+                                time.sleep(2)
+
+                    if response is None:
+                        if browser_challenge_detected:
+                            raise requests.HTTPError(
+                                "Access blocked by a browser challenge on the source host. This source requires an interactive browser session and cannot be downloaded by the embedded Python client."
+                            )
+                        if archive_alt_urls and (last_status in (401, 403) or last_error_type in ("timeout", "connection", "request")):
+                            for alt_url in archive_alt_urls:
+                                try:
+                                    timeout_val = (45, 90)
+                                    logger.debug(f"Tentative archive.org alt URL: {alt_url}")
+                                    alt_headers = download_headers.copy()
+                                    try:
+                                        alt_host = urllib.parse.urlsplit(alt_url).netloc
+                                        if alt_host.startswith("ia") and alt_host.endswith(".archive.org"):
+                                            alt_headers["Referer"] = f"https://{alt_host}/"
+                                            alt_headers["Origin"] = "https://archive.org"
+                                    except Exception:
+                                        pass
+                                    r = session.get(alt_url, stream=True, timeout=timeout_val, allow_redirects=True, headers=alt_headers)
+                                    if r.status_code not in (401, 403):
+                                        r.raise_for_status()
+                                        response = r
+                                        url = alt_url
+                                        break
+                                except Exception as e:
+                                    logger.debug(f"Alt URL archive.org échec: {e}")
+                        if response is None and 'archive.org/download/' in url:
+                            try:
+                                identifier = url.split('/download/')[1].split('/')[0]
+                                if meta_json is None:
+                                    meta_resp = session.get(f'https://archive.org/metadata/{identifier}', timeout=30)
+                                    if meta_resp.status_code == 200:
+                                        meta_json = meta_resp.json()
+                                if meta_json:
+                                    if meta_json.get('is_dark'):
+                                        raise requests.HTTPError(f"Item archive.org restreint (is_dark=true): {identifier}")
+                                    if not meta_json.get('files'):
+                                        raise requests.HTTPError(f"Item archive.org sans fichiers listés: {identifier}")
+                                    available = [f.get('name') for f in meta_json.get('files', [])][:10]
+                                    raise requests.HTTPError(f"Accès refusé (HTTP {last_status}). Fichiers disponibles exemples: {available}")
+                                raise requests.HTTPError(f"HTTP {last_status} & metadata indisponible pour {identifier}")
+                            except requests.HTTPError:
+                                raise
+                            except Exception as e:
+                                raise requests.HTTPError(f"HTTP {last_status} après variations; metadata échec: {e}")
+
+                        error_msg = None
+                        if last_status:
+                            if last_status == 401:
+                                error_msg = _("network_auth_required").format(last_status) if _ else f"Authentication required (HTTP {last_status})"
+                            elif last_status == 403:
+                                error_msg = _("network_access_denied").format(last_status) if _ else f"Access denied (HTTP {last_status})"
+                            elif last_status == 429 and 'vimm.net' in url:
+                                # Vimm.net limite apparemment à un seul téléchargement simultané par IP :
+                                # un 429 persistant après plusieurs tentatives est très probablement dû à
+                                # un autre téléchargement vimm.net déjà en cours, pas à un vrai blocage.
+                                error_msg = _("network_vimm_rate_limit") if _ else "Vimm.net limits downloads to one at a time per IP. Wait for the other download to finish and retry."
+                            elif last_status >= 500:
+                                error_msg = _("network_server_error").format(last_status) if _ else f"Server error (HTTP {last_status})"
+                            else:
+                                error_msg = _("network_http_error").format(last_status) if _ else f"HTTP error {last_status}"
+                        elif last_error_type == "timeout":
+                            error_msg = _("network_timeout_error") if _ else "Connection timeout"
+                        elif last_error_type == "connection":
+                            error_msg = _("network_connection_error") if _ else "Network connection error"
+                        else:
+                            error_msg = _("network_no_response") if _ else "No response from server"
+
+                        attempts_count = attempt
+                        full_error_msg = _("network_connection_failed").format(attempts_count) if _ else f"Connection failed after {attempts_count} attempts"
+                        full_error_msg += f" - {error_msg}"
+                        if last_error:
+                            logger.error(f"Détails de l'erreur: {last_error}")
+                        raise requests.HTTPError(full_error_msg)
+
+                    response_content_type = (response.headers.get('content-type', '') or '').lower()
+                    if 'vimm.net' in original_history_url and 'text/html' in response_content_type:
+                        raise requests.HTTPError(
+                            f"Vimm returned an HTML page instead of an archive (content-type={response_content_type})"
+                        )
+
+                    if url in config.download_progress:
+                        config.download_progress[url]["status"] = "Downloading"
+                        config.needs_redraw = True
+
+                    announced_total_size = int(response.headers.get('content-length', 0) or 0) or int(vimm_file_size or known_total_size or 0)
+                    has_space, low_space_message = _ensure_sufficient_disk_space(dest_dir, announced_total_size)
+                    if not has_space:
+                        raise InsufficientDiskSpaceError(low_space_message)
+
+                    transfer = _stream_response_to_path(response, dest_path, task_id, cancel_ev, progress_queues.get(task_id), fallback_total_size=vimm_file_size or known_total_size)
+                    total_size = int(transfer['total_size'])
+                    downloaded = int(transfer['downloaded'])
+                    last_downloaded = int(transfer['last_downloaded'])
+                    last_update_time = float(transfer['last_update_time'])
+                    download_canceled = bool(transfer['download_canceled'])
+
+                    logger.info(f"Taille totale: {total_size} octets")
+                    logger.debug(f"Progression initiale envoyée: 0% pour {game_name}, task_id={task_id}")
+                    if isinstance(config.history, list):
+                        for entry in config.history:
+                            if "url" in entry and entry["url"] == original_history_url:
+                                entry["total_size"] = total_size
+                                _save_history_with_feedback("download_rom:stream_total_size")
+                                break
+                    
+                    # Mettre à jour la taille dans download_progress si elle n'était pas connue
+                    if url in config.download_progress and config.download_progress[url]["total_size"] == 0:
+                        config.download_progress[url]["total_size"] = total_size
+
+                    if downloaded <= 0 and archive_alt_urls and 'archive.org' in url:
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+                        response, fallback_url, fallback_transfer = _try_archive_org_alternate_urls(
+                            session,
+                            archive_alt_urls,
+                            url,
+                            download_headers,
+                            dest_path,
+                            task_id,
+                            cancel_ev,
+                            progress_queues.get(task_id),
+                            fallback_total_size=known_total_size,
+                        )
+                        if fallback_transfer is not None:
+                            url = fallback_url
+                            total_size = int(fallback_transfer['total_size'])
+                            downloaded = int(fallback_transfer['downloaded'])
+                            last_downloaded = int(fallback_transfer['last_downloaded'])
+                            last_update_time = float(fallback_transfer['last_update_time'])
+                            download_canceled = bool(fallback_transfer['download_canceled'])
+                            logger.debug(f"Fallback Archive.org réussi: {url}")
+
+                    if downloaded <= 0:
+                        try:
+                            if os.path.exists(dest_path):
+                                os.remove(dest_path)
+                        except Exception:
+                            pass
+                        content_type = response.headers.get('content-type', '') if response is not None else ''
+                        raise requests.HTTPError(
+                            f"Downloaded empty response from source (content-type={content_type or 'unknown'})"
+                        )
+
+                    # Garde-fous anti faux-positifs: certains hôtes peuvent
+                    # renvoyer une page HTML/challenge avec un status 200.
+                    archive_ext = os.path.splitext(dest_path)[1].lower()
+                    if archive_ext in {'.7z', '.zip', '.rar'}:
+                        if _looks_like_html_or_challenge(dest_path):
+                            _safe_remove_file(dest_path)
+                            raise requests.HTTPError(
+                                "Downloaded HTML/challenge content instead of archive payload"
+                            )
+                        if not _matches_expected_archive_signature(dest_path):
+                            _safe_remove_file(dest_path)
+                            raise requests.HTTPError(
+                                "Downloaded payload is not a valid archive"
+                            )
+                        if total_size > 0 and downloaded < total_size:
+                            accepted, reason = _should_accept_partial_archive(downloaded, total_size, dest_path)
+                            if not accepted:
+                                _safe_remove_file(dest_path)
+                                raise requests.HTTPError(reason)
+                            logger.warning(
+                                f"Archive partiellement incomplète mais acceptée malgré l'écart de taille: {reason}"
+                            )
+
+                    if downloaded > 0 and downloaded != last_downloaded:
+                        current_time = time.time()
+                        delta = downloaded - last_downloaded
+                        elapsed = current_time - last_update_time
+                        speed = delta / elapsed / (1024 * 1024) if elapsed > 0 else 0
+                        progress_queues[task_id].put((task_id, downloaded, total_size, speed))
+                        logger.debug(f"Mise à jour finale de progression: {downloaded}/{total_size} octets")
+
+                    if download_canceled:
+                        try:
+                            notify_download_finished()
+                        except Exception:
+                            pass
+                        return
+            
+            os.chmod(dest_path, 0o644)
+            logger.info(f"Téléchargement terminé: {dest_path}")
+            
+            # Vérifier si l'extraction automatique est activée dans les paramètres
+            from rgsx_settings import get_auto_extract
+            auto_extract_enabled = get_auto_extract()
+            
+            # Forcer extraction si plateforme BIOS même si le pré-check ne l'avait pas marqué
+            force_extract = is_zip_non_supported and auto_extract_enabled
+            if not force_extract and auto_extract_enabled:
+                try:
+                    bios_like = {"BIOS", "- BIOS by TMCTV -", "- BIOS"}
+                    if platform_folder == "bios" or platform in bios_like:
+                        force_extract = True
+                        logger.debug("Extraction forcée activée pour BIOS")
+                except Exception:
+                    pass
+            
+            # Forcer extraction pour PS3 Redump (déchiffrement et extraction ISO obligatoire)
+            is_ps3_target = _is_ps3_redump_target(platform_folder, platform)
+            if not force_extract and is_ps3_target:
+                force_extract = True
+                logger.debug("Extraction forcée activée pour PS3 Redump (déchiffrement ISO)")
+
+            if force_extract:
+                logger.debug(f"Extraction automatique nécessaire pour {dest_path}")
+                if url in config.download_progress:
+                    config.download_progress[url]["status"] = "Extracting"
+                    config.download_progress[url]["progress_percent"] = 0
+                    config.download_progress[url]["downloaded_size"] = 0
+                    config.needs_redraw = True
+                if isinstance(config.history, list):
+                    for entry in config.history:
+                        if "url" in entry and entry["url"] == original_history_url and entry["status"] in ["Downloading", "Téléchargement"]:
+                            entry["status"] = "Extracting"
+                            entry["progress"] = 0
+                            entry["message"] = "Préparation de l'extraction..."
+                            _save_history_with_feedback("download_rom:extracting")
+                            config.needs_redraw = True
+                            break
+                try:
+                    result[0], result[1] = _postprocess_downloaded_file(dest_path, dest_dir, url, game_name, is_ps3_target)
+                except Exception as e:
+                    logger.error(f"Exception lors du post-traitement: {str(e)}")
+                    result[0] = False
+                    result[1] = f"Erreur téléchargement {game_name}: {str(e)}"
+            else:
+                result[0] = True
+                result[1] = _("network_download_ok").format(game_name)
+
+        except InsufficientDiskSpaceError as e:
+            logger.warning(f"Téléchargement annulé par manque d'espace disque pour {url}: {e}")
+            result[0] = False
+            result[1] = str(e)
+        except Exception as e:
+            logger.error(f"Erreur téléchargement {url}: {str(e)}")
+            result[0] = False
+            result[1] = _("network_download_error").format(game_name, str(e))
+        
+        # AVANT le finally : Mettre à jour la progression à 100% si succès
+        if result[0] and url in config.download_progress:
+            logger.info(f"[WEB PROGRESS] Mise à jour finale à 100% pour {game_name}")
+            config.download_progress[url]["progress_percent"] = 100
+            config.download_progress[url]["status"] = "Completed"
+            config.download_progress[url]["downloaded_size"] = config.download_progress[url].get("total_size", 0)
+                # Plus besoin de update_web_progress
+            logger.info(f"[WEB PROGRESS] Attente 1.5s pour affichage...")
+            time.sleep(1.5)  # Laisser l'interface afficher 100% pendant 1.5 secondes
+            logger.info(f"[WEB PROGRESS] Fin de l'attente, envoi signal de fin")
+        
+        # Maintenant on peut envoyer le signal de fin à la boucle
+        logger.debug(f"Thread téléchargement terminé pour {url}, task_id={task_id}")
+        progress_queues[task_id].put((task_id, result[0], result[1]))
+        logger.debug(f"Final result sent to queue: success={result[0]}, message={result[1]}, task_id={task_id}")
+
+    thread = threading.Thread(target=download_thread, daemon=True)
+    download_threads[task_id] = thread
+    thread.start()
+    last_saved_progress_percent = -1
+    
+    # Boucle principale pour mettre à jour la progression
+    while thread.is_alive():
+        try:
+            task_queue = progress_queues.get(task_id)
+            if task_queue:
+                while not task_queue.empty():
+                    data = task_queue.get()
+                    #logger.debug(f"Progress queue data received: {data}")
+                    if isinstance(data[1], bool):  # Fin du téléchargement
+                        success, message = data[1], data[2]
+                        
+                        # Nettoyer download_progress et web_progress
+                        if url in config.download_progress:
+                            del config.download_progress[url]
+                        # Plus besoin de remove_web_progress
+                        
+                        if isinstance(config.history, list):
+                            for entry in config.history:
+                                if "url" in entry and entry["url"] == original_history_url and entry["status"] in ["Downloading", "Téléchargement", "Extracting", "Converting"]:
+                                    current_progress = int(entry.get("progress", 0) or 0)
+                                    entry["status"] = "Download_OK" if success else "Erreur"
+                                    entry["progress"] = 100 if success else current_progress
+                                    entry["message"] = message
+                                    _save_history_with_feedback("download_rom:final")
+                                    # Marquer le jeu comme téléchargé si succès
+                                    if success:
+                                        logger.debug(f"[WHILE_LOOP] Marking game as downloaded: platform={platform}, game={game_name}")
+                                        from history import mark_game_as_downloaded
+                                        file_size = entry.get("size", "N/A")
+                                        mark_game_as_downloaded(platform, game_name, file_size)
+                                    config.needs_redraw = True
+                                    logger.debug(f"Final update in history: status={entry['status']}, progress={entry['progress']}%, message={message}, task_id={task_id}")
+                                    break
+                    else:
+                        # logger.debug(f"[QUEUE] Traitement données progression: {data}, task_id={task_id}")
+                        if len(data) >= 7:
+                            downloaded, total_size, speed, seeds, connections, phase = data[1], data[2], data[3], data[4], data[5], data[6]
+                        elif len(data) >= 6:
+                            downloaded, total_size, speed, seeds, connections = data[1], data[2], data[3], data[4], data[5]
+                            phase = "downloading" if (data[3] > 0.001 or data[1] > 0) else "connecting"
+                        elif len(data) >= 4:
+                            downloaded, total_size, speed = data[1], data[2], data[3]
+                            seeds, connections = 0, 0
+                            phase = "downloading" if data[3] > 0.001 else "connecting"
+                        else:
+                            downloaded, total_size = data[1], data[2]
+                            speed, seeds, connections = 0.0, 0, 0
+                            phase = "connecting"
+                        display_seeds = seeds
+                        progress_percent = int(downloaded / total_size * 100) if total_size > 0 else 0
+                        progress_percent = max(0, min(100, progress_percent))
+                        
+                        # Mettre à jour config.download_progress pour compatibilité
+                        if url in config.download_progress:
+                            config.download_progress[url]["downloaded_size"] = downloaded
+                            config.download_progress[url]["total_size"] = total_size
+                            config.download_progress[url]["speed"] = speed
+                            config.download_progress[url]["progress_percent"] = progress_percent
+                            config.download_progress[url]["seeds"] = display_seeds
+                            config.download_progress[url]["connections"] = connections
+                            # Si 100%, afficher "Completed" au lieu de "Downloading"
+                            if progress_percent >= 100:
+                                config.download_progress[url]["status"] = "Completed"
+                            elif display_seeds > 0 or connections > 0:
+                                display_connections = connections if connections > 0 else display_seeds
+                                config.download_progress[url]["status"] = f"CN:{display_connections}"
+                            else:
+                                config.download_progress[url]["status"] = "Downloading"
+                            
+                            # Mettre à jour l'historique
+                        if isinstance(config.history, list):
+                            for entry in config.history:
+                                if "url" in entry and entry["url"] == original_history_url:
+                                    entry["progress"] = progress_percent
+                                    entry["downloaded_size"] = downloaded
+                                    entry["total_size"] = total_size
+                                    entry["speed"] = speed
+                                    entry["seeds"] = display_seeds
+                                    entry["connections"] = connections
+                                    entry["aria2_phase"] = phase
+                                    entry["status"] = "Téléchargement"
+                                    config.needs_redraw = True
+                                    break
+                        
+                        # IMPORTANT: Mettre à jour config.history PENDANT le téléchargement aussi
+                        # pour que l'interface web affiche la progression en temps réel
+                        # NOTE: On ne touche PAS au timestamp qui doit rester celui de création
+                        if isinstance(config.history, list):
+                            for entry in config.history:
+                                if "url" in entry and entry["url"] == original_history_url and entry["status"] in ["Downloading", "Téléchargement"]:
+                                    entry["downloaded_size"] = downloaded
+                                    entry["total_size"] = total_size
+                                    entry["speed"] = speed
+                                    entry["seeds"] = display_seeds
+                                    entry["connections"] = connections
+                                    entry["progress"] = progress_percent
+                                    entry["aria2_phase"] = phase
+                                    entry["status"] = "Téléchargement"
+                                    config.needs_redraw = True
+                                    # Sauvegarder au plus une fois par palier de 5%
+                                    if (progress_percent % 5 == 0 or progress_percent >= 99) and progress_percent != last_saved_progress_percent:
+                                        if _save_history_with_feedback("download_rom:progress"):
+                                            last_saved_progress_percent = progress_percent
+                                    break
+            try:
+                await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                # La tâche asyncio a été annulée depuis l'UI (Cancel Download). Le thread
+                # d'arrière-plan a déjà reçu le signal coopératif via cancel_events
+                # (request_cancel) et va s'arrêter de lui-même : on sort de la boucle
+                # sans propager l'annulation, pour ne jamais sauter le nettoyage final
+                # (thread.join, drain de la queue, notify_download_finished) qui libère
+                # le slot de la file d'attente.
+                logger.debug(f"Boucle de progression annulée (Cancel Download) pour task_id={task_id}")
+                break
+        except Exception as e:
+            logger.error(f"Erreur mise à jour progression: {str(e)}")
+    
+    thread.join()
+    try:
+        download_threads.pop(task_id, None)
+    except Exception:
+        pass
+    # Drain any remaining final message to ensure history is saved
+    try:
+        task_queue = progress_queues.get(task_id)
+        if task_queue:
+            while not task_queue.empty():
+                data = task_queue.get()
+                if isinstance(data[1], bool):
+                    success, message = data[1], data[2]
+                    logger.debug(f"[DRAIN_QUEUE] Processing final message: success={success}, message={message[:100] if message else 'None'}")
+                    if isinstance(config.history, list):
+                        for entry in config.history:
+                            if "url" in entry and entry["url"] == original_history_url and entry["status"] in ["Downloading", "Téléchargement", "Extracting", "Converting"]:
+                                entry["status"] = "Download_OK" if success else "Erreur"
+                                entry["progress"] = 100 if success else 0
+                                entry["message"] = message
+                                _save_history_with_feedback("download_rom:drain")
+                                # Marquer le jeu comme téléchargé si succès
+                                if success:
+                                    logger.debug(f"[DRAIN_QUEUE] Marking game as downloaded: platform={platform}, game={game_name}")
+                                    from history import mark_game_as_downloaded
+                                    file_size = entry.get("size", "N/A")
+                                    mark_game_as_downloaded(platform, game_name, file_size)
+                                break
+    except Exception as e:
+        logger.error(f"[DRAIN_QUEUE] Error processing final message: {e}")
+
+
+    # Nettoyer la queue
+    if task_id in progress_queues:
+        del progress_queues[task_id]
+    cancel_events.pop(task_id, None)
+    
+    # Sauvegarder le résultat AVANT de retirer l'URL du set (pour les doublons)
+    with urls_lock:
+        url_results[original_history_url] = (result[0], result[1])
+        urls_in_progress.discard(original_history_url)
+        logger.debug(f"URL supprimée du set des téléchargements en cours: {original_history_url} (URLs restantes: {len(urls_in_progress)})")
+        # Signaler l'événement pour les appels doublons en attente
+        if original_history_url in url_done_events:
+            url_done_events[original_history_url].set()
+    
+    # Libérer le slot de la queue
+    try:
+        notify_download_finished()
+    except Exception:
+        pass
+    
+    return result[0], result[1]
+
+async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=False, task_id=None):
+    # Charger/rafraîchir les clés API (mtime aware)
+    keys_info = load_api_keys()
+    config.API_KEY_1FICHIER = keys_info.get('1fichier', '')
+    config.API_KEY_ALLDEBRID = keys_info.get('alldebrid', '')
+    config.API_KEY_DEBRIDLINK = keys_info.get('debridlink', '')
+    config.API_KEY_REALDEBRID = keys_info.get('realdebrid', '')
+    config.API_KEY_TORBOX = keys_info.get('torbox', '')
+    if not config.API_KEY_1FICHIER and config.API_KEY_ALLDEBRID:
+        logger.debug("Clé 1fichier absente, utilisation fallback AllDebrid")
+    if not config.API_KEY_1FICHIER and not config.API_KEY_ALLDEBRID and config.API_KEY_DEBRIDLINK:
+        logger.debug("Clé 1fichier & AllDebrid absentes, utilisation fallback Debrid-Link")
+    if not config.API_KEY_1FICHIER and not config.API_KEY_ALLDEBRID and not config.API_KEY_DEBRIDLINK and config.API_KEY_REALDEBRID:
+        logger.debug("Clé 1fichier, AllDebrid & Debrid-Link absentes, utilisation fallback RealDebrid")
+    if not config.API_KEY_1FICHIER and not config.API_KEY_ALLDEBRID and not config.API_KEY_DEBRIDLINK and not config.API_KEY_REALDEBRID and config.API_KEY_TORBOX:
+        logger.debug("Clé 1fichier, AllDebrid, Debrid-Link & RealDebrid absentes, utilisation fallback TorBox")
+    elif not config.API_KEY_1FICHIER and not config.API_KEY_ALLDEBRID and not config.API_KEY_DEBRIDLINK and not config.API_KEY_REALDEBRID and not config.API_KEY_TORBOX:
+        logger.debug("Aucune clé API disponible (1fichier, AllDebrid, Debrid-Link, RealDebrid, TorBox)")
+    logger.debug(f"Début téléchargement 1fichier: {game_name} depuis {url}, is_zip_non_supported={is_zip_non_supported}, task_id={task_id}")
+    logger.debug(
+        f"Clé API 1fichier: {'présente' if config.API_KEY_1FICHIER else 'absente'} / "
+        f"AllDebrid: {'présente' if config.API_KEY_ALLDEBRID else 'absente'} / "
+        f"Debrid-Link: {'présente' if config.API_KEY_DEBRIDLINK else 'absente'} / "
+        f"RealDebrid: {'présente' if config.API_KEY_REALDEBRID else 'absente'} / "
+        f"TorBox: {'présente' if config.API_KEY_TORBOX else 'absente'} (reloaded={keys_info.get('reloaded')})"
+    )
+    result = [None, None]
+    
+    # Vérifier si cette URL est déjà en cours de téléchargement (prévenir les doublons)
+    with urls_lock:
+        if url in urls_in_progress:
+            logger.warning(f"⚠️ Un téléchargement pour cette URL est déjà en cours, attente du résultat: {url}")
+            # Créer un événement d'attente si ce n'est pas déjà fait
+            if url not in url_done_events:
+                url_done_events[url] = threading.Event()
+            done_event = url_done_events[url]
+        else:
+            # Ajouter l'URL au set en cours
+            urls_in_progress.add(url)
+            done_event = None
+    
+    # Si on attendait un doublon, on attend ici
+    if done_event is not None:
+        logger.debug(f"Attente de la fin du téléchargement en doublon pour {url}")
+        # Attendre de manière asynchrone l'événement (timeout de 30 minutes pour les gros fichiers)
+        start_wait = time.time()
+        while not done_event.is_set():
+            if time.time() - start_wait > 1800:  # 30 minutes timeout
+                logger.warning(f"Timeout d'attente pour le doublon de {url}")
+                break
+            await asyncio.sleep(0.1)
+        # Vérifier si on a un résultat en cache
+        if url in url_results:
+            logger.info(f"Résultat en cache pour {url}: {url_results[url]}")
+            try:
+                notify_download_finished()
+            except Exception:
+                pass
+            return url_results[url]
+        else:
+            # Fallback: retourner un message de succès (le premier téléchargement a probablement réussi)
+            try:
+                notify_download_finished()
+            except Exception:
+                pass
+            return (True, _("network_download_ok").format(game_name))
+
+        # Ajouter l'URL au set en cours
+        urls_in_progress.add(url)
+
+    # Créer une queue spécifique pour cette tâche
+    logger.debug(f"Création queue pour task_id={task_id}")
+    if task_id not in progress_queues:
+        progress_queues[task_id] = queue.Queue()
+    if task_id not in cancel_events:
+        cancel_events[task_id] = threading.Event()
+
+    provider_used = None  # '1F', 'AD', 'DL', 'RD', 'TB'
+
+    def _set_provider_in_history(pfx: str):
+        try:
+            if not pfx:
+                return
+            if isinstance(config.history, list):
+                for entry in config.history:
+                    if entry.get("url") == url:
+                        entry["provider"] = pfx
+                        entry["provider_prefix"] = f"{pfx}:"
+                        _save_history_with_feedback("download_1fichier:set_provider")
+                        config.needs_redraw = True
+                        break
+        except Exception:
+            pass
+
+    def download_thread():
+        logger.debug(f"Thread téléchargement 1fichier démarré pour {url}, task_id={task_id}")
+        # Assurer l'accès à provider_used dans cette closure (lecture/écriture)
+        nonlocal provider_used
+
+        def _refresh_alldebrid_final_url(current_link):
+            """Request a fresh AllDebrid unlock URL after transient download failures."""
+            ad_key = getattr(config, 'API_KEY_ALLDEBRID', '')
+            if not ad_key:
+                return None, None
+            params = {'agent': 'RGSX', 'apikey': ad_key, 'link': current_link}
+            refresh_resp = requests.get("https://api.alldebrid.com/v4/link/unlock", params=params, timeout=30)
+            refresh_resp.raise_for_status()
+            refresh_json = refresh_resp.json()
+            if refresh_json.get('status') != 'success':
+                logger.warning(f"AllDebrid refresh status != success: {refresh_json}")
+                return None, None
+            refresh_data = refresh_json.get('data', {})
+            return (
+                refresh_data.get('link') or refresh_data.get('download') or refresh_data.get('streamingLink'),
+                refresh_data.get('filename'),
+            )
+
+        try:
+            _check_history_access_before_download("download_1fichier")
+            cancel_ev = cancel_events.get(task_id)
+            link = url.split('&af=')[0]
+            logger.debug(f"URL nettoyée: {link}")
+            
+            # IMPORTANT: Créer l'entrée dans config.history dès le début avec status "Downloading"
+            # pour que l'interface web puisse afficher le téléchargement en cours
+
+            # Charger l'historique existant depuis le fichier
+            if not isinstance(config.history, list):
+                config.history = load_history()
+            
+            # Vérifier si l'entrée existe déjà
+            entry_exists = False
+            for entry in config.history:
+                if entry.get("url") == url:
+                    entry_exists = True
+                    # Réinitialiser le status à "Downloading"
+                    entry["status"] = "Downloading"
+                    entry["progress"] = 0
+                    entry["downloaded_size"] = 0
+                    entry["platform"] = platform
+                    entry["game_name"] = game_name
+                    entry["display_name"] = get_clean_display_name(game_name, platform)
+                    entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    entry["task_id"] = task_id
+                    break
+            
+            # Si l'entrée n'existe pas, la créer
+            if not entry_exists:
+                config.history.append({
+                    "platform": platform,
+                    "game_name": game_name,
+                    "display_name": get_clean_display_name(game_name, platform),
+                    "url": url,
+                    "status": "Downloading",
+                    "progress": 0,
+                    "downloaded_size": 0,
+                    "total_size": 0,
+                    "speed": 0,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "message": f"Téléchargement 1fichier de {game_name}",
+                    "task_id": task_id
+                })
+            
+            # Sauvegarder history.json immédiatement
+            _save_history_with_feedback("download_1fichier:init")
+            
+            # Use symlink path if enabled
+            from rgsx_settings import apply_symlink_path, get_platform_custom_path
+            
+            # Vérifier si un dossier personnalisé est configuré pour cette plateforme
+            custom_path = get_platform_custom_path(platform)
+            if custom_path and os.path.isdir(custom_path):
+                dest_dir = custom_path
+                logger.debug(f"Utilisation du dossier personnalisé pour {platform}: {dest_dir}")
+                platform_folder = os.path.basename(dest_dir)
+            else:
+                dest_dir = None
+                platform_folder = None
+                for platform_dict in config.platform_dicts:
+                    if platform_dict.get("platform_name") == platform:
+                        platform_folder = map_rom_folder(platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform))
+                        dest_dir = apply_symlink_path(config.ROMS_FOLDER, platform_folder)
+                        break
+                if not dest_dir:
+                    logger.warning(f"Aucun dossier 'folder'/'dossier' trouvé pour la plateforme {platform}")
+                    platform_folder = map_rom_folder(resolve_platform_folder(platform))
+                    dest_dir = apply_symlink_path(config.ROMS_FOLDER, platform_folder)
+            logger.debug(f"Répertoire destination déterminé: {dest_dir}")
+
+            # Spécifique: si le système est "- BIOS by TMCTV -" on force le dossier BIOS
+            if platform_folder == "bios" or platform == "BIOS" or platform == "- BIOS by TMCTV -":
+                dest_dir = config.USERDATA_FOLDER
+                logger.debug(f"Plateforme '- BIOS by TMCTV -' détectée, destination forcée vers USERDATA_FOLDER: {dest_dir}")
+
+            logger.debug(f"Vérification répertoire destination: {dest_dir}")
+            os.makedirs(dest_dir, exist_ok=True)
+            logger.debug(f"Répertoire créé ou existant: {dest_dir}")
+            if not os.access(dest_dir, os.W_OK):
+                logger.error(f"Pas de permission d'écriture dans {dest_dir}")
+                raise PermissionError(f"Pas de permission d'écriture dans {dest_dir}")
+
+            final_url = None
+            filename = game_name
+            onefichier_error_message = None
+            provider_download_session = requests.Session()
+            provider_download_headers = _build_browser_download_headers()
+            provider_download_session.headers.update(provider_download_headers)
+
+            # Choisir la stratégie d'accès: 1fichier direct via API, sinon AllDebrid pour débrider
+            if config.API_KEY_1FICHIER:
+                logger.debug("Mode téléchargement sélectionné: 1fichier (API directe)")
+                headers = {
+                    "Authorization": f"Bearer {config.API_KEY_1FICHIER}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "url": link,
+                    "pretty": 1
+                }
+                logger.debug(f"Préparation requête 1fichier file/info pour {link}")
+                response = requests.post("https://api.1fichier.com/v1/file/info.cgi", headers=headers, json=payload, timeout=30)
+                logger.debug(f"Réponse file/info reçue, code: {response.status_code}")
+                file_info = None
+                raw_fileinfo_text = None
+                try:
+                    raw_fileinfo_text = response.text
+                except Exception:
+                    pass
+                try:
+                    file_info = response.json()
+                except Exception:
+                    file_info = None
+                if response.status_code != 200:
+                    # 403 souvent = clé invalide ou accès interdit
+                    friendly = None
+                    raw_err = None
+                    if isinstance(file_info, dict):
+                        raw_err = file_info.get('message') or file_info.get('error') or file_info.get('status')
+                        if raw_err == 'Bad token':
+                            friendly = "1F: Clé API 1fichier invalide"
+                        elif raw_err:
+                            friendly = f"1F: {raw_err}"
+                    if not friendly:
+                        if response.status_code == 403:
+                            friendly = "1F: Accès refusé (403)"
+                        elif response.status_code == 401:
+                            friendly = "1F: Non autorisé (401)"
+                        else:
+                            friendly = f"1F: Erreur HTTP {response.status_code}"
+                    result[0] = False
+                    result[1] = friendly
+                    try:
+                        result.append({"raw_error_1fichier_fileinfo": raw_err or raw_fileinfo_text})
+                    except Exception:
+                        pass
+                    onefichier_error_message = friendly
+                    logger.warning(f"Échec API 1fichier file/info, fallback providers activé: {friendly}")
+                if response.status_code == 200:
+                    file_info = file_info if isinstance(file_info, dict) else {}
+                    if "error" in file_info and file_info["error"] == "Resource not found":
+                        logger.error(f"Le fichier {game_name} n'existe pas sur 1fichier")
+                        result[0] = False
+                        try:
+                            if _:
+                                not_found_tpl = _("network_file_not_found")
+                                msg_nf = not_found_tpl.format(game_name) if "{" in not_found_tpl else f"{not_found_tpl} {game_name}"
+                                result[1] = f"1F: {msg_nf}"
+                            else:
+                                result[1] = f"1F: File not found {game_name}"
+                        except Exception:
+                            result[1] = f"1F: File not found {game_name}"
+                        onefichier_error_message = result[1]
+                        logger.warning("Ressource introuvable via API 1fichier, fallback providers activé")
+                    else:
+                        filename = file_info.get("filename", "").strip()
+                        if not filename:
+                            logger.error("Impossible de récupérer le nom du fichier")
+                            result[0] = False
+                            result[1] = _("network_cannot_get_filename")
+                            onefichier_error_message = result[1]
+                            logger.warning("Nom de fichier 1fichier introuvable, fallback providers activé")
+                        else:
+                            sanitized_filename = sanitize_filename(filename)
+                            dest_path = os.path.join(dest_dir, sanitized_filename)
+                            logger.info(f"Chemin destination: {dest_path}")
+                            _update_history_local_target(url, task_id, dest_path)
+
+                            remote_size = None
+                            try:
+                                remote_size = file_info.get("size")
+                                if isinstance(remote_size, str):
+                                    remote_size = int(remote_size)
+                                logger.debug(f"Taille du fichier 1fichier: {remote_size} octets")
+                            except Exception as e:
+                                logger.debug(f"Impossible de récupérer la taille 1fichier: {e}")
+
+                            file_found = False
+                            if os.path.exists(dest_path):
+                                logger.info(f"Le fichier {dest_path} existe déjà, vérification de la taille...")
+                                local_size = os.path.getsize(dest_path)
+                                logger.debug(f"Taille du fichier local: {local_size} octets")
+                                if remote_size is not None and local_size != remote_size:
+                                    logger.warning(f"Taille mismatch! Local: {local_size}, Remote: {remote_size} - le fichier sera re-téléchargé")
+                                    try:
+                                        if os.path.exists(dest_path):
+                                            os.remove(dest_path)
+                                            logger.info(f"Fichier incomplet supprimé: {dest_path}")
+                                        else:
+                                            logger.debug(f"Fichier déjà supprimé par un autre thread: {dest_path}")
+                                    except FileNotFoundError:
+                                        logger.debug(f"Fichier déjà supprimé (ou n'existe plus): {dest_path}")
+                                    except Exception as e:
+                                        logger.error(f"Impossible de supprimer le fichier incomplet: {e}")
+                                        result[0] = False
+                                        result[1] = f"Erreur suppression fichier incomplet: {str(e)}"
+                                        return
+                                else:
+                                    logger.info(f"Le fichier {dest_path} existe déjà et la taille est correcte, téléchargement ignoré")
+                                    result[0] = True
+                                    result[1] = _("network_download_ok").format(game_name) + _("download_already_present")
+                                    try:
+                                        show_toast(result[1])
+                                    except Exception as e:
+                                        logger.debug(f"Impossible d'afficher le toast: {e}")
+                                    with urls_lock:
+                                        urls_in_progress.discard(url)
+                                        logger.debug(f"URL supprimée du set des téléchargements en cours: {url} (URLs restantes: {len(urls_in_progress)})")
+                                    return result[0], result[1]
+                                file_found = True
+
+                            if not file_found:
+                                base_name_no_ext = os.path.splitext(sanitized_filename)[0]
+                                if base_name_no_ext != sanitized_filename:
+                                    try:
+                                        if os.path.exists(dest_dir):
+                                            for existing_file in os.listdir(dest_dir):
+                                                existing_base = os.path.splitext(existing_file)[0]
+                                                if existing_base == base_name_no_ext:
+                                                    existing_path = os.path.join(dest_dir, existing_file)
+                                                    logger.info(f"Un fichier avec le même nom de base existe: {existing_path}, vérification de la taille...")
+                                                    local_size = os.path.getsize(existing_path)
+                                                    logger.debug(f"Taille du fichier local (extension différente): {local_size} octets")
+                                                    if remote_size is not None and local_size != remote_size:
+                                                        logger.warning(f"Taille mismatch (extension différente)! Local: {local_size}, Remote: {remote_size} - re-téléchargement")
+                                                        break
+                                                    else:
+                                                        logger.info(f"Un fichier avec le même nom de base existe déjà: {existing_path}, téléchargement ignoré")
+                                                        result[0] = True
+                                                        result[1] = _("network_download_ok").format(game_name) + _("download_already_extracted")
+                                                        try:
+                                                            show_toast(result[1])
+                                                        except Exception as e:
+                                                            logger.debug(f"Impossible d'afficher le toast: {e}")
+                                                        with urls_lock:
+                                                            urls_in_progress.discard(url)
+                                                            logger.debug(f"URL supprimée du set des téléchargements en cours: {url} (URLs restantes: {len(urls_in_progress)})")
+                                                        return result[0], result[1]
+                                    except Exception as e:
+                                        logger.debug(f"Erreur lors de la vérification des fichiers existants: {e}")
+
+                            logger.debug(f"Envoi requête 1fichier get_token pour {link}")
+                            response = requests.post("https://api.1fichier.com/v1/download/get_token.cgi", headers=headers, json=payload, timeout=30)
+                            status_1f = response.status_code
+                            raw_text_1f = None
+                            try:
+                                raw_text_1f = response.text
+                            except Exception:
+                                pass
+                            logger.debug(f"Réponse get_token reçue, code: {status_1f} body_snippet={(raw_text_1f[:120] + '...') if raw_text_1f and len(raw_text_1f) > 120 else raw_text_1f}")
+                            download_info = None
+                            try:
+                                download_info = response.json()
+                            except Exception:
+                                download_info = None
+                            if status_1f != 200:
+                                friendly_1f = None
+                                raw_error_1f = None
+                                if isinstance(download_info, dict):
+                                    raw_error_1f = download_info.get('message') or download_info.get('status')
+                                    ONEFICHIER_ERROR_MAP = {
+                                        "Bad token": "1F: Clé API invalide",
+                                        "Must be a customer (Premium, Access) #236": "1F: Compte Premium requis",
+                                    }
+                                    if raw_error_1f:
+                                        friendly_1f = ONEFICHIER_ERROR_MAP.get(raw_error_1f)
+                                if not friendly_1f:
+                                    if status_1f == 403:
+                                        friendly_1f = "1F: Accès refusé (403)"
+                                    elif status_1f == 401:
+                                        friendly_1f = "1F: Non autorisé (401)"
+                                    elif status_1f >= 500:
+                                        friendly_1f = f"1F: Erreur serveur ({status_1f})"
+                                    else:
+                                        friendly_1f = f"1F: Erreur ({status_1f})"
+                                result[0] = False
+                                result[1] = friendly_1f
+                                try:
+                                    result.append({"raw_error_1fichier": raw_error_1f or raw_text_1f})
+                                except Exception:
+                                    pass
+                                onefichier_error_message = friendly_1f
+                                logger.warning(f"Échec API 1fichier get_token, fallback providers activé: {friendly_1f}")
+                            else:
+                                response.raise_for_status()
+                                if not isinstance(download_info, dict):
+                                    logger.error("Réponse 1fichier inattendue (pas un JSON) pour get_token")
+                                    result[0] = False
+                                    result[1] = _("network_api_error").format("1fichier invalid JSON") if _ else "1fichier invalid JSON"
+                                    onefichier_error_message = result[1]
+                                else:
+                                    final_url = download_info.get("url")
+                                    if not final_url:
+                                        logger.error("Impossible de récupérer l'URL de téléchargement")
+                                        result[0] = False
+                                        result[1] = _("network_cannot_get_download_url")
+                                        onefichier_error_message = result[1]
+                                    else:
+                                        logger.debug(f"URL de téléchargement obtenue via 1fichier: {final_url}")
+                                        provider_used = '1F'
+                                        _set_provider_in_history(provider_used)
+
+            if not final_url:
+                # Tentative AllDebrid
+                if getattr(config, 'API_KEY_ALLDEBRID', ''):
+                    logger.debug("Mode téléchargement sélectionné: AllDebrid (fallback 1)")
+                    try:
+                        ad_key = config.API_KEY_ALLDEBRID
+                        params = {'agent': 'RGSX', 'apikey': ad_key, 'link': link}
+                        logger.debug("Requête AllDebrid link/unlock en cours")
+                        response = requests.get("https://api.alldebrid.com/v4/link/unlock", params=params, timeout=30)
+                        logger.debug(f"Réponse AllDebrid reçue, code: {response.status_code}")
+                        response.raise_for_status()
+                        ad_json = response.json()
+                        if ad_json.get('status') == 'success':
+                            data = ad_json.get('data', {})
+                            filename = data.get('filename') or game_name
+                            final_url = data.get('link') or data.get('download') or data.get('streamingLink')
+                            if final_url:
+                                logger.debug("Débridage réussi via AllDebrid")
+                                provider_used = 'AD'
+                                _set_provider_in_history(provider_used)
+                        else:
+                            logger.warning(f"AllDebrid status != success: {ad_json}")
+                    except Exception as e:
+                        logger.error(f"Erreur AllDebrid fallback: {e}")
+                # Tentative Debrid-Link si pas de final_url
+                if not final_url and getattr(config, 'API_KEY_DEBRIDLINK', ''):
+                    logger.debug("Tentative fallback Debrid-Link (downloader/add)")
+                    try:
+                        dl_key = config.API_KEY_DEBRIDLINK
+                        headers_dl = {
+                            "Authorization": f"Bearer {dl_key}",
+                            "Content-Type": "application/json",
+                        }
+                        payload_dl = {"url": link}
+                        dl_resp = requests.post(
+                            "https://debrid-link.com/api/v2/downloader/add",
+                            json=payload_dl,
+                            headers=headers_dl,
+                            timeout=30
+                        )
+                        dl_status = dl_resp.status_code
+                        raw_text_dl = None
+                        dl_json = None
+                        try:
+                            raw_text_dl = dl_resp.text
+                        except Exception:
+                            pass
+                        try:
+                            dl_json = dl_resp.json()
+                        except Exception:
+                            dl_json = None
+                        logger.debug(f"Réponse Debrid-Link code={dl_status} body_snippet={(raw_text_dl[:120] + '...') if raw_text_dl and len(raw_text_dl) > 120 else raw_text_dl}")
+
+                        DEBRIDLINK_ERROR_MAP = {
+                            "badToken": "DL: Invalid API key",
+                            "notDebrid": "DL: Host unavailable",
+                            "hostNotValid": "DL: Unsupported host",
+                            "fileNotFound": "DL: File not found",
+                            "fileNotAvailable": "DL: File temporarily unavailable",
+                            "badFileUrl": "DL: Invalid link",
+                            "badFilePassword": "DL: Invalid file password",
+                            "notFreeHost": "DL: Premium account only",
+                            "maintenanceHost": "DL: Host in maintenance",
+                            "noServerHost": "DL: No server available",
+                            "maxLink": "DL: Daily link limit reached",
+                            "maxLinkHost": "DL: Daily host limit reached",
+                            "maxData": "DL: Daily data limit reached",
+                            "maxDataHost": "DL: Daily host data limit reached",
+                            "disabledServerHost": "DL: Server or VPN not allowed",
+                            "floodDetected": "DL: Rate limit reached",
+                        }
+
+                        error_message = None
+                        error_message_raw = None
+                        if dl_json and isinstance(dl_json, dict):
+                            if dl_json.get('success') is True:
+                                value = dl_json.get('value') or {}
+                                if isinstance(value, dict):
+                                    final_url = value.get('downloadUrl') or value.get('downloadURL') or value.get('link') or value.get('url')
+                                    filename = value.get('name') or value.get('filename') or filename or game_name
+                            else:
+                                error_code = dl_json.get('error')
+                                if error_code:
+                                    error_message = DEBRIDLINK_ERROR_MAP.get(error_code, f"DL: {error_code}")
+                                    error_message_raw = str(error_code)
+                        if dl_status in (200, 201) and final_url:
+                            logger.debug("Débridage réussi via Debrid-Link")
+                            provider_used = 'DL'
+                            _set_provider_in_history(provider_used)
+                        elif not final_url:
+                            if not error_message:
+                                if dl_status == 401:
+                                    error_message = "DL: Unauthorized (401)"
+                                elif dl_status == 429:
+                                    error_message = "DL: Rate limited (429)"
+                                elif dl_status >= 500:
+                                    error_message = f"DL: Server error ({dl_status})"
+                                else:
+                                    error_message = f"DL: Unexpected status ({dl_status})"
+                                error_message_raw = raw_text_dl or error_message
+                            logger.warning(f"Debrid-Link fallback échec: {error_message}")
+                            result[0] = False
+                            result[1] = error_message
+                            try:
+                                if isinstance(result, list):
+                                    result.append({"raw_error_debridlink": error_message_raw})
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.error(f"Exception Debrid-Link fallback: {e}")
+                # Tentative RealDebrid si pas de final_url
+                if not final_url and getattr(config, 'API_KEY_REALDEBRID', ''):
+                    logger.debug("Tentative fallback RealDebrid (unlock)")
+                    try:
+                        rd_key = config.API_KEY_REALDEBRID
+                        headers_rd = {"Authorization": f"Bearer {rd_key}"}
+                        rd_resp = requests.post(
+                            "https://api.real-debrid.com/rest/1.0/unrestrict/link",
+                            data={"link": link},
+                            headers=headers_rd,
+                            timeout=30
+                        )
+                        status = rd_resp.status_code
+                        raw_text = None
+                        rd_json = None
+                        try:
+                            raw_text = rd_resp.text
+                        except Exception:
+                            pass
+                        # Tenter JSON même si statut != 200
+                        try:
+                            rd_json = rd_resp.json()
+                        except Exception:
+                            rd_json = None
+                        logger.debug(f"Réponse RealDebrid code={status} body_snippet={(raw_text[:120] + '...') if raw_text and len(raw_text) > 120 else raw_text}")
+
+                        # Mapping erreurs RD (liste partielle, extensible)
+                        REALDEBRID_ERROR_MAP = {
+                            # Values intentionally WITHOUT prefix; we'll add 'RD:' dynamically
+                            1: "Bad request",
+                            2: "Unsupported hoster",
+                            3: "Temporarily unavailable",
+                            4: "File not found",
+                            5: "Too many requests",
+                            6: "Access denied",
+                            8: "Not premium account",
+                            9: "No traffic left",
+                            11: "Internal error",
+                            20: "Premium account only",  # normalisation wording
+                        }
+
+                        error_code = None
+                        error_message = None            # Friendly / mapped message (to display in history)
+                        error_message_raw = None        # Raw provider message ('error') kept for debugging if needed
+                        if rd_json and isinstance(rd_json, dict):
+                            # Format attendu quand erreur: {'error_code': int, 'error': 'message'}
+                            error_code = rd_json.get('error_code') or rd_json.get('error') if isinstance(rd_json.get('error'), int) else rd_json.get('error_code')
+                            if isinstance(error_code, str) and error_code.isdigit():
+                                error_code = int(error_code)
+                            api_error_text = rd_json.get('error') if isinstance(rd_json.get('error'), str) else None
+                            if error_code is not None:
+                                mapped = REALDEBRID_ERROR_MAP.get(error_code)
+                                # Raw API error sometimes returns 'hoster_not_free' while code=20
+                                if api_error_text and api_error_text.strip().lower() == 'hoster_not_free':
+                                    api_error_text = 'Premium account only'
+                                if mapped and not mapped.lower().startswith('rd:'):
+                                    mapped = f"RD: {mapped}"
+                                if not mapped and api_error_text and not api_error_text.lower().startswith('rd:'):
+                                    api_error_text = f"RD: {api_error_text}"
+                                error_message = mapped or api_error_text or f"RD: error {error_code}"
+                                # Conserver la version brute séparément
+                                error_message_raw = api_error_text if api_error_text and api_error_text != error_message else None
+                        # Succès si 200 et presence 'download'
+                        if status == 200 and rd_json and rd_json.get('download'):
+                            final_url = rd_json.get('download')
+                            filename = rd_json.get('filename') or filename or game_name
+                            logger.debug("Débridage réussi via RealDebrid")
+                            provider_used = 'RD'
+                            _set_provider_in_history(provider_used)
+                        else:
+                            if error_message:
+                                logger.warning(f"RealDebrid a renvoyé une erreur (code interne {error_code}): {error_message}")
+                            else:
+                                # Pas d'erreur structurée -> traiter statut HTTP
+                                if status == 503:
+                                    error_message = "RD: service unavailable (503)"
+                                elif status >= 500:
+                                    error_message = f"RD: server error ({status})"
+                                elif status == 429:
+                                    error_message = "RD: rate limited (429)"
+                                else:
+                                    error_message = f"RD: unexpected status ({status})"
+                                logger.warning(f"RealDebrid fallback échec: {error_message}")
+                                # Pas de détail JSON -> utiliser friendly comme raw aussi
+                                error_message_raw = error_message
+                            # Conserver message dans result si aucun autre provider ne réussit
+                            if not final_url:
+                                # Marquer le provider même en cas d'erreur pour affichage du préfixe dans l'historique
+                                if provider_used is None:
+                                    provider_used = 'RD'
+                                    _set_provider_in_history(provider_used)
+                                result[0] = False
+                                # Pour l'interface: stocker le message friendly en priorité
+                                result[1] = error_message or error_message_raw
+                                # Stocker la version brute pour éventuel usage avancé
+                                try:
+                                    if isinstance(result, list):
+                                        # Ajouter un dict auxiliaire pour meta erreurs
+                                        result.append({"raw_error_realdebrid": error_message_raw})
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        logger.error(f"Exception RealDebrid fallback: {e}")
+                # Tentative TorBox si pas de final_url
+                if not final_url and getattr(config, 'API_KEY_TORBOX', ''):
+                    logger.debug("Tentative fallback TorBox (webdl/createwebdownload)")
+                    try:
+                        import hashlib as _hashlib
+                        tb_key = config.API_KEY_TORBOX
+                        headers_tb = {"Authorization": f"Bearer {tb_key}"}
+
+                        TORBOX_ERROR_MAP = {
+                            "BAD_TOKEN": "TB: Invalid API key",
+                            "AUTH_ERROR": "TB: Authentication error",
+                            "NO_AUTH": "TB: No credentials provided",
+                            "PLAN_RESTRICTED_FEATURE": "TB: Plan upgrade required",
+                            "DOWNLOAD_TOO_LARGE": "TB: Download too large for plan",
+                            "MONTHLY_LIMIT": "TB: Monthly limit reached",
+                            "COOLDOWN_LIMIT": "TB: Download cooldown active",
+                            "ACTIVE_LIMIT": "TB: Max active downloads reached",
+                            "LINK_OFFLINE": "TB: Link offline or inaccessible",
+                            "ITEM_NOT_FOUND": "TB: Item not found",
+                            "NO_SERVERS_AVAILABLE_ERROR": "TB: No servers available",
+                            "DOWNLOAD_SERVER_ERROR": "TB: Download server error",
+                        }
+
+                        error_message = None
+                        error_message_raw = None
+                        tb_webdl_id = None
+
+                        # Étape 0: Vérifier le cache (lien déjà disponible instantanément)
+                        link_hash = _hashlib.md5(link.encode()).hexdigest()
+                        try:
+                            tb_cache_resp = requests.get(
+                                "https://api.torbox.app/v1/api/webdl/checkcached",
+                                params={"hash": link_hash, "format": "list"},
+                                headers=headers_tb,
+                                timeout=15
+                            )
+                            tb_cache_json = tb_cache_resp.json()
+                            if tb_cache_json.get('success') and tb_cache_json.get('data'):
+                                logger.debug("TorBox: lien trouvé en cache, téléchargement immédiat possible")
+                        except Exception as cache_e:
+                            logger.debug(f"TorBox checkcached error (non-fatal): {cache_e}")
+
+                        # Étape 1: Créer le web download
+                        tb_create_resp = requests.post(
+                            "https://api.torbox.app/v1/api/webdl/createwebdownload",
+                            data={"link": link},
+                            headers=headers_tb,
+                            timeout=30
+                        )
+                        tb_create_status = tb_create_resp.status_code
+                        raw_text_tb = None
+                        tb_create_json = None
+                        try:
+                            raw_text_tb = tb_create_resp.text
+                        except Exception:
+                            pass
+                        try:
+                            tb_create_json = tb_create_resp.json()
+                        except Exception:
+                            tb_create_json = None
+                        logger.debug(f"Réponse TorBox createwebdownload code={tb_create_status} body_snippet={(raw_text_tb[:120] + '...') if raw_text_tb and len(raw_text_tb) > 120 else raw_text_tb}")
+
+                        if tb_create_json and isinstance(tb_create_json, dict):
+                            if tb_create_json.get('success') is True:
+                                tb_data = tb_create_json.get('data', {})
+                                if isinstance(tb_data, dict):
+                                    tb_webdl_id = tb_data.get('webdl_id') or tb_data.get('id')
+                                    tb_hash = tb_data.get('hash', '')
+                            elif tb_create_json.get('error') == 'DUPLICATE_ITEM':
+                                # Le lien a déjà été soumis, récupérer l'ID existant
+                                logger.debug("TorBox: DUPLICATE_ITEM - récupération du download existant")
+                                tb_dup_data = tb_create_json.get('data', {})
+                                if isinstance(tb_dup_data, dict):
+                                    tb_webdl_id = tb_dup_data.get('webdl_id') or tb_dup_data.get('id')
+                                if not tb_webdl_id:
+                                    # Chercher dans la liste par hash
+                                    try:
+                                        tb_find_resp = requests.get(
+                                            "https://api.torbox.app/v1/api/webdl/mylist",
+                                            headers=headers_tb,
+                                            timeout=30
+                                        )
+                                        tb_find_json = tb_find_resp.json()
+                                        if tb_find_json.get('success') and tb_find_json.get('data'):
+                                            tb_find_list = tb_find_json['data']
+                                            if isinstance(tb_find_list, list):
+                                                for item in tb_find_list:
+                                                    if item.get('hash') == link_hash or item.get('original_url') == link:
+                                                        tb_webdl_id = item.get('id')
+                                                        break
+                                    except Exception as find_e:
+                                        logger.debug(f"TorBox find existing error: {find_e}")
+                            else:
+                                tb_err_code = tb_create_json.get('error', '')
+                                error_message = TORBOX_ERROR_MAP.get(tb_err_code, f"TB: {tb_create_json.get('detail', tb_err_code)}")
+                                error_message_raw = str(tb_err_code)
+
+                        if tb_webdl_id is not None and not error_message:
+                            # Étape 2: Attendre que le téléchargement soit prêt (polling)
+                            max_wait = 120  # secondes max d'attente
+                            poll_interval = 3  # secondes entre chaque vérification
+                            start_wait = time.time()
+                            tb_ready = False
+
+                            while time.time() - start_wait < max_wait:
+                                try:
+                                    tb_list_resp = requests.get(
+                                        "https://api.torbox.app/v1/api/webdl/mylist",
+                                        params={"id": tb_webdl_id},
+                                        headers=headers_tb,
+                                        timeout=30
+                                    )
+                                    tb_list_json = tb_list_resp.json()
+                                    if tb_list_json.get('success') and tb_list_json.get('data'):
+                                        tb_item = tb_list_json['data']
+                                        if isinstance(tb_item, list):
+                                            tb_item = tb_item[0] if tb_item else {}
+                                        tb_dl_state = tb_item.get('download_state', '')
+                                        tb_dl_finished = tb_item.get('download_finished', False)
+                                        logger.debug(f"TorBox webdl status: download_state={tb_dl_state}, finished={tb_dl_finished}")
+                                        if tb_dl_state in ('cached', 'completed', 'uploading', 'done') or tb_dl_finished:
+                                            tb_ready = True
+                                            filename = tb_item.get('name') or tb_item.get('original_name') or filename or game_name
+                                            break
+                                        elif tb_dl_state in ('error', 'failed', 'stalled'):
+                                            error_message = f"TB: Download failed ({tb_dl_state})"
+                                            break
+                                except Exception as poll_e:
+                                    logger.debug(f"TorBox poll error: {poll_e}")
+                                time.sleep(poll_interval)
+
+                            if tb_ready:
+                                # Étape 3: Demander le lien de téléchargement
+                                try:
+                                    tb_dl_resp = requests.get(
+                                        "https://api.torbox.app/v1/api/webdl/requestdl",
+                                        params={"token": tb_key, "web_id": tb_webdl_id, "file_id": 0},
+                                        timeout=30
+                                    )
+                                    tb_dl_json = tb_dl_resp.json()
+                                    if tb_dl_json.get('success') and tb_dl_json.get('data'):
+                                        final_url = tb_dl_json['data']
+                                        logger.debug("Débridage réussi via TorBox")
+                                        provider_used = 'TB'
+                                        _set_provider_in_history(provider_used)
+                                    else:
+                                        tb_err = tb_dl_json.get('error', '')
+                                        error_message = TORBOX_ERROR_MAP.get(tb_err, f"TB: {tb_dl_json.get('detail', tb_err)}")
+                                        error_message_raw = str(tb_err)
+                                except Exception as dl_e:
+                                    logger.error(f"TorBox requestdl error: {dl_e}")
+                            elif not error_message:
+                                error_message = "TB: Download not ready (timeout)"
+                        elif not error_message:
+                            if tb_webdl_id is None:
+                                if tb_create_status == 403:
+                                    error_message = "TB: Authentication failed (403)"
+                                elif tb_create_status == 429:
+                                    error_message = "TB: Rate limited (429)"
+                                elif tb_create_status >= 500:
+                                    error_message = f"TB: Server error ({tb_create_status})"
+                                elif tb_create_status != 200:
+                                    error_message = f"TB: Unexpected status ({tb_create_status})"
+                                else:
+                                    error_message = "TB: No webdl_id returned"
+
+                        if not final_url and error_message:
+                            logger.warning(f"TorBox fallback échec: {error_message}")
+                            if provider_used is None:
+                                provider_used = 'TB'
+                                _set_provider_in_history(provider_used)
+                            result[0] = False
+                            result[1] = error_message
+                            try:
+                                if isinstance(result, list):
+                                    result.append({"raw_error_torbox": error_message_raw or error_message})
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.error(f"Exception TorBox fallback: {e}")
+                if not final_url:
+                    # NOUVEAU: Fallback mode gratuit 1fichier si aucune clé API disponible
+                    logger.warning("Aucune URL directe obtenue via API - Tentative mode gratuit 1fichier")
+                    
+                    # Créer un lock pour ce téléchargement
+                    free_lock = threading.Lock()
+                    last_free_saved_percent = {"value": -1}
+                    last_free_wait_save_ts = {"value": 0.0}
+                    
+                    try:
+                        # Créer une session requests pour le mode gratuit
+                        free_session = requests.Session()
+                        free_session.headers.update(
+                            _build_browser_download_headers(
+                                referer=link,
+                                accept='text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                            )
+                        )
+                        
+                        # Callbacks pour le mode gratuit
+                        def log_cb(msg):
+                            logger.info(msg)
+                            if isinstance(config.history, list):
+                                for entry in config.history:
+                                    if "url" in entry and entry["url"] == url:
+                                        entry["message"] = msg
+                                        config.needs_redraw = True
+                                        break
+                        
+                        def progress_cb(filename, downloaded, total, pct):
+                            with free_lock:
+                                if isinstance(config.history, list):
+                                    for entry in config.history:
+                                        if "url" in entry and entry["url"] == url and entry["status"] == "Downloading":
+                                            progress_percent = int(pct) if pct else 0
+                                            entry["progress"] = progress_percent
+                                            entry["downloaded_size"] = downloaded
+                                            entry["total_size"] = total
+                                            # Effacer le message personnalisé pour afficher le pourcentage
+                                            entry["message"] = ""
+                                            config.needs_redraw = True
+                                            should_save = (
+                                                (progress_percent % 5 == 0 or progress_percent >= 99)
+                                                and progress_percent != last_free_saved_percent["value"]
+                                            )
+                                            if should_save and _save_history_with_feedback("download_1fichier:free_progress"):
+                                                last_free_saved_percent["value"] = progress_percent
+                                            break
+                                progress_queues[task_id].put((task_id, downloaded, total))
+                        
+                        def wait_cb(remaining, total_wait):
+                            if isinstance(config.history, list):
+                                for entry in config.history:
+                                    if "url" in entry and entry["url"] == url:
+                                        entry["message"] = _("free_mode_waiting").format(remaining, total_wait)
+                                        config.needs_redraw = True
+                                        now_wait = time.time()
+                                        if now_wait - last_free_wait_save_ts["value"] >= 2.0:
+                                            if _save_history_with_feedback("download_1fichier:free_wait"):
+                                                last_free_wait_save_ts["value"] = now_wait
+                                        break
+                        
+                        # Lancer le téléchargement gratuit
+                        success, filepath, error_msg = download_1fichier_free_mode(
+                            url=link,
+                            dest_dir=dest_dir,
+                            session=free_session,
+                            log_callback=log_cb,
+                            progress_callback=progress_cb,
+                            wait_callback=wait_cb,
+                            cancel_event=cancel_ev
+                        )
+                        
+                        if success:
+                            logger.info(f"Téléchargement gratuit réussi: {filepath}")
+                            result[0] = True
+                            result[1] = _("network_download_ok").format(game_name) if _ else f"Download successful: {game_name}"
+                            provider_used = 'FREE'
+                            _set_provider_in_history(provider_used)
+                            
+                            # Mettre à jour l'historique
+                            if isinstance(config.history, list):
+                                for entry in config.history:
+                                    if "url" in entry and entry["url"] == url:
+                                        entry["status"] = "Completed"
+                                        entry["progress"] = 100
+                                        entry["message"] = result[1]
+                                        entry["provider"] = "FREE"
+                                        entry["provider_prefix"] = "FREE:"
+                                        _save_history_with_feedback("download_1fichier:free_success")
+                                        config.needs_redraw = True
+                                        break
+                            
+                            # Traiter le fichier (extraction si nécessaire)
+                            if not is_zip_non_supported:
+                                try:
+                                    if filepath.lower().endswith('.zip'):
+                                        logger.info(f"Extraction ZIP: {filepath}")
+                                        extract_zip(filepath, dest_dir, url)
+                                        logger.info("ZIP extrait")
+                                    elif filepath.lower().endswith('.rar'):
+                                        logger.info(f"Extraction RAR: {filepath}")
+                                        extract_rar(filepath, dest_dir, url)
+                                        logger.info("RAR extrait")
+                                    elif filepath.lower().endswith('.7z'):
+                                        logger.info(f"Extraction 7z: {filepath}")
+                                        extract_7z(filepath, dest_dir, url)
+                                        logger.info("7z extrait")
+                                except Exception as e:
+                                    logger.error(f"Erreur extraction: {e}")
+                            
+                            return
+                        else:
+                            logger.error(f"Échec téléchargement gratuit: {error_msg}")
+                            result[0] = False
+                            if isinstance(error_msg, str) and error_msg.startswith("1fichier:"):
+                                result[1] = error_msg
+                            else:
+                                result[1] = f"Error Downloading with free mode: {error_msg}"
+                            return
+                    
+                    except Exception as e:
+                        logger.error(f"Exception mode gratuit: {e}", exc_info=True)
+                    
+                    # Si le mode gratuit a échoué aussi
+                    logger.error("Échec de tous les providers (API + mode gratuit)")
+                    result[0] = False
+                    if result[1] is None:
+                        result[1] = _("network_api_error").format("No provider available") if _ else "No provider available"
+                    return
+                if not filename:
+                    filename = game_name
+                sanitized_filename = sanitize_filename(filename)
+                dest_path = os.path.join(dest_dir, sanitized_filename)
+
+                # Essayer de récupérer la taille du serveur via HEAD request
+                remote_size = None
+                try:
+                    if final_url and provider_used not in {'AD', 'DL', 'RD'}:
+                        head_response = provider_download_session.head(final_url, timeout=10, allow_redirects=True)
+                        if head_response.status_code == 200:
+                            content_length = head_response.headers.get('content-length')
+                            if content_length:
+                                remote_size = int(content_length)
+                                logger.debug(f"Taille du fichier serveur (AllDebrid/Debrid-Link/RealDebrid): {remote_size} octets")
+                    elif final_url:
+                        logger.debug(f"Saut du HEAD préliminaire pour provider {provider_used}: URL temporaire potentiellement sensible ({final_url})")
+                except Exception as e:
+                    logger.debug(f"Impossible de vérifier la taille serveur (AllDebrid/Debrid-Link/RealDebrid): {e}")
+                
+                # Vérifier si le fichier existe déjà (exact ou avec autre extension)
+                file_found = False
+                if os.path.exists(dest_path):
+                    logger.info(f"Le fichier {dest_path} existe déjà, vérification de la taille...")
+                    
+                    # Vérifier la taille du fichier local
+                    local_size = os.path.getsize(dest_path)
+                    logger.debug(f"Taille du fichier local: {local_size} octets")
+                    
+                    # Comparer les tailles si on a obtenu la taille distante
+                    if remote_size is not None and local_size != remote_size:
+                        logger.warning(f"Taille mismatch! Local: {local_size}, Remote: {remote_size} - le fichier sera re-téléchargé")
+                        # Les tailles ne correspondent pas, il faut re-télécharger
+                        try:
+                            if os.path.exists(dest_path):
+                                os.remove(dest_path)
+                                logger.info(f"Fichier incomplet supprimé: {dest_path}")
+                            else:
+                                logger.debug(f"Fichier déjà supprimé par un autre thread: {dest_path}")
+                        except FileNotFoundError:
+                            logger.debug(f"Fichier déjà supprimé (ou n'existe plus): {dest_path}")
+                        except Exception as e:
+                            logger.error(f"Impossible de supprimer le fichier incomplet: {e}")
+                            result[0] = False
+                            result[1] = f"Erreur suppression fichier incomplet: {str(e)}"
+                            return
+                        # Continuer le téléchargement normal (ne pas faire return)
+                    else:
+                        # Les tailles correspondent ou on ne peut pas vérifier, considérer comme déjà téléchargé
+                        logger.info(f"Le fichier {dest_path} existe déjà et la taille est correcte, téléchargement ignoré")
+                        result[0] = True
+                        result[1] = _("network_download_ok").format(game_name) + _("download_already_present")
+                        # Afficher un toast au lieu d'ouvrir l'historique
+                        try:
+                            show_toast(result[1])
+                        except Exception as e:
+                            logger.debug(f"Impossible d'afficher le toast: {e}")
+                        with urls_lock:
+                            urls_in_progress.discard(url)
+                            logger.debug(f"URL supprimée du set des téléchargements en cours: {url} (URLs restantes: {len(urls_in_progress)})")
+                        return result[0], result[1]
+                    file_found = True
+                
+                # Vérifier si un fichier avec le même nom de base mais extension différente existe (SEULEMENT si fichier exact non trouvé)
+                if not file_found:
+                    base_name_no_ext = os.path.splitext(sanitized_filename)[0]
+                    if base_name_no_ext != sanitized_filename:  # Seulement si une extension était présente
+                        try:
+                            # Lister tous les fichiers dans le répertoire de destination
+                            if os.path.exists(dest_dir):
+                                for existing_file in os.listdir(dest_dir):
+                                    existing_base = os.path.splitext(existing_file)[0]
+                                    if existing_base == base_name_no_ext:
+                                        existing_path = os.path.join(dest_dir, existing_file)
+                                        logger.info(f"Un fichier avec le même nom de base existe: {existing_path}, vérification de la taille...")
+                                        
+                                        # Vérifier la taille du fichier local
+                                        local_size = os.path.getsize(existing_path)
+                                        logger.debug(f"Taille du fichier local (extension différente): {local_size} octets")
+                                        
+                                        # Comparer les tailles si on a obtenu la taille distante
+                                        if remote_size is not None and local_size != remote_size:
+                                            logger.warning(f"Taille mismatch (extension différente)! Local: {local_size}, Remote: {remote_size} - re-téléchargement")
+                                            # Continuer le téléchargement normal
+                                            break
+                                        else:
+                                            # Les tailles correspondent, fichier complet
+                                            logger.info(f"Un fichier avec le même nom de base existe déjà: {existing_path}, téléchargement ignoré")
+                                            result[0] = True
+                                            result[1] = _("network_download_ok").format(game_name) + _("download_already_extracted")
+                                            # Afficher un toast au lieu d'ouvrir l'historique
+                                            try:
+                                                show_toast(result[1])
+                                            except Exception as e:
+                                                logger.debug(f"Impossible d'afficher le toast: {e}")
+                                            with urls_lock:
+                                                urls_in_progress.discard(url)
+                                                logger.debug(f"URL supprimée du set des téléchargements en cours: {url} (URLs restantes: {len(urls_in_progress)})")
+                                            return result[0], result[1]
+                        except Exception as e:
+                            logger.debug(f"Erreur lors de la vérification des fichiers existants: {e}")
+            lock = threading.Lock()
+            retries = 10
+            retry_delay = 10
+            download_header_variants = [
+                provider_download_headers,
+                _build_browser_download_headers(accept='*/*'),
+                {
+                    'User-Agent': 'curl/8.4.0',
+                    'Accept': '*/*',
+                    'Accept-Encoding': 'identity',
+                    'Connection': 'keep-alive',
+                },
+            ]
+            logger.debug(f"Initialisation progression avec taille inconnue pour task_id={task_id}")
+            progress_queues[task_id].put((task_id, 0, 0))  # Taille initiale inconnue
+            for attempt in range(retries):
+                logger.debug(f"Début tentative {attempt + 1} pour télécharger {final_url}")
+                try:
+                    attempt_headers = download_header_variants[min(attempt, len(download_header_variants) - 1)]
+                    logger.debug(f"Headers tentative {attempt + 1}: {_redact_headers(attempt_headers)}")
+                    with provider_download_session.get(final_url, stream=True, headers=attempt_headers, timeout=(30, 120), allow_redirects=True) as response:
+                        logger.debug(f"Réponse GET reçue, code: {response.status_code}")
+                        if response.status_code == 503 and provider_used == 'AD' and attempt < retries - 1:
+                            logger.warning("AllDebrid a renvoyé 503 sur l'URL débridée, tentative de régénération du lien")
+                            try:
+                                refreshed_url, refreshed_filename = _refresh_alldebrid_final_url(link)
+                                if refreshed_url:
+                                    if refreshed_url != final_url:
+                                        logger.debug(f"Nouvelle URL AllDebrid obtenue: {refreshed_url}")
+                                    final_url = refreshed_url
+                                if refreshed_filename:
+                                    filename = refreshed_filename
+                                    sanitized_filename = sanitize_filename(filename)
+                                    dest_path = os.path.join(dest_dir, sanitized_filename)
+                            except Exception as refresh_error:
+                                logger.warning(f"Impossible de régénérer le lien AllDebrid après 503: {refresh_error}")
+                        response.raise_for_status()
+                        total_size = int(response.headers.get('content-length', 0))
+                        logger.debug(f"Taille totale: {total_size} octets")
+
+                        has_space, low_space_message = _ensure_sufficient_disk_space(dest_dir, total_size)
+                        if not has_space:
+                            raise InsufficientDiskSpaceError(low_space_message)
+
+                        if isinstance(config.history, list):
+                            for entry in config.history:
+                                if "url" in entry and entry["url"] == url:
+                                    entry["total_size"] = total_size  # Ajouter la taille totale
+                                    _save_history_with_feedback("download_1fichier:total_size")
+                                    break
+                        with lock:
+                            if isinstance(config.history, list):
+                                for entry in config.history:
+                                    if "url" in entry and entry["url"] == url and entry["status"] == "Downloading":
+                                        entry["total_size"] = total_size
+                                        config.needs_redraw = True
+                                        break
+                            progress_queues[task_id].put((task_id, 0, total_size))  # Mettre à jour la taille totale
+
+                        downloaded = 0
+                        chunk_size = 8192
+                        last_update_time = time.time()
+                        last_downloaded = 0
+                        update_interval = 0.1  # Mettre à jour toutes les 0,1 secondes
+                        download_canceled = False
+                        logger.debug(f"Ouverture fichier: {dest_path}")
+                        with open(dest_path, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=chunk_size):
+                                # Vérifier la pause (dynamiquement car l'événement peut être créé après le début)
+                                while True:
+                                    pause_ev = pause_events.get(task_id)
+                                    if pause_ev is None or not pause_ev.is_set():
+                                        break  # Pas en pause, continuer le téléchargement
+                                    if cancel_ev is not None and cancel_ev.is_set():
+                                        break  # Sortir de la boucle de pause si annulation demandée
+                                    time.sleep(0.1)  # Attendre en pause
+                                
+                                if cancel_ev is not None and cancel_ev.is_set():
+                                    logger.debug(f"Annulation détectée, arrêt du téléchargement 1fichier pour task_id={task_id}")
+                                    result[0] = False
+                                    result[1] = _("download_canceled") if _ else "Download canceled"
+                                    download_canceled = True
+                                    try:
+                                        f.close()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        if os.path.exists(dest_path):
+                                            os.remove(dest_path)
+                                    except Exception:
+                                        pass
+                                    break
+                                if chunk:
+                                    f.write(chunk)
+                                    downloaded += len(chunk)
+                                    current_time = time.time()
+                                    if current_time - last_update_time >= update_interval:
+                                        with lock:
+                                            if isinstance(config.history, list):
+                                                for entry in config.history:
+                                                    if "url" in entry and entry["url"] == url and entry["status"] == "Downloading":
+                                                        progress_percent = int(downloaded / total_size * 100) if total_size > 0 else 0
+                                                        progress_percent = max(0, min(100, progress_percent))
+                                                        entry["progress"] = progress_percent
+                                                        entry["status"] = "Téléchargement"
+                                                        entry["downloaded_size"] = downloaded
+                                                        entry["total_size"] = total_size
+                                                        config.needs_redraw = True
+                                                        break
+                                        # Calcul de la vitesse en Mo/s
+                                        delta = downloaded - last_downloaded
+                                        speed = (delta / (current_time - last_update_time) / (1024 * 1024)) if (current_time - last_update_time) > 0 else 0.0
+                                        last_downloaded = downloaded
+                                        last_update_time = current_time
+                                        progress_queues[task_id].put((task_id, downloaded, total_size, speed))
+
+                    if downloaded <= 0:
+                        try:
+                            if os.path.exists(dest_path):
+                                os.remove(dest_path)
+                        except Exception:
+                            pass
+                        content_type = response.headers.get('content-type', '') if response is not None else ''
+                        raise requests.HTTPError(
+                            f"Downloaded empty response from source (content-type={content_type or 'unknown'})"
+                        )
+
+                    # Si annulé, ne pas continuer avec extraction
+                    if download_canceled:
+                        return
+                    
+                    # Vérifier si l'extraction automatique est activée dans les paramètres
+                    from rgsx_settings import get_auto_extract
+                    auto_extract_enabled = get_auto_extract()
+                    
+                    # Déterminer si extraction est nécessaire
+                    force_extract = is_zip_non_supported and auto_extract_enabled
+                    is_ps3_target = _is_ps3_redump_target(platform_folder, platform)
+                    if not force_extract and auto_extract_enabled and is_ps3_target:
+                        force_extract = True
+                        logger.debug("Extraction forcée activée pour PS3 Redump (déchiffrement ISO)")
+                    
+                    if force_extract:
+                        with lock:
+                            if url in config.download_progress:
+                                config.download_progress[url]["status"] = "Extracting"
+                                config.download_progress[url]["progress_percent"] = 0
+                                config.download_progress[url]["downloaded_size"] = 0
+                                config.needs_redraw = True
+                            if isinstance(config.history, list):
+                                for entry in config.history:
+                                    if "url" in entry and entry["url"] == url and entry["status"] in ["Téléchargement", "Downloading"]:
+                                        entry["progress"] = 0
+                                        entry["status"] = "Extracting"
+                                        entry["message"] = "Préparation de l'extraction..."
+                                        _save_history_with_feedback("download_1fichier:extracting")
+                                        config.needs_redraw = True
+                                        break
+                        logger.debug(f"Début post-traitement du téléchargement: {os.path.splitext(dest_path)[1].lower()}")
+                        try:
+                            result[0], result[1] = _postprocess_downloaded_file(dest_path, dest_dir, url, game_name, is_ps3_target)
+                        except Exception as e:
+                            logger.error(f"Exception lors du post-traitement: {str(e)}")
+                            result[0] = False
+                            result[1] = f"Erreur téléchargement {game_name}: {str(e)}"
+                    else:
+                        logger.debug(f"Application des permissions sur {dest_path}")
+                        os.chmod(dest_path, 0o644)
+                        logger.info(f"Téléchargement terminé: {dest_path}")
+                        result[0] = True
+                        result[1] = _("network_download_ok").format(game_name)
+                    return
+
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Tentative {attempt + 1} échouée: {e}")
+                    if attempt < retries - 1:
+                        logger.debug(f"Attente de {retry_delay} secondes avant nouvelle tentative")
+                        time.sleep(retry_delay)
+                    else:
+                        logger.error(f"Nombre maximum de tentatives atteint")
+                        result[0] = False
+                        result[1] = _("network_download_failed").format(retries)
+                        return
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Erreur API 1fichier: {e}")
+            result[0] = False
+            result[1] = _("network_api_error").format(str(e))
+        except InsufficientDiskSpaceError as e:
+            logger.warning(f"Téléchargement 1fichier annulé par manque d'espace disque pour {url}: {e}")
+            result[0] = False
+            result[1] = str(e)
+        except Exception as e:
+            logger.error(f"Erreur inattendue téléchargement 1fichier: {e}", exc_info=True)
+            result[0] = False
+            result[1] = _("network_download_error").format(game_name, str(e))
+
+        finally:
+            logger.debug(f"Thread téléchargement 1fichier terminé pour {url}, task_id={task_id}")
+            progress_queues[task_id].put((task_id, result[0], result[1]))
+            logger.debug(f"Résultat final envoyé à la queue: success={result[0]}, message={result[1]}, task_id={task_id}")
+            # Nettoyer l'URL du set en cours de téléchargement
+            with urls_lock:
+                urls_in_progress.discard(url)
+                logger.debug(f"URL supprimée du set des téléchargements en cours (finally): {url} (URLs restantes: {len(urls_in_progress)})")
+
+    logger.debug(f"Démarrage thread pour {url}, task_id={task_id}")
+    thread = threading.Thread(target=download_thread, daemon=True)
+    download_threads[task_id] = thread
+    thread.start()
+
+    # Boucle principale pour mettre à jour la progression
+    logger.debug(f"Début boucle de progression pour task_id={task_id}")
+    while thread.is_alive():
+        try:
+            task_queue = progress_queues.get(task_id)
+            if task_queue:
+                while not task_queue.empty():
+                    data = task_queue.get()
+                    #logger.debug(f"Données queue progression reçues: {data}")
+                    if isinstance(data[1], bool):  # Fin du téléchargement
+                        success, message = data[1], data[2]
+                        if isinstance(config.history, list):
+                            for entry in config.history:
+                                if "url" in entry and entry["url"] == url and entry["status"] in ["Downloading", "Téléchargement", "Extracting", "Converting"]:
+                                    entry["status"] = "Download_OK" if success else "Erreur"
+                                    entry["progress"] = 100 if success else 0
+                                    entry["message"] = message
+                                    _save_history_with_feedback("download_1fichier:final")
+                                    # Marquer le jeu comme téléchargé si succès
+                                    if success:
+                                        logger.debug(f"[1F_WHILE_LOOP] Marking game as downloaded: platform={platform}, game={game_name}")
+                                        from history import mark_game_as_downloaded
+                                        file_size = entry.get("size", "N/A")
+                                        mark_game_as_downloaded(platform, game_name, file_size)
+                                    config.needs_redraw = True
+                                    logger.debug(f"Mise à jour finale historique: status={entry['status']}, progress={entry['progress']}%, message={message}, task_id={task_id}")
+                                    break
+                    else:
+                        if len(data) >= 4:
+                            downloaded, total_size, speed = data[1], data[2], data[3]
+                        else:
+                            downloaded, total_size = data[1], data[2]
+                            speed = 0.0
+                        progress_percent = int(downloaded / total_size * 100) if total_size > 0 else 0
+                        progress_percent = max(0, min(100, progress_percent))
+                        
+                        if isinstance(config.history, list):
+                            for entry in config.history:
+                                if "url" in entry and entry["url"] == url and entry["status"] in ["Downloading", "Téléchargement"]:
+                                    entry["progress"] = progress_percent
+                                    entry["status"] = "Téléchargement"
+                                    entry["downloaded_size"] = downloaded
+                                    entry["total_size"] = total_size
+                                    entry["speed"] = speed  # Ajout de la vitesse
+                                    config.needs_redraw = True
+                                    break
+            try:
+                await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                # Cf. download_rom : on ne propage pas l'annulation ici pour garantir
+                # que thread.join()/notify_download_finished() s'exécutent toujours et
+                # libèrent le slot de la file d'attente (sinon active_download_count
+                # reste bloqué et la queue ne redémarre plus après un Cancel Download).
+                logger.debug(f"Boucle de progression annulée (Cancel Download) pour task_id={task_id}")
+                break
+        except Exception as e:
+            logger.error(f"Erreur mise à jour progression: {str(e)}")
+
+    logger.debug(f"Fin boucle de progression, attente fin thread pour task_id={task_id}")
+    thread.join()
+    try:
+        download_threads.pop(task_id, None)
+    except Exception:
+        pass
+    logger.debug(f"Thread terminé, nettoyage queue pour task_id={task_id}")
+    # Drain any remaining final message to ensure history is saved
+    try:
+        task_queue = progress_queues.get(task_id)
+        if task_queue:
+            while not task_queue.empty():
+                data = task_queue.get()
+                if isinstance(data[1], bool):
+                    success, message = data[1], data[2]
+                    logger.debug(f"[1F_DRAIN_QUEUE] Processing final message: success={success}, message={message[:100] if message else 'None'}")
+                    if isinstance(config.history, list):
+                        for entry in config.history:
+                            if "url" in entry and entry["url"] == url and entry["status"] in ["Downloading", "Téléchargement", "Extracting", "Converting"]:
+                                entry["status"] = "Download_OK" if success else "Erreur"
+                                entry["progress"] = 100 if success else 0
+                                entry["message"] = message
+                                _save_history_with_feedback("download_1fichier:drain")
+                                # Marquer le jeu comme téléchargé si succès
+                                if success:
+                                    logger.debug(f"[1F_DRAIN_QUEUE] Marking game as downloaded: platform={platform}, game={game_name}")
+                                    from history import mark_game_as_downloaded
+                                    file_size = entry.get("size", "N/A")
+                                    mark_game_as_downloaded(platform, game_name, file_size)
+                                break
+    except Exception as e:
+        logger.error(f"[1F_DRAIN_QUEUE] Error processing final message: {e}")
+    # Nettoyer la queue
+    if task_id in progress_queues:
+        del progress_queues[task_id]
+    cancel_events.pop(task_id, None)
+    logger.debug(f"Fin download_from_1fichier, résultat: success={result[0]}, message={result[1]}")
+    
+    # Sauvegarder le résultat AVANT de retirer l'URL du set (pour les doublons)
+    with urls_lock:
+        url_results[url] = (result[0], result[1])
+        urls_in_progress.discard(url)
+        logger.debug(f"URL supprimée du set des téléchargements en cours: {url} (URLs restantes: {len(urls_in_progress)})")
+        # Signaler l'événement pour les appels doublons en attente
+        if url in url_done_events:
+            url_done_events[url].set()
+    
+    try:
+        notify_download_finished()
+    except Exception:
+        pass
+    return result[0], result[1]
+
+def is_1fichier_url(url):
+    """Détecte si l'URL est un lien 1fichier."""
+    return isinstance(url, str) and "1fichier.com" in url

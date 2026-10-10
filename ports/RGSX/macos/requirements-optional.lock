@@ -1,0 +1,6 @@
+# Generated with: pip download --only-binary=:all: --platform macosx_11_0_arm64 --python-version 3.12 -r requirements-optional.in; pip hash <wheel>
+# Install: pip install --require-hashes --only-binary=:all: --no-deps -r requirements-optional.lock
+pillow==11.3.0 \
+    --hash=sha256:921bd305b10e82b4d1f5e802b6850677f965d8394203d182f078873851dada69
+watchdog==6.0.0 \
+    --hash=sha256:6f10cb2d5902447c7d0da897e2c6768bca89174d0c6e1e30abec5421af97a5b0

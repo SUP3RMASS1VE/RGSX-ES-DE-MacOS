@@ -1,0 +1,4759 @@
+from pathlib import Path
+import collections
+import io
+import shutil
+import requests  # type: ignore
+import re
+import json
+import os
+import logging
+import platform
+import subprocess
+import urllib.parse
+import config
+from config import HEADLESS, Game
+from esde_folders import map_rom_folder
+try:
+    if not HEADLESS:
+        import pygame  # type: ignore
+    else:
+        pygame = None  # type: ignore
+except Exception:
+    pygame = None  # type: ignore
+import glob
+import threading
+from rgsx_settings import load_rgsx_settings, save_rgsx_settings, get_allow_unknown_extensions
+import zipfile
+import time
+import random
+import config
+from history import save_history
+from language import _ 
+from datetime import datetime
+import sys
+import tempfile
+try:
+    from PIL import Image  # type: ignore
+except Exception:
+    Image = None  # type: ignore
+
+
+logger = logging.getLogger(__name__)
+# Désactiver les logs DEBUG de urllib3 e requests pour supprimer les messages de connexion HTTP
+
+_SOURCE_BADGE_CACHE = {}
+_HISTORY_MATCH_NO_MATCH_LOG_COOLDOWN_SEC = 5.0
+_HISTORY_MATCH_NO_MATCH_LOG_LAST_TS: dict[str, float] = {}
+_HISTORY_MATCH_NO_MATCH_LOG_LOCK = threading.Lock()
+
+DiskUsage = collections.namedtuple("DiskUsage", "total used free")
+
+
+def get_disk_usage(path: str, log: bool = False) -> "DiskUsage | None":
+    """Retourne (total, used, free) en octets pour le point de montage de `path`.
+
+    Sur certains montages (overlayfs, NFS, quotas), `f_bavail` (blocs libres pour un
+    utilisateur non privilégié) peut remonter à 0 alors que `f_bfree` (blocs libres
+    incluant la réserve root) est correct : on prend le plus grand des deux pour éviter
+    de considérer le disque comme plein à tort.
+    """
+    try:
+        usage = shutil.disk_usage(path)
+    except Exception as exc:
+        logger.debug(f"Impossible de lire l'espace disque pour {path}: {exc}")
+        return None
+
+    if usage.free > 0 or platform.system() == "Windows" or not hasattr(os, "statvfs"):
+        if log:
+            logger.info(f"[HDD] Espace Disque disponible : {usage}")
+        return usage
+
+    try:
+        st = os.statvfs(path)
+        bfree_bytes = st.f_bfree * st.f_frsize
+        if bfree_bytes > usage.free:
+            logger.warning(
+                f"Espace disque libre incohérent pour {path}: f_bavail=0 mais f_bfree={bfree_bytes} octets, utilisation de f_bfree"
+            )
+            return DiskUsage(usage.total, usage.total - bfree_bytes, bfree_bytes)
+    except Exception as exc:
+        logger.debug(f"Fallback statvfs impossible pour {path}: {exc}")
+    return usage
+
+
+def _history_no_match_log_key(game_name, platform_name) -> str:
+    return f"{str(platform_name or '').strip().lower()}::{str(game_name or '').strip().lower()}"
+
+
+def _log_history_no_match_once(game_name, platform_name) -> None:
+    """Log no-match once per key during a short cooldown to avoid spam."""
+    key = _history_no_match_log_key(game_name, platform_name)
+    now_ts = time.time()
+    should_log = False
+
+    with _HISTORY_MATCH_NO_MATCH_LOG_LOCK:
+        last_ts = _HISTORY_MATCH_NO_MATCH_LOG_LAST_TS.get(key, 0.0)
+        if (now_ts - last_ts) >= _HISTORY_MATCH_NO_MATCH_LOG_COOLDOWN_SEC:
+            _HISTORY_MATCH_NO_MATCH_LOG_LAST_TS[key] = now_ts
+            should_log = True
+
+    if should_log:
+        logger.debug(
+            "[HISTORY_MATCH_LOOKUP] no_match game=%s platform=%s",
+            game_name,
+            platform_name,
+        )
+
+
+def _clear_history_no_match_log_cooldown(game_name, platform_name) -> None:
+    key = _history_no_match_log_key(game_name, platform_name)
+    with _HISTORY_MATCH_NO_MATCH_LOG_LOCK:
+        _HISTORY_MATCH_NO_MATCH_LOG_LAST_TS.pop(key, None)
+
+
+def _platform_image_folders():
+    return [
+        config.IMAGES_FOLDER,
+        os.path.join(config.APP_FOLDER, "assets", "images"),
+        os.path.join(config.APP_FOLDER, "images"),
+    ]
+
+
+def _resolve_platform_image_path(platform_dict):
+    platform_name = platform_dict.get("platform_name", "unknown")
+    folder_name = platform_dict.get("folder") or ""
+
+    candidates = []
+    platform_image_field = (platform_dict.get("platform_image") or "").strip()
+    if platform_image_field:
+        candidates.append(platform_image_field)
+    candidates.append(platform_name)
+    if folder_name:
+        candidates.append(folder_name)
+
+    image_path = None
+    for candidate in candidates:
+        candidate_base = os.path.splitext(candidate)[0]
+        for folder in _platform_image_folders():
+            if not os.path.exists(folder):
+                continue
+            for ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp'):
+                test_path = os.path.join(folder, candidate_base + ext)
+                if os.path.exists(test_path):
+                    image_path = test_path
+                    break
+            if image_path:
+                break
+        if image_path:
+            break
+
+    if image_path:
+        return image_path
+
+    for folder in _platform_image_folders():
+        default_path = os.path.join(folder, 'default.png')
+        if os.path.exists(default_path):
+            return default_path
+    return None
+
+
+def get_platform_source_badge_key(platform_name: str):
+    text = str(platform_name).strip()
+    if not text:
+        return None
+    match = re.search(r'\(([^()]+)\)\s*$', text)
+    if not match:
+        return None
+    source = match.group(1).strip().lower()
+    mapping = {
+        'archive': 'Archive',
+        'lolroms': 'LolRoms',
+        'torrent': 'Torrent',
+        '1fichier': '1Fichier',
+        'vimms': 'Vimms',
+        'edgeemu': 'EdgeEmu',
+        'edgeemu.net': 'EdgeEmu',
+    }
+    return mapping.get(source)
+
+
+def _load_svg_badge_surface(svg_path: str, size: int):
+    if pygame is None:
+        return None
+    try:
+        surf = pygame.image.load(svg_path)
+        width, height = surf.get_size()
+        if width <= 0 or height <= 0:
+            return None
+        scale = min(size / width, size / height)
+        scaled = pygame.transform.smoothscale(
+            surf,
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+        )
+        return _safe_convert_alpha(scaled)
+    except Exception as exc:
+        logger.debug(f"Badge SVG load failed for {svg_path}: {exc}")
+        return None
+
+
+def _safe_convert_alpha(surface):
+    if pygame is None or surface is None:
+        return surface
+    try:
+        if pygame.display.get_surface() is not None:
+            return surface.convert_alpha()
+    except Exception:
+        pass
+    return surface.copy()
+
+
+def _build_text_badge_icon(label: str, size: int, color):
+    if pygame is None:
+        return None
+    try:
+        if not pygame.font.get_init():
+            pygame.font.init()
+        font_size = max(11, int(size * (0.34 if len(label) <= 2 else 0.26)))
+        font = pygame.font.SysFont('arial', font_size, bold=True)
+        surface = font.render(label, True, color)
+        return _safe_convert_alpha(surface)
+    except Exception as exc:
+        logger.debug(f"Badge text render failed for {label}: {exc}")
+        return None
+
+
+def _build_1fichier_badge_icon(size: int):
+    if pygame is None:
+        return None
+    try:
+        if not pygame.font.get_init():
+            pygame.font.init()
+
+        width = max(size, int(size * 0.98))
+        height = max(16, int(size * 0.90))
+        surface = pygame.Surface((width, height), pygame.SRCALPHA)
+
+        box_width = max(16, int(width * 0.88))
+        box_height = max(14, int(height * 0.78))
+        box_left = (width - box_width) // 2
+        box_top = (height - box_height) // 2
+
+        front = [
+            (box_left + box_width * 0.10, box_top + box_height * 0.24),
+            (box_left + box_width * 0.74, box_top + box_height * 0.24),
+            (box_left + box_width * 0.74, box_top + box_height * 0.86),
+            (box_left + box_width * 0.10, box_top + box_height * 0.86),
+        ]
+        right = [
+            (box_left + box_width * 0.74, box_top + box_height * 0.24),
+            (box_left + box_width * 0.92, box_top + box_height * 0.12),
+            (box_left + box_width * 0.92, box_top + box_height * 0.70),
+            (box_left + box_width * 0.74, box_top + box_height * 0.86),
+        ]
+        top = [
+            (box_left + box_width * 0.10, box_top + box_height * 0.24),
+            (box_left + box_width * 0.30, box_top + box_height * 0.04),
+            (box_left + box_width * 0.92, box_top + box_height * 0.12),
+            (box_left + box_width * 0.74, box_top + box_height * 0.24),
+        ]
+
+        pygame.draw.polygon(surface, (229, 133, 20), [(int(x), int(y)) for x, y in front])
+        pygame.draw.polygon(surface, (191, 104, 8), [(int(x), int(y)) for x, y in right])
+        pygame.draw.polygon(surface, (248, 177, 63), [(int(x), int(y)) for x, y in top])
+        pygame.draw.lines(surface, (111, 61, 6), True, [(int(x), int(y)) for x, y in front], 1)
+        pygame.draw.lines(surface, (111, 61, 6), True, [(int(x), int(y)) for x, y in right], 1)
+        pygame.draw.lines(surface, (111, 61, 6), True, [(int(x), int(y)) for x, y in top], 1)
+
+        accent_radius = max(1, int(box_height * 0.08))
+        pygame.draw.circle(surface, (48, 48, 48), (int(box_left + box_width * 0.88), int(box_top + box_height * 0.08)), accent_radius)
+        pygame.draw.circle(surface, (48, 48, 48), (int(box_left + box_width * 0.95), int(box_top + box_height * 0.22)), accent_radius)
+
+        one_font = pygame.font.SysFont('arial', max(12, int(box_height * 0.60)), bold=True)
+        f_font = pygame.font.SysFont('arial', max(12, int(box_height * 0.64)), bold=True)
+        one_surface = one_font.render('1', True, (92, 92, 92))
+        f_outline_surface = f_font.render('F', True, (32, 32, 32))
+        f_surface = f_font.render('F', True, (236, 129, 18))
+
+        total_text_width = one_surface.get_width() + f_surface.get_width() - max(1, int(box_height * 0.06))
+        text_x = int(box_left + box_width * 0.16)
+        max_text_x = box_left + box_width - total_text_width - max(2, int(box_width * 0.08))
+        text_x = min(text_x, max_text_x)
+        text_y = int(box_top + (box_height - max(one_surface.get_height(), f_surface.get_height())) / 2)
+        surface.blit(one_surface, (text_x, text_y))
+        f_x = text_x + one_surface.get_width() - max(1, int(box_height * 0.06))
+        f_y = text_y - 1
+        for offset_x, offset_y in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            surface.blit(f_outline_surface, (f_x + offset_x, f_y + offset_y))
+        surface.blit(f_surface, (f_x, f_y))
+        return _safe_convert_alpha(surface)
+    except Exception as exc:
+        logger.debug(f"1Fichier badge render failed: {exc}")
+        return None
+
+
+def get_platform_source_badge_surface(source_key: str, badge_size: int):
+    cache_key = (source_key, badge_size)
+    if cache_key in _SOURCE_BADGE_CACHE:
+        return _SOURCE_BADGE_CACHE[cache_key]
+
+    if pygame is None:
+        _SOURCE_BADGE_CACHE[cache_key] = None
+        return None
+
+    style_map = { 
+        'Archive': {
+            'svg': 'archive.svg',
+            'bg': (255, 255, 255, 242),
+            'border': (48, 48, 48, 235),
+            'label': 'AR',
+            'text': (35, 35, 35),
+        },
+        'LolRoms': {
+            'svg': 'lolroms.svg',
+            'bg': (255, 255, 255, 242),
+            'border': (0, 255, 255, 230),
+            'label': 'LOL',
+            'text': (61, 19, 110),
+        },
+        'Vimms': {
+            'svg': 'vimms.svg',
+            'bg': (255, 255, 255, 242),
+            'border': (208, 208, 208, 235),
+            'label': 'VL',
+            'text': (24, 77, 176),
+        },
+        'Torrent': {
+            'svg': 'torrent.svg',
+            'bg': (255, 255, 255, 242),
+            'border': (97, 164, 64, 235),
+            'label': 'TOR',
+            'text': (37, 90, 24),
+        },
+        '1Fichier': {
+            'svg': None,
+            'bg': (255, 255, 255, 242),
+            'border': (208, 208, 208, 235),
+            'label': '1F',
+            'text': (24, 77, 176),
+        },
+        'EdgeEmu': {
+            'svg': 'edgeemu.svg',
+            'bg': (255, 255, 255, 242),
+            'border': (41, 126, 196, 235),
+            'label': 'EMU',
+            'text': (24, 77, 176),
+            'icon_scale': 0.90,
+        },
+    }
+    style = style_map.get(source_key)
+    if not style:
+        _SOURCE_BADGE_CACHE[cache_key] = None
+        return None
+
+    badge_surface = pygame.Surface((badge_size, badge_size), pygame.SRCALPHA)
+    border_radius = max(10, badge_size // 4)
+    pygame.draw.rect(badge_surface, style['bg'], (0, 0, badge_size, badge_size), border_radius=border_radius)
+
+    inner_margin = max(3, badge_size // 14)
+    inner_rect = pygame.Rect(inner_margin, inner_margin, badge_size - inner_margin * 2, badge_size - inner_margin * 2)
+    pygame.draw.rect(badge_surface, (255, 255, 255, 50), inner_rect, border_radius=max(8, border_radius - 3))
+
+    highlight_height = max(8, badge_size // 3)
+    highlight = pygame.Surface((badge_size - 8, highlight_height), pygame.SRCALPHA)
+    highlight.fill((255, 255, 255, 34))
+    badge_surface.blit(highlight, (4, 4))
+    pygame.draw.rect(badge_surface, style['border'], (0, 0, badge_size, badge_size), max(2, badge_size // 18), border_radius=border_radius)
+
+    icon_surface = None
+    svg_name = style.get('svg')
+    icon_scale = float(style.get('icon_scale', 0.76))
+    target_icon_size = max(22, int(badge_size * icon_scale))
+    if svg_name:
+        svg_path = os.path.join(config.APP_FOLDER, 'assets', 'images', svg_name)
+        if os.path.exists(svg_path):
+            icon_surface = _load_svg_badge_surface(svg_path, target_icon_size)
+    elif source_key == '1Fichier':
+        icon_surface = _build_1fichier_badge_icon(target_icon_size)
+    if icon_surface is None:
+        icon_surface = _build_text_badge_icon(style['label'], badge_size, style['text'])
+
+    if icon_surface is not None:
+        try:
+            icon_shadow = pygame.mask.from_surface(icon_surface).to_surface(
+                setcolor=(0, 0, 0, 90),
+                unsetcolor=(0, 0, 0, 0),
+            )
+            icon_shadow.set_colorkey((0, 0, 0))
+            shadow_rect = icon_shadow.get_rect(center=(badge_size // 2 + 2, badge_size // 2 + 2))
+            badge_surface.blit(icon_shadow, shadow_rect)
+        except Exception:
+            pass
+        icon_rect = icon_surface.get_rect(center=(badge_size // 2, badge_size // 2))
+        badge_surface.blit(icon_surface, icon_rect)
+
+    _SOURCE_BADGE_CACHE[cache_key] = badge_surface
+    return badge_surface
+
+
+def _apply_platform_source_badge(base_surface, platform_name: str):
+    if pygame is None or base_surface is None:
+        return base_surface
+    source_key = get_platform_source_badge_key(platform_name)
+    if not source_key:
+        return base_surface
+
+    composed = _safe_convert_alpha(base_surface)
+    width, height = composed.get_size()
+    badge_size = max(34, min(int(min(width, height) * 0.34), 180))
+    badge_surface = get_platform_source_badge_surface(source_key, badge_size)
+    if badge_surface is None:
+        return composed
+
+    margin = max(5, badge_size // 10)
+    shadow = pygame.Surface((badge_size + 16, badge_size + 16), pygame.SRCALPHA)
+    pygame.draw.rect(shadow, (0, 0, 0, 115), (8, 8, badge_size, badge_size), border_radius=max(10, badge_size // 4))
+    shadow_x = max(0, width - badge_size - margin - 8)
+    shadow_y = margin - 3
+    composed.blit(shadow, (shadow_x, shadow_y))
+
+    badge_x = max(0, width - badge_size - margin)
+    badge_y = margin
+    composed.blit(badge_surface, (badge_x, badge_y))
+    return composed
+
+
+def _surface_to_png_bytes(surface):
+    if pygame is None or surface is None:
+        return None
+    try:
+        raw_bytes = pygame.image.tobytes(surface, 'RGBA')
+        if Image is not None:
+            image = Image.frombytes('RGBA', surface.get_size(), raw_bytes)
+            buffer = io.BytesIO()
+            image.save(buffer, format='PNG')
+            return buffer.getvalue()
+    except Exception as exc:
+        logger.debug(f"Surface to PNG conversion failed: {exc}")
+
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix='.png')
+        os.close(fd)
+        pygame.image.save(surface, tmp_path)
+        with open(tmp_path, 'rb') as handle:
+            return handle.read()
+    except Exception as exc:
+        logger.debug(f"Surface temp export failed: {exc}")
+        return None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def get_platform_image_payload(platform_dict):
+    image_path = _resolve_platform_image_path(platform_dict)
+    if not image_path:
+        return None, None
+
+    platform_name = platform_dict.get('platform_name', 'unknown')
+    try:
+        if pygame is not None and get_platform_source_badge_key(platform_name):
+            surface = _safe_convert_alpha(pygame.image.load(image_path))
+            surface = _apply_platform_source_badge(surface, platform_name)
+            png_bytes = _surface_to_png_bytes(surface)
+            if png_bytes:
+                return png_bytes, 'image/png'
+    except Exception as exc:
+        logger.debug(f"Badged image payload failed for {platform_name}: {exc}")
+
+    ext = os.path.splitext(image_path)[1].lower()
+    mime_types = {
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+    }
+    try:
+        with open(image_path, 'rb') as handle:
+            return handle.read(), mime_types.get(ext, 'image/png')
+    except Exception as exc:
+        logger.error(f"Unable to read platform image payload {image_path}: {exc}")
+        return None, None
+
+
+def parse_game_size_to_bytes(value) -> int:
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if not isinstance(value, str):
+        return 0
+
+    text = value.strip()
+    if not text:
+        return 0
+
+    if ',' in text and '.' in text:
+        text = text.replace(',', '')
+    elif ',' in text:
+        numeric_part_match = re.match(r'^([0-9][0-9,]*)', text)
+        numeric_part = numeric_part_match.group(1) if numeric_part_match else ''
+        comma_groups = numeric_part.split(',')
+        if len(comma_groups) > 1 and all(group.isdigit() for group in comma_groups) and all(len(group) == 3 for group in comma_groups[1:]):
+            text = text.replace(',', '')
+        else:
+            text = text.replace(',', '.')
+
+    match = re.match(r'^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)?$', text)
+    if not match:
+        return 0
+
+    amount = float(match.group(1))
+    unit = (match.group(2) or 'B').strip().lower()
+    multipliers = {
+        'b': 1,
+        'byte': 1,
+        'bytes': 1,
+        'octet': 1,
+        'octets': 1,
+        'k': 1024,
+        'kb': 1024,
+        'kib': 1024,
+        'ko': 1024,
+        'm': 1024 ** 2,
+        'mb': 1024 ** 2,
+        'mib': 1024 ** 2,
+        'mo': 1024 ** 2,
+        'g': 1024 ** 3,
+        'gb': 1024 ** 3,
+        'gib': 1024 ** 3,
+        'go': 1024 ** 3,
+        't': 1024 ** 4,
+        'tb': 1024 ** 4,
+        'tib': 1024 ** 4,
+        'to': 1024 ** 4,
+        'p': 1024 ** 5,
+        'pb': 1024 ** 5,
+        'pib': 1024 ** 5,
+        'po': 1024 ** 5,
+    }
+    return int(amount * multipliers.get(unit, 0)) if unit in multipliers else 0
+
+
+def sort_games_list(items: list[Game], option: str = 'name_asc') -> list[Game]:
+    reverse = option in ('name_desc', 'size_desc')
+
+    if option.startswith('size_'):
+        return sorted(
+            items,
+            key=lambda game: (
+                parse_game_size_to_bytes(game.size),
+                str(game.display_name or game.name or '').lower(),
+            ),
+            reverse=reverse,
+        )
+
+    return sorted(
+        items,
+        key=lambda game: (
+            str(game.display_name or game.name or '').lower(),
+            parse_game_size_to_bytes(game.size),
+        ),
+        reverse=reverse,
+    )
+
+
+def sort_games_list_from_settings(items: list[Game]) -> list[Game]:
+    try:
+        from rgsx_settings import get_global_sort_option
+
+        option = get_global_sort_option()
+    except Exception:
+        option = 'name_asc'
+    return sort_games_list(items, option)
+
+
+def _resolve_7z_command():
+    if config.OPERATING_SYSTEM == "Windows":
+        return config.SEVEN_Z_EXE
+
+    candidates = []
+    is_mac = config.OPERATING_SYSTEM == "Darwin"
+    # macOS: the bundled 7zz is a Linux ELF binary, use Homebrew/PATH instead
+    bundled = '' if is_mac else getattr(config, 'SEVEN_Z_LINUX', '')
+    if bundled:
+        candidates.append(bundled)
+    for binary_name in ("7zz", "7z", "7zr"):
+        resolved = shutil.which(binary_name)
+        if resolved and resolved not in candidates:
+            candidates.append(resolved)
+    if is_mac:
+        # Apps launched from Finder get a minimal PATH: try Homebrew locations explicitly
+        for fallback in ("/opt/homebrew/bin/7zz", "/usr/local/bin/7zz", "/opt/homebrew/bin/7z", "/usr/local/bin/7z"):
+            if fallback not in candidates:
+                candidates.append(fallback)
+
+    last_error = None
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            if os.path.isabs(candidate) and not os.path.exists(candidate):
+                continue
+            if os.path.exists(candidate) and not os.access(candidate, os.X_OK):
+                logger.warning(f"{candidate} n'est pas exécutable, correction des permissions...")
+                os.chmod(candidate, 0o755)
+            probe = subprocess.run(
+                [candidate],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            if isinstance(probe.returncode, int):
+                return candidate
+        except OSError as exc:
+            last_error = exc
+            logger.warning(f"Binaire 7z ignoré ({candidate}): {exc}")
+        except Exception as exc:
+            last_error = exc
+            logger.warning(f"Impossible d'utiliser le binaire 7z {candidate}: {exc}")
+
+    if last_error is not None:
+        logger.error(f"Aucun binaire 7z utilisable trouvé: {last_error}")
+    return bundled or None
+
+
+def get_clean_display_name(raw_name, platform_id=None):
+    """Return a user-facing game title from a raw file/path entry."""
+    text = str(raw_name or "").strip()
+    if not text:
+        return ""
+
+    normalized = text.replace("\\", "/")
+    leaf_name = normalized.rsplit("/", 1)[-1]
+    display_name = Path(leaf_name).stem.strip()
+
+    prefixes = []
+    if platform_id:
+        prefixes.append(str(platform_id).strip())
+        platform_label = getattr(config, "platform_names", {}).get(platform_id)
+        if platform_label:
+            prefixes.append(str(platform_label).strip())
+
+    for prefix in prefixes:
+        if not prefix:
+            continue
+        pattern = rf"^{re.escape(prefix)}[\s\-_:]+"
+        updated_name = re.sub(pattern, "", display_name, flags=re.IGNORECASE).strip()
+        if updated_name:
+            display_name = updated_name
+
+    return display_name.strip(" -_/")
+
+_games_cache = {}
+_platform_game_count_cache = {}
+_platform_game_count_cache_loaded = False
+_platform_game_count_cache_lock = threading.Lock()
+_torrent_manifest_cache = {}
+_torrent_manifest_cache_loaded = False
+_torrent_manifest_cache_lock = threading.Lock()
+_TORRENT_DOWNLOAD_SCHEME = "rgsx+torrent"
+
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+
+# Helper pour vérifier si pygame.mixer est disponible
+def is_mixer_available():
+    """Vérifie si pygame.mixer est disponible et initialisé."""
+    try:
+        return pygame is not None and hasattr(pygame, 'mixer') and pygame.mixer.get_init() is not None
+    except (AttributeError, NotImplementedError):
+        return False
+
+# Liste globale pour stocker les systèmes avec une erreur 404
+unavailable_systems = []
+
+
+def _load_persistent_torrent_manifest_cache() -> None:
+    global _torrent_manifest_cache_loaded, _torrent_manifest_cache
+    if _torrent_manifest_cache_loaded:
+        return
+    with _torrent_manifest_cache_lock:
+        if _torrent_manifest_cache_loaded:
+            return
+        cache_path = getattr(config, 'TORRENT_MANIFEST_CACHE_PATH', '')
+        loaded_cache = {}
+        try:
+            if cache_path and os.path.exists(cache_path):
+                with open(cache_path, 'r', encoding='utf-8') as handle:
+                    payload = json.load(handle)
+                if isinstance(payload, dict):
+                    entries = payload.get('entries') if isinstance(payload.get('entries'), dict) else payload
+                    if isinstance(entries, dict):
+                        for source_url, cached_entries in entries.items():
+                            if not isinstance(source_url, str) or not isinstance(cached_entries, list):
+                                continue
+                            safe_entries = []
+                            for entry in cached_entries:
+                                if not isinstance(entry, dict):
+                                    continue
+                                safe_entries.append({
+                                    'name': str(entry.get('name') or ''),
+                                    'path': str(entry.get('path') or ''),
+                                    'download_path': str(entry.get('download_path') or entry.get('path') or ''),
+                                    'index': int(entry.get('index') or 1),
+                                    'size_bytes': int(entry.get('size_bytes') or 0),
+                                    'source_url': str(entry.get('source_url') or source_url),
+                                })
+                            if safe_entries:
+                                loaded_cache[source_url] = safe_entries
+                logger.info(f"Cache torrent charge: {len(loaded_cache)} manifestes")
+        except Exception as exc:
+            logger.warning(f"Impossible de charger le cache torrent persistant: {exc}")
+        _torrent_manifest_cache = loaded_cache
+        _torrent_manifest_cache_loaded = True
+
+
+def _save_persistent_torrent_manifest_cache() -> None:
+    cache_path = getattr(config, 'TORRENT_MANIFEST_CACHE_PATH', '')
+    if not cache_path:
+        return
+    with _torrent_manifest_cache_lock:
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            payload = {
+                'version': 1,
+                'entries': _torrent_manifest_cache,
+            }
+            temp_path = f"{cache_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(temp_path, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            last_error = None
+            for attempt in range(5):
+                try:
+                    os.replace(temp_path, cache_path)
+                    last_error = None
+                    break
+                except PermissionError as exc:
+                    last_error = exc
+                    time.sleep(0.15 * (attempt + 1))
+            if last_error is not None:
+                raise last_error
+        except Exception as exc:
+            logger.warning(f"Impossible de sauvegarder le cache torrent persistant: {exc}")
+        finally:
+            try:
+                if 'temp_path' in locals() and os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+
+
+def clear_torrent_manifest_cache() -> None:
+    global _torrent_manifest_cache, _torrent_manifest_cache_loaded
+    with _torrent_manifest_cache_lock:
+        _torrent_manifest_cache = {}
+        _torrent_manifest_cache_loaded = True
+        cache_path = getattr(config, 'TORRENT_MANIFEST_CACHE_PATH', '')
+        try:
+            if cache_path and os.path.exists(cache_path):
+                os.remove(cache_path)
+            logger.info("Cache torrent invalide")
+        except Exception as exc:
+            logger.warning(f"Impossible de supprimer le cache torrent: {exc}")
+
+
+def request_torrent_manifest_refresh() -> None:
+    marker_path = getattr(config, 'PENDING_TORRENT_REFRESH_MARKER_PATH', '')
+    if not marker_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+        with open(marker_path, 'w', encoding='utf-8') as handle:
+            handle.write(datetime.now().isoformat())
+        logger.info("Rafraichissement complet des manifests torrent planifie")
+    except Exception as exc:
+        logger.warning(f"Impossible de planifier le rafraichissement torrent: {exc}")
+
+
+def is_torrent_manifest_refresh_requested() -> bool:
+    marker_path = getattr(config, 'PENDING_TORRENT_REFRESH_MARKER_PATH', '')
+    return bool(marker_path and os.path.exists(marker_path))
+
+
+def clear_torrent_manifest_refresh_request() -> None:
+    marker_path = getattr(config, 'PENDING_TORRENT_REFRESH_MARKER_PATH', '')
+    if not marker_path or not os.path.exists(marker_path):
+        return
+    try:
+        os.remove(marker_path)
+        logger.debug("Demande de rafraichissement torrent consommee")
+    except Exception as exc:
+        logger.warning(f"Impossible de supprimer le marqueur de rafraichissement torrent: {exc}")
+
+
+def _load_persistent_platform_game_count_cache() -> None:
+    global _platform_game_count_cache_loaded, _platform_game_count_cache
+    if _platform_game_count_cache_loaded:
+        return
+    with _platform_game_count_cache_lock:
+        if _platform_game_count_cache_loaded:
+            return
+        cache_path = getattr(config, 'PLATFORM_GAME_COUNT_CACHE_PATH', '')
+        loaded_cache = {}
+        try:
+            if cache_path and os.path.exists(cache_path):
+                with open(cache_path, 'r', encoding='utf-8') as handle:
+                    payload = json.load(handle)
+                entries = payload.get('entries') if isinstance(payload, dict) else payload
+                if isinstance(entries, dict):
+                    for platform_id, entry in entries.items():
+                        if not isinstance(platform_id, str) or not isinstance(entry, dict):
+                            continue
+                        loaded_cache[platform_id] = {
+                            'path': str(entry.get('path') or ''),
+                            'mtime_ns': int(entry.get('mtime_ns') or 0),
+                            'file_name': str(entry.get('file_name') or ''),
+                            'size_bytes': int(entry.get('size_bytes') or 0),
+                            'count': int(entry.get('count') or 0),
+                        }
+                logger.info(f"Cache compteurs plateformes charge: {len(loaded_cache)} entrees")
+        except Exception as exc:
+            logger.warning(f"Impossible de charger le cache compteurs plateformes: {exc}")
+        _platform_game_count_cache = loaded_cache
+        _platform_game_count_cache_loaded = True
+
+
+def _save_persistent_platform_game_count_cache() -> None:
+    cache_path = getattr(config, 'PLATFORM_GAME_COUNT_CACHE_PATH', '')
+    if not cache_path:
+        return
+    with _platform_game_count_cache_lock:
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            payload = {
+                'version': 2,
+                'entries': _platform_game_count_cache,
+            }
+            temp_path = f"{cache_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(temp_path, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            last_error = None
+            for attempt in range(5):
+                try:
+                    os.replace(temp_path, cache_path)
+                    last_error = None
+                    break
+                except PermissionError as exc:
+                    last_error = exc
+                    time.sleep(0.15 * (attempt + 1))
+            if last_error is not None:
+                raise last_error
+        except Exception as exc:
+            logger.warning(f"Impossible de sauvegarder le cache compteurs plateformes: {exc}")
+        finally:
+            try:
+                if 'temp_path' in locals() and os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+
+
+def clear_platform_game_count_cache() -> None:
+    global _platform_game_count_cache, _platform_game_count_cache_loaded
+    with _platform_game_count_cache_lock:
+        _platform_game_count_cache = {}
+        _platform_game_count_cache_loaded = True
+        cache_path = getattr(config, 'PLATFORM_GAME_COUNT_CACHE_PATH', '')
+        try:
+            if cache_path and os.path.exists(cache_path):
+                os.remove(cache_path)
+            logger.info("Cache compteurs plateformes invalide")
+        except Exception as exc:
+            logger.warning(f"Impossible de supprimer le cache compteurs plateformes: {exc}")
+
+
+def _resolve_game_file(platform_id: str):
+    platform_dict = None
+    for pd in config.platform_dicts:
+        if pd.get("platform_name") == platform_id or pd.get("platform") == platform_id:
+            platform_dict = pd
+            break
+
+    candidates = [os.path.join(config.GAMES_FOLDER, f"{platform_id}.json")]
+    norm = normalize_platform_name(platform_id)
+    if norm and norm != platform_id:
+        candidates.append(os.path.join(config.GAMES_FOLDER, f"{norm}.json"))
+    if platform_dict:
+        folder_name = platform_dict.get("folder")
+        if folder_name:
+            candidates.append(os.path.join(config.GAMES_FOLDER, f"{folder_name}.json"))
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate, platform_dict, candidates
+    return None, platform_dict, candidates
+
+
+def _get_cached_platform_game_count(platform_id: str, game_file: str, game_mtime_ns: int, game_size_bytes: int) -> int | None:
+    _load_persistent_platform_game_count_cache()
+    cached_entry = _platform_game_count_cache.get(platform_id)
+    if not isinstance(cached_entry, dict):
+        return None
+    cached_path = str(cached_entry.get('path') or '')
+    cached_mtime_ns = int(cached_entry.get('mtime_ns') or 0)
+    cached_file_name = str(cached_entry.get('file_name') or '')
+    cached_size_bytes = int(cached_entry.get('size_bytes') or 0)
+
+    if cached_path == game_file and cached_mtime_ns == int(game_mtime_ns):
+        return max(0, int(cached_entry.get('count') or 0))
+
+    # Portable fallback for caches embedded in games.zip.
+    if cached_file_name and cached_file_name == os.path.basename(game_file) and cached_size_bytes == int(game_size_bytes):
+        return max(0, int(cached_entry.get('count') or 0))
+
+    return None
+
+
+def _store_platform_game_count(platform_id: str, game_file: str, game_mtime_ns: int, game_size_bytes: int, count: int) -> None:
+    _load_persistent_platform_game_count_cache()
+    normalized_entry = {
+        'path': game_file,
+        'mtime_ns': int(game_mtime_ns),
+        'file_name': os.path.basename(game_file),
+        'size_bytes': int(game_size_bytes),
+        'count': max(0, int(count)),
+    }
+    with _platform_game_count_cache_lock:
+        existing_entry = _platform_game_count_cache.get(platform_id)
+        if isinstance(existing_entry, dict):
+            existing_normalized = {
+                'path': str(existing_entry.get('path') or ''),
+                'mtime_ns': int(existing_entry.get('mtime_ns') or 0),
+                'file_name': str(existing_entry.get('file_name') or ''),
+                'size_bytes': int(existing_entry.get('size_bytes') or 0),
+                'count': int(existing_entry.get('count') or 0),
+            }
+            if existing_normalized == normalized_entry:
+                return
+
+        _platform_game_count_cache[platform_id] = normalized_entry
+    _save_persistent_platform_game_count_cache()
+
+
+def _get_torrent_entry_count(source_url: str, display_label: str | None = None, platform_id: str | None = None, allow_network_fetch: bool = True) -> int:
+    _load_persistent_torrent_manifest_cache()
+    cached = _torrent_manifest_cache.get(source_url)
+    if cached is not None:
+        return len(cached)
+    if not allow_network_fetch:
+        logger.debug(f"Comptage torrent differe (cache absent, fetch desactive): {platform_id or 'unknown'} -> {source_url}")
+        return 0
+    return len(_get_torrent_entries(source_url, display_label=display_label, platform_id=platform_id))
+
+
+def get_platform_game_count(platform_id: str, allow_torrent_manifest_fetch: bool = True) -> int:
+    game_file, resolved_platform_dict, candidates = _resolve_game_file(platform_id)
+    if not game_file:
+        logger.warning(f"Aucun fichier de jeux trouvé pour {platform_id} (candidats: {candidates})")
+        return 0
+
+    game_stat = os.stat(game_file)
+    game_mtime_ns = game_stat.st_mtime_ns
+    game_size_bytes = game_stat.st_size
+    cached_count = _get_cached_platform_game_count(platform_id, game_file, game_mtime_ns, game_size_bytes)
+    if cached_count is not None:
+        return cached_count
+
+    with open(game_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    if isinstance(data, dict) and 'games' in data:
+        data = data['games']
+
+    count = 0
+
+    def count_from_dict(d):
+        torrent_source = _extract_torrent_source(d)
+        if torrent_source is not None:
+            source_name, source_url = torrent_source
+            try:
+                return _get_torrent_entry_count(
+                    source_url,
+                    display_label=source_name,
+                    platform_id=platform_id,
+                    allow_network_fetch=allow_torrent_manifest_fetch,
+                )
+            except Exception as exc:
+                logger.error(f"Erreur comptage torrent pour {platform_id} ({source_name or source_url}): {exc}")
+                return 0
+        name = d.get('game_name') or d.get('name') or d.get('title') or d.get('game')
+        return 1 if name else 0
+
+    if isinstance(data, list):
+        total_items = max(1, len(data))
+        for item_index, item in enumerate(data, start=1):
+            if item_index == 1 or item_index == total_items or item_index % 250 == 0:
+                _refresh_loading_feedback(
+                    detail_lines=[
+                        _("loading_platform_name").format(platform_id),
+                        _("loading_game_entries_progress").format(item_index, total_items),
+                        _("loading_read_games_resolve_sources"),
+                    ],
+                    force=True,
+                )
+            if isinstance(item, dict):
+                count += count_from_dict(item)
+            elif isinstance(item, (list, tuple)):
+                torrent_source = _extract_torrent_source(item)
+                if torrent_source is not None:
+                    source_name, source_url = torrent_source
+                    try:
+                        count += _get_torrent_entry_count(
+                            source_url,
+                            display_label=source_name,
+                            platform_id=platform_id,
+                            allow_network_fetch=allow_torrent_manifest_fetch,
+                        )
+                    except Exception as exc:
+                        logger.error(f"Erreur comptage torrent pour {platform_id} ({source_name or source_url}): {exc}")
+                elif len(item) > 0:
+                    count += 1
+            elif isinstance(item, str):
+                count += 1
+            elif item is not None:
+                count += 1
+    elif isinstance(data, dict):
+        count += count_from_dict(data)
+    else:
+        logger.warning(f"Format de fichier jeux inattendu pour {platform_id}: {type(data)}")
+
+    _store_platform_game_count(platform_id, game_file, game_mtime_ns, game_size_bytes, count)
+    return count
+
+
+def _refresh_loading_feedback(current_system: str | None = None, progress: float | None = None, detail_lines=None, force: bool = False):
+    """Refresh the blocking startup loading screen with more granular details."""
+    try:
+        if current_system is not None:
+            config.current_loading_system = current_system
+        if progress is not None:
+            config.loading_progress = max(0.0, min(100.0, float(progress)))
+        if detail_lines is not None:
+            config.loading_detail_lines = [str(line) for line in detail_lines if line]
+        config.needs_redraw = True
+
+        if getattr(config, 'menu_state', '') != 'loading' or pygame is None:
+            return
+
+        now = time.time()
+        last_update = float(getattr(config, '_loading_feedback_last_update', 0.0) or 0.0)
+        if not force and (now - last_update) < 0.12:
+            return
+        config._loading_feedback_last_update = now
+
+        screen = pygame.display.get_surface()
+        if screen is None:
+            return
+
+        from display import draw_app_background, draw_loading_screen, draw_controls
+
+        draw_app_background(screen)
+        draw_loading_screen(screen)
+        draw_controls(screen, config.menu_state, getattr(config, 'current_music_name', None), getattr(config, 'music_popup_start_time', 0))
+        pygame.display.flip()
+        pygame.event.pump()
+    except Exception as exc:
+        logger.debug(f"Impossible de rafraichir le loading screen: {exc}")
+
+# Cache/process flags for extensions generation/loading
+
+
+def _format_size_bytes(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+
+    value = float(size_bytes)
+    for unit in ["KB", "MB", "GB", "TB", "PB"]:
+        value /= 1024.0
+        if value < 1024.0 or unit == "PB":
+            return f"{value:.2f} {unit}"
+
+    return f"{size_bytes} B"
+
+
+def _decode_bencode_text(value) -> str:
+    if isinstance(value, bytes):
+        for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                return value.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return value.decode("utf-8", errors="replace")
+    return str(value or "")
+
+
+def _bdecode(data: bytes, index: int = 0):
+    token = data[index:index + 1]
+    if token == b"i":
+        end = data.index(b"e", index)
+        return int(data[index + 1:end]), end + 1
+    if token == b"l":
+        items = []
+        index += 1
+        while data[index:index + 1] != b"e":
+            value, index = _bdecode(data, index)
+            items.append(value)
+        return items, index + 1
+    if token == b"d":
+        values = {}
+        index += 1
+        while data[index:index + 1] != b"e":
+            key, index = _bdecode(data, index)
+            value, index = _bdecode(data, index)
+            values[key] = value
+        return values, index + 1
+    if token.isdigit():
+        sep = data.index(b":", index)
+        length = int(data[index:sep])
+        start = sep + 1
+        end = start + length
+        return data[start:end], end
+    raise ValueError(f"Invalid bencode token at offset {index}: {token!r}")
+
+
+def is_torrent_manifest_url(url: str | None) -> bool:
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+    except Exception:
+        return False
+    return (parsed.path or "").lower().endswith(".torrent")
+
+
+def build_torrent_download_url(source_url: str, file_index: int, relative_path: str, size_bytes: int | None = None) -> str:
+    params = {
+        "source": source_url,
+        "index": str(max(1, int(file_index))),
+        "path": relative_path,
+    }
+    if isinstance(size_bytes, int) and size_bytes > 0:
+        params["size"] = str(size_bytes)
+    return f"{_TORRENT_DOWNLOAD_SCHEME}://download?{urllib.parse.urlencode(params, quote_via=urllib.parse.quote)}"
+
+
+def is_torrent_download_url(url: str | None) -> bool:
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        return urllib.parse.urlparse(url).scheme == _TORRENT_DOWNLOAD_SCHEME
+    except Exception:
+        return False
+
+
+def parse_torrent_download_url(url: str | None) -> dict[str, str | int] | None:
+    if not is_torrent_download_url(url):
+        return None
+    parsed = urllib.parse.urlparse(str(url))
+    query = urllib.parse.parse_qs(parsed.query)
+    source_url = (query.get("source") or [""])[0].strip()
+    relative_path = (query.get("path") or [""])[0].strip()
+    try:
+        file_index = int((query.get("index") or ["1"])[0])
+    except (TypeError, ValueError):
+        file_index = 1
+    try:
+        size_bytes = int((query.get("size") or ["0"])[0])
+    except (TypeError, ValueError):
+        size_bytes = 0
+    if not source_url or not relative_path:
+        return None
+    return {
+        "source_url": source_url,
+        "file_index": max(1, file_index),
+        "relative_path": relative_path,
+        "size_bytes": max(0, size_bytes),
+    }
+
+
+def _extract_torrent_entries_from_bytes(payload: bytes, source_url: str, display_label: str | None = None, platform_id: str | None = None) -> list[dict[str, str | int]]:
+    torrent_data, next_index = _bdecode(payload)
+    if not isinstance(torrent_data, dict):
+        raise ValueError("Torrent root metadata is not a dictionary")
+
+    info = torrent_data.get(b"info")
+    if not isinstance(info, dict):
+        raise ValueError("Torrent metadata does not contain an info dictionary")
+
+    entries: list[dict[str, str | int]] = []
+    files = info.get(b"files")
+    root_name = _decode_bencode_text(info.get(b"name.utf-8") or info.get(b"name") or "").strip()
+    if isinstance(files, list):
+        total_files = len(files)
+        resolved_label = display_label or root_name or Path(urllib.parse.urlparse(source_url).path).name or source_url
+        for file_index, file_entry in enumerate(files, start=1):
+            if not isinstance(file_entry, dict):
+                continue
+            if file_index == 1 or file_index == total_files or file_index % 25 == 0:
+                detail_lines = []
+                if platform_id:
+                    detail_lines.append(_("loading_platform_name").format(platform_id))
+                detail_lines.append(_("loading_torrent_files_progress").format(file_index, total_files))
+                detail_lines.append(_("loading_torrent_manifest_analysis").format(resolved_label))
+                _refresh_loading_feedback(detail_lines=detail_lines, force=True)
+            path_parts = file_entry.get(b"path.utf-8") or file_entry.get(b"path") or []
+            if not isinstance(path_parts, list):
+                continue
+            parts = [_decode_bencode_text(part).strip() for part in path_parts]
+            parts = [part for part in parts if part]
+            if not parts:
+                continue
+            full_path = "/".join(parts)
+            download_path = "/".join([p for p in [root_name, full_path] if p])
+            entries.append({
+                "name": parts[-1],
+                "path": full_path,
+                "download_path": download_path or full_path,
+                "index": file_index,
+                "size_bytes": int(file_entry.get(b"length") or 0),
+                "source_url": source_url,
+            })
+    else:
+        if root_name:
+            entries.append({
+                "name": root_name,
+                "path": root_name,
+                "download_path": root_name,
+                "index": 1,
+                "size_bytes": int(info.get(b"length") or 0),
+                "source_url": source_url,
+            })
+
+    duplicate_names = {}
+    for entry in entries:
+        name = str(entry["name"])
+        duplicate_names[name] = duplicate_names.get(name, 0) + 1
+
+    for entry in entries:
+        if duplicate_names.get(str(entry["name"]), 0) > 1:
+            entry["name"] = str(entry["path"])
+
+    return entries
+
+
+def _get_torrent_entries(source_url: str, display_label: str | None = None, platform_id: str | None = None) -> list[dict[str, str | int]]:
+    _load_persistent_torrent_manifest_cache()
+    cached = _torrent_manifest_cache.get(source_url)
+    if cached is not None:
+        return cached
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "*/*",
+    }
+    response = requests.get(source_url, headers=headers, timeout=30)
+    response.raise_for_status()
+
+    entries = _extract_torrent_entries_from_bytes(response.content, source_url, display_label=display_label, platform_id=platform_id)
+    _torrent_manifest_cache[source_url] = entries
+    _save_persistent_torrent_manifest_cache()
+    return entries
+
+
+def _extract_torrent_source(item) -> tuple[str, str] | None:
+    if isinstance(item, (list, tuple)):
+        if len(item) < 2:
+            return None
+        source_name = str(item[0] or "").strip()
+        source_url = item[1] if isinstance(item[1], str) else None
+        if source_url and is_torrent_manifest_url(source_url):
+            return source_name, source_url.strip()
+        return None
+
+    if isinstance(item, dict):
+        source_url = item.get("torrent_url") or item.get("url") or item.get("download") or item.get("link")
+        if not isinstance(source_url, str) or not source_url.strip():
+            return None
+        source_type = str(item.get("type") or item.get("source_type") or item.get("source") or "").strip().lower()
+        if source_type == "torrent" or is_torrent_manifest_url(source_url):
+            source_name = item.get("game_name") or item.get("name") or item.get("title") or item.get("game") or item.get("label")
+            if not source_name:
+                parsed = urllib.parse.urlparse(source_url)
+                source_name = urllib.parse.unquote(Path(parsed.path).name)
+            return str(source_name or "").strip(), source_url.strip()
+
+    return None
+
+
+def _expand_torrent_source(item, platform_id: str) -> list[tuple[str, None, str | None]] | None:
+    source = _extract_torrent_source(item)
+    if not source:
+        return None
+
+    source_name, source_url = source
+    try:
+        _refresh_loading_feedback(
+            detail_lines=[
+                _("loading_platform_name").format(platform_id),
+                _("loading_torrent_manifest_analysis").format(source_name or Path(urllib.parse.urlparse(source_url).path).name),
+            ]
+        )
+        entries = _get_torrent_entries(source_url, display_label=source_name, platform_id=platform_id)
+    except Exception as exc:
+        label = source_name or source_url
+        logger.error(f"Erreur chargement torrent pour {platform_id} ({label}): {exc}")
+        return []
+
+    expanded: list[tuple[str, None, str | None]] = []
+    total_entries = max(1, len(entries))
+    display_label = source_name or Path(urllib.parse.urlparse(source_url).path).name or source_url
+    for position, entry in enumerate(entries, start=1):
+        if position == 1 or position == total_entries or position % 25 == 0:
+            _refresh_loading_feedback(
+                detail_lines=[
+                    _("loading_platform_name").format(platform_id),
+                    _("loading_torrent_files_progress").format(position, total_entries),
+                    _("loading_torrent_manifest_analysis").format(display_label),
+                ],
+                force=True,
+            )
+        game_name = str(entry.get("name") or "").strip()
+        if not game_name:
+            continue
+        size_bytes = int(entry.get("size_bytes") or 0)
+        file_index = int(entry.get("index") or 1)
+        relative_path = str(entry.get("download_path") or entry.get("path") or game_name)
+        download_url = build_torrent_download_url(source_url, file_index, relative_path, size_bytes)
+        expanded.append((game_name, download_url, _format_size_bytes(size_bytes) if size_bytes > 0 else None))
+    return expanded
+
+ 
+def restart_application(delay_ms: int = 2000):
+    """Schedule a restart with a visible popup; actual restart happens in the main loop.
+
+    - Sets popup_restarting and schedules config.pending_restart_at = now + delay_ms.
+    - Main loop (__main__) detects pending_restart_at and calls restart_application(0) to perform the execl.
+    """
+    try:
+        # Show popup and schedule
+        if hasattr(config, 'popup_message'):
+            try:
+                config.popup_message = _("popup_restarting")
+            except Exception:
+                config.popup_message = "Restarting..."
+            config.popup_timer = max(config.popup_timer, int(delay_ms)) if hasattr(config, 'popup_timer') else int(delay_ms)
+            config.menu_state = getattr(config, 'menu_state', 'restart_popup') or 'restart_popup'
+            config.needs_redraw = True
+        # Schedule actual restart in main loop
+        now = pygame.time.get_ticks() if hasattr(pygame, 'time') else 0
+        config.pending_restart_at = now + max(0, int(delay_ms))
+        logger.debug(f"Redémarrage planifié dans {delay_ms} ms (pending_restart_at={getattr(config, 'pending_restart_at', 0)})")
+
+        # If delay_ms is 0, perform immediately here
+        if int(delay_ms) <= 0:
+            try:
+                try:
+                    if is_mixer_available():
+                        pygame.mixer.music.stop()
+                except Exception:
+                    pass
+                try:
+                    pygame.quit()
+                except Exception:
+                    pass
+                exe = sys.executable or "python"
+                os.execl(exe, exe, *sys.argv)
+            except Exception as e:
+                logger.exception(f"Failed to restart immediately: {e}")
+    except Exception as e:
+        logger.exception(f"Failed to schedule restart: {e}")
+
+
+def generate_support_zip():
+    """Génère un fichier ZIP contenant tous les fichiers de support pour le diagnostic.
+    
+    Returns:
+        tuple: (success: bool, message: str, zip_path: str ou None)
+    """
+
+    
+    try:
+        # Créer un fichier ZIP temporaire
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        zip_filename = f"rgsx_support_{timestamp}.zip"
+        zip_path = os.path.join(config.SAVE_FOLDER, zip_filename)
+        
+        # Liste des fichiers à inclure
+        files_to_include = []
+        
+        # Ajouter les fichiers de configuration
+        if hasattr(config, 'CONTROLS_CONFIG_PATH') and os.path.exists(config.CONTROLS_CONFIG_PATH):
+            files_to_include.append(('controls.json', config.CONTROLS_CONFIG_PATH))
+        
+        if hasattr(config, 'HISTORY_PATH') and os.path.exists(config.HISTORY_PATH):
+            files_to_include.append(('history.json', config.HISTORY_PATH))
+        
+        if hasattr(config, 'RGSX_SETTINGS_PATH') and os.path.exists(config.RGSX_SETTINGS_PATH):
+            files_to_include.append(('rgsx_settings.json', config.RGSX_SETTINGS_PATH))
+        
+        # Ajouter les fichiers de log
+        if hasattr(config, 'log_file') and os.path.exists(config.log_file):
+            files_to_include.append(('RGSX.log', config.log_file))
+        
+        # Log du serveur web
+        if hasattr(config, 'log_dir'):
+            web_log = os.path.join(config.log_dir, 'rgsx_web.log')
+            if os.path.exists(web_log):
+                files_to_include.append(('rgsx_web.log', web_log))
+            
+            web_startup_log = os.path.join(config.log_dir, 'rgsx_web_startup.log')
+            if os.path.exists(web_startup_log):
+                files_to_include.append(('rgsx_web_startup.log', web_startup_log))
+        
+        # Créer le fichier ZIP
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for archive_name, file_path in files_to_include:
+                try:
+                    zipf.write(file_path, archive_name)
+                    logger.debug(f"Ajouté au ZIP: {archive_name}")
+                except Exception as e:
+                    logger.warning(f"Impossible d'ajouter {archive_name}: {e}")
+            
+            # Ajouter un fichier README avec des informations système
+            readme_content = f"""RGSX Support Package
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+System Information:
+- OS: {config.OPERATING_SYSTEM}
+- Python: {sys.version}
+- Platform: {sys.platform}
+
+Included Files:
+"""
+            for archive_name, _ in files_to_include:
+                readme_content += f"- {archive_name}\n"
+            
+            readme_content += """
+Instructions:
+1. Join RGSX Discord server
+2. Describe your issue in the support channel
+3. Upload this ZIP file to help the team diagnose your problem
+
+DO NOT share this file publicly as it may contain sensitive information.
+"""
+            zipf.writestr('README.txt', readme_content)
+        
+        logger.info(f"Fichier de support généré: {zip_path}")
+        return (True, f"Support file created: {zip_filename}", zip_path)
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de la génération du fichier de support: {e}")
+        return (False, str(e), None)
+
+
+VERSIONCLEAN_SERVICE_NAME = "versionclean"
+VERSIONCLEAN_BACKUP_PATH = "/usr/bin/batocera-version.bak"
+
+
+def _get_enabled_services():
+    """Retourne la liste des services activés dans batocera-settings, ou None si indisponible."""
+    try:
+        result = subprocess.run(
+            ["batocera-settings-get", "system.services"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            logger.warning(f"batocera-settings-get failed: {result.stderr}")
+            return None
+        return result.stdout.split()
+    except FileNotFoundError:
+        logger.warning("batocera-settings-get command not found")
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to read enabled services: {e}")
+        return None
+
+
+def _ensure_versionclean_service():
+    """Installe et active versionclean si nécessaire.
+
+    - Installe uniquement si le service n'est pas déjà présent.
+    - Active uniquement si le service n'est pas déjà activé.
+    - Démarre uniquement si le nettoyage n'est pas déjà appliqué.
+    """
+    try:
+        if config.OPERATING_SYSTEM != "Linux":
+            return (True, "Versionclean skipped (non-Linux)")
+
+        services_dir = "/userdata/system/services"
+        service_file = os.path.join(services_dir, VERSIONCLEAN_SERVICE_NAME)
+        source_file = os.path.join(config.APP_FOLDER, "assets", "progs", VERSIONCLEAN_SERVICE_NAME)
+
+        if not os.path.exists(service_file):
+            try:
+                os.makedirs(services_dir, exist_ok=True)
+            except Exception as e:
+                error_msg = f"Failed to create services directory: {str(e)}"
+                logger.error(error_msg)
+                return (False, error_msg)
+
+            if not os.path.exists(source_file):
+                error_msg = f"Source service file not found: {source_file}"
+                logger.error(error_msg)
+                return (False, error_msg)
+
+            try:
+                shutil.copy2(source_file, service_file)
+                os.chmod(service_file, 0o755)
+                logger.info(f"Versionclean service installed: {service_file}")
+            except Exception as e:
+                error_msg = f"Failed to copy versionclean service file: {str(e)}"
+                logger.error(error_msg)
+                return (False, error_msg)
+        else:
+            logger.debug("Versionclean service already present, skipping install")
+
+        enabled_services = _get_enabled_services()
+        if enabled_services is None or VERSIONCLEAN_SERVICE_NAME not in enabled_services:
+            try:
+                result = subprocess.run(
+                    ["batocera-services", "enable", VERSIONCLEAN_SERVICE_NAME],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode != 0:
+                    error_msg = f"batocera-services enable versionclean failed: {result.stderr}"
+                    logger.error(error_msg)
+                    return (False, error_msg)
+                logger.debug(f"Versionclean enabled: {result.stdout}")
+            except FileNotFoundError:
+                error_msg = "batocera-services command not found"
+                logger.error(error_msg)
+                return (False, error_msg)
+            except Exception as e:
+                error_msg = f"Failed to enable versionclean: {str(e)}"
+                logger.error(error_msg)
+                return (False, error_msg)
+        else:
+            logger.debug("Versionclean already enabled, skipping enable")
+
+        if os.path.exists(VERSIONCLEAN_BACKUP_PATH):
+            logger.debug("Versionclean already active (backup present), skipping start")
+            return (True, "Versionclean already active")
+
+        try:
+            result = subprocess.run(
+                ["batocera-services", "start", VERSIONCLEAN_SERVICE_NAME],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                logger.warning(f"batocera-services start versionclean warning: {result.stderr}")
+            else:
+                logger.debug(f"Versionclean started: {result.stdout}")
+        except Exception as e:
+            logger.warning(f"Failed to start versionclean (non-critical): {str(e)}")
+
+        return (True, "Versionclean ensured")
+
+    except Exception as e:
+        error_msg = f"Unexpected versionclean error: {str(e)}"
+        logger.exception(error_msg)
+        return (False, error_msg)
+
+
+def toggle_web_service_at_boot(enable: bool):
+    """Active ou désactive le service web au démarrage de Batocera.
+    
+    Args:
+        enable: True pour activer, False pour désactiver
+        
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+
+    
+    try:
+        # Vérifier si on est sur un système compatible (Linux avec batocera-services)
+        if config.OPERATING_SYSTEM != "Linux":
+            return (False, "Web service auto-start is only available on Batocera/Linux systems")
+        
+        services_dir = "/userdata/system/services"
+        service_file = os.path.join(services_dir, "rgsx_web")
+        source_file = os.path.join(config.APP_FOLDER, "assets", "progs", "rgsx_web")
+        
+        if enable:
+            # Mode ENABLE
+            logger.debug("Activation du service web au démarrage...")
+            
+            # 1. Créer le dossier services s'il n'existe pas
+            try:
+                os.makedirs(services_dir, exist_ok=True)
+                logger.debug(f"Dossier services vérifié/créé: {services_dir}")
+            except Exception as e:
+                error_msg = f"Failed to create services directory: {str(e)}"
+                logger.error(error_msg)
+                return (False, error_msg)
+
+            # 1b. Assurer versionclean (install/enable/start si nécessaire)
+            ensure_ok, ensure_msg = _ensure_versionclean_service()
+            if not ensure_ok:
+                return (False, ensure_msg)
+            
+            # 2. Copier le fichier rgsx_web
+            try:
+                if not os.path.exists(source_file):
+                    error_msg = f"Source service file not found: {source_file}"
+                    logger.error(error_msg)
+                    return (False, error_msg)
+                
+                shutil.copy2(source_file, service_file)
+                os.chmod(service_file, 0o755)  # Rendre exécutable
+                logger.debug(f"Fichier service copié et rendu exécutable: {service_file}")
+            except Exception as e:
+                error_msg = f"Failed to copy service file: {str(e)}"
+                logger.error(error_msg)
+                return (False, error_msg)
+            
+            # 3. Activer le service avec batocera-services
+            try:
+                result = subprocess.run(
+                    ['batocera-services', 'enable', 'rgsx_web'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode != 0:
+                    error_msg = f"batocera-services enable failed: {result.stderr}"
+                    logger.error(error_msg)
+                    return (False, error_msg)
+                logger.debug(f"Service activé: {result.stdout}")
+            except FileNotFoundError:
+                error_msg = "batocera-services command not found"
+                logger.error(error_msg)
+                return (False, error_msg)
+            except Exception as e:
+                error_msg = f"Failed to enable service: {str(e)}"
+                logger.error(error_msg)
+                return (False, error_msg)
+            
+            # 4. Démarrer le service immédiatement
+            try:
+                result = subprocess.run(
+                    ['batocera-services', 'start', 'rgsx_web'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode != 0:
+                    # Le service peut ne pas démarrer si déjà en cours, ce n'est pas grave
+                    logger.warning(f"batocera-services start warning: {result.stderr}")
+                else:
+                    logger.debug(f"Service démarré: {result.stdout}")
+            except Exception as e:
+                logger.warning(f"Failed to start service (non-critical): {str(e)}")
+            
+            success_msg = _("settings_web_service_success_enabled") if _ else "Web service enabled at boot"
+            logger.info(success_msg)
+            
+            # Sauvegarder l'état dans rgsx_settings.json            
+            settings = load_rgsx_settings()
+            settings["web_service_at_boot"] = True
+            save_rgsx_settings(settings)
+            
+            return (True, success_msg)
+            
+        else:
+            # Mode DISABLE
+            logger.debug("Désactivation du service web au démarrage...")
+            
+            # 1. Désactiver le service avec batocera-services
+            try:
+                result = subprocess.run(
+                    ['batocera-services', 'disable', 'rgsx_web'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode != 0:
+                    error_msg = f"batocera-services disable failed: {result.stderr}"
+                    logger.error(error_msg)
+                    return (False, error_msg)
+                logger.debug(f"Service désactivé: {result.stdout}")
+            except FileNotFoundError:
+                error_msg = "batocera-services command not found"
+                logger.error(error_msg)
+                return (False, error_msg)
+            except Exception as e:
+                error_msg = f"Failed to disable service: {str(e)}"
+                logger.error(error_msg)
+                return (False, error_msg)
+            
+            success_msg = _("settings_web_service_success_disabled") if _ else "✓ Web service disabled at boot"
+            logger.info(success_msg)
+            
+            # Sauvegarder l'état dans rgsx_settings.json
+            settings = load_rgsx_settings()
+            settings["web_service_at_boot"] = False
+            save_rgsx_settings(settings)
+            
+            return (True, success_msg)
+            
+    except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        logger.exception(error_msg)
+        return (False, error_msg)
+
+
+def toggle_custom_dns_at_boot(enable: bool):
+    """Active ou désactive le service custom DNS au démarrage de Batocera.
+    
+    Args:
+        enable: True pour activer, False pour désactiver
+        
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    try:
+        # Vérifier si on est sur un système compatible (Linux avec batocera-services)
+        if config.OPERATING_SYSTEM != "Linux":
+            return (False, "Custom DNS service is only available on Batocera/Linux systems")
+        
+        services_dir = "/userdata/system/services"
+        service_file = os.path.join(services_dir, "custom_dns")
+        source_file = os.path.join(config.APP_FOLDER, "assets", "progs", "custom_dns")
+        
+        if enable:
+            # Mode ENABLE
+            logger.debug("Activation du service custom DNS au démarrage...")
+            
+            # 1. Créer le dossier services s'il n'existe pas
+            try:
+                os.makedirs(services_dir, exist_ok=True)
+                logger.debug(f"Dossier services vérifié/créé: {services_dir}")
+            except Exception as e:
+                error_msg = f"Failed to create services directory: {str(e)}"
+                logger.error(error_msg)
+                return (False, error_msg)
+
+            # 1b. Assurer versionclean (install/enable/start si nécessaire)
+            ensure_ok, ensure_msg = _ensure_versionclean_service()
+            if not ensure_ok:
+                return (False, ensure_msg)
+            
+            # 2. Copier le fichier custom_dns
+            try:
+                if not os.path.exists(source_file):
+                    error_msg = f"Source service file not found: {source_file}"
+                    logger.error(error_msg)
+                    return (False, error_msg)
+                
+                shutil.copy2(source_file, service_file)
+                os.chmod(service_file, 0o755)  # Rendre exécutable
+                logger.debug(f"Fichier service copié et rendu exécutable: {service_file}")
+            except Exception as e:
+                error_msg = f"Failed to copy service file: {str(e)}"
+                logger.error(error_msg)
+                return (False, error_msg)
+            
+            # 3. Activer le service avec batocera-services
+            try:
+                result = subprocess.run(
+                    ['batocera-services', 'enable', 'custom_dns'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode != 0:
+                    error_msg = f"batocera-services enable failed: {result.stderr}"
+                    logger.error(error_msg)
+                    return (False, error_msg)
+                logger.debug(f"Service activé: {result.stdout}")
+            except FileNotFoundError:
+                error_msg = "batocera-services command not found"
+                logger.error(error_msg)
+                return (False, error_msg)
+            except Exception as e:
+                error_msg = f"Failed to enable service: {str(e)}"
+                logger.error(error_msg)
+                return (False, error_msg)
+            
+            # 4. Démarrer le service immédiatement
+            try:
+                result = subprocess.run(
+                    ['batocera-services', 'start', 'custom_dns'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode != 0:
+                    # Le service peut ne pas démarrer si déjà en cours, ce n'est pas grave
+                    logger.warning(f"batocera-services start warning: {result.stderr}")
+                else:
+                    logger.debug(f"Service démarré: {result.stdout}")
+            except Exception as e:
+                logger.warning(f"Failed to start service (non-critical): {str(e)}")
+            
+            success_msg = _("settings_custom_dns_success_enabled") if _ else "Custom DNS enabled at boot"
+            logger.info(success_msg)
+            
+            # Sauvegarder l'état dans rgsx_settings.json
+            settings = load_rgsx_settings()
+            settings["custom_dns_at_boot"] = True
+            save_rgsx_settings(settings)
+            
+            return (True, success_msg)
+            
+        else:
+            # Mode DISABLE
+            logger.debug("Désactivation du service custom DNS au démarrage...")
+            
+            # 1. Désactiver le service avec batocera-services
+            try:
+                result = subprocess.run(
+                    ['batocera-services', 'disable', 'custom_dns'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode != 0:
+                    error_msg = f"batocera-services disable failed: {result.stderr}"
+                    logger.error(error_msg)
+                    return (False, error_msg)
+                logger.debug(f"Service désactivé: {result.stdout}")
+            except FileNotFoundError:
+                error_msg = "batocera-services command not found"
+                logger.error(error_msg)
+                return (False, error_msg)
+            except Exception as e:
+                error_msg = f"Failed to disable service: {str(e)}"
+                logger.error(error_msg)
+                return (False, error_msg)
+            
+            # 2. Arrêter le service immédiatement
+            try:
+                result = subprocess.run(
+                    ['batocera-services', 'stop', 'custom_dns'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode != 0:
+                    logger.warning(f"batocera-services stop warning: {result.stderr}")
+                else:
+                    logger.debug(f"Service arrêté: {result.stdout}")
+            except Exception as e:
+                logger.warning(f"Failed to stop service (non-critical): {str(e)}")
+            
+            success_msg = _("settings_custom_dns_success_disabled") if _ else "✓ Custom DNS disabled at boot"
+            logger.info(success_msg)
+            
+            # Sauvegarder l'état dans rgsx_settings.json
+            settings = load_rgsx_settings()
+            settings["custom_dns_at_boot"] = False
+            save_rgsx_settings(settings)
+            
+            return (True, success_msg)
+            
+    except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        logger.exception(error_msg)
+        return (False, error_msg)
+
+
+def check_custom_dns_status():
+    """Vérifie si le service custom DNS est activé au démarrage.
+    
+    Returns:
+        bool: True si activé, False sinon
+    """
+    try:
+        if config.OPERATING_SYSTEM != "Linux":
+            return False
+        
+        # Lire l'état depuis rgsx_settings.json
+        settings = load_rgsx_settings()
+        return settings.get("custom_dns_at_boot", False)
+        
+    except Exception as e:
+        logger.debug(f"Failed to check custom DNS status: {e}")
+        return False
+
+
+CONNECTION_STATUS_TTL_SECONDS = 120
+
+
+def get_connection_status_targets():
+    """Retourne la liste des sites à vérifier pour le status de connexion."""
+    default_targets = [
+        {
+            "key": "retrogamesets",
+            "label": "Retrogamesets.fr",
+            "url": "https://retrogamesets.fr",
+            "category": "updates",
+        },
+        {
+            "key": "github",
+            "label": "GitHub.com",
+            "url": "https://github.com",
+            "category": "updates",
+        },
+        {
+            "key": "myrient",
+            "label": "Myrient.erista.me",
+            "url": "https://myrient.erista.me",
+            "category": "sources",
+        },
+        {
+            "key": "1fichier",
+            "label": "1fichier.com",
+            "url": "https://1fichier.com",
+            "category": "sources",
+        },
+        {
+            "key": "archive",
+            "label": "Archive.org",
+            "url": "https://archive.org",
+            "category": "sources",
+        },
+    ]
+
+    configured = getattr(config, "CONNECTION_STATUS_TARGETS", None)
+    if not isinstance(configured, list):
+        return default_targets
+
+    normalized = []
+    seen_keys = set()
+    for index, item in enumerate(configured):
+        if not isinstance(item, dict):
+            continue
+        raw_key = str(item.get("key", "")).strip().lower()
+        key = raw_key if raw_key else f"target_{index + 1}"
+        if key in seen_keys:
+            continue
+
+        url = str(item.get("url", "")).strip()
+        if not url:
+            continue
+
+        label = str(item.get("label", "")).strip() or url
+        category = str(item.get("category", "sources")).strip().lower() or "sources"
+
+        normalized.append({
+            "key": key,
+            "label": label,
+            "url": url,
+            "category": category,
+        })
+        seen_keys.add(key)
+
+    return normalized if normalized else default_targets
+
+
+def _check_url_connectivity(url: str, timeout: int = 6) -> bool:
+    """Teste rapidement la connectivité à une URL (DNS + HTTPS)."""
+    headers = {"User-Agent": "RGSX-Connectivity/1.0"}
+    try:
+        try:
+           
+
+            try:
+                response = requests.head(url, timeout=timeout, allow_redirects=True, headers=headers)
+                if response.status_code < 500:
+                    return True
+            except Exception:
+                pass
+            try:
+                response = requests.get(url, timeout=timeout, allow_redirects=True, stream=True, headers=headers)
+                return response.status_code < 500
+            except Exception:
+                return False
+        except Exception:
+            import urllib.request
+
+            try:
+                req = urllib.request.Request(url, method="HEAD", headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.status < 500
+            except Exception:
+                try:
+                    req = urllib.request.Request(url, method="GET", headers=headers)
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        return resp.status < 500
+                except Exception:
+                    return False
+    except Exception:
+        return False
+
+
+def start_connection_status_check(force: bool = False) -> None:
+    """Lance un check asynchrone des sites (avec cache/TTL)."""
+    try:
+        now = time.time()
+        if getattr(config, "connection_status_in_progress", False):
+            return
+        last_ts = getattr(config, "connection_status_timestamp", 0.0) or 0.0
+        if not force and last_ts and now - last_ts < CONNECTION_STATUS_TTL_SECONDS:
+            return
+
+        targets = get_connection_status_targets()
+        status = getattr(config, "connection_status", {})
+        if not isinstance(status, dict):
+            status = {}
+        if not status:
+            for item in targets:
+                status[item["key"]] = None
+        config.connection_status = status
+        config.connection_status_in_progress = True
+        config.connection_status_progress = {"done": 0, "total": len(targets)}
+
+        def _worker():
+            try:
+                results = {}
+                done = 0
+                total = len(targets)
+                for item in targets:
+                    results[item["key"]] = _check_url_connectivity(item["url"])
+                    done += 1
+                    config.connection_status_progress = {"done": done, "total": total}
+                    try:
+                        config.needs_redraw = True
+                    except Exception:
+                        pass
+                config.connection_status.update(results)
+                config.connection_status_timestamp = time.time()
+                try:
+                    summary = ", ".join([f"{k}={'OK' if v else 'FAIL'}" for k, v in results.items()])
+                    logger.info(f"Connection status results: {summary}")
+                except Exception:
+                    pass
+                try:
+                    config.needs_redraw = True
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.debug(f"Connection status check failed: {e}")
+            finally:
+                config.connection_status_in_progress = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception as e:
+        logger.debug(f"Failed to start connection status check: {e}")
+
+
+def get_connection_status_snapshot():
+    """Retourne (status_dict, timestamp, in_progress, progress)."""
+    status = getattr(config, "connection_status", {})
+    if not isinstance(status, dict):
+        status = {}
+    ts = getattr(config, "connection_status_timestamp", 0.0) or 0.0
+    in_progress = getattr(config, "connection_status_in_progress", False)
+    progress = getattr(config, "connection_status_progress", {"done": 0, "total": 0})
+    if not isinstance(progress, dict):
+        progress = {"done": 0, "total": 0}
+    return status, ts, in_progress, progress
+
+
+
+_extensions_cache = None  # type: ignore
+_extensions_json_regenerated = False
+
+
+# Fonction pour charger le fichier JSON des extensions supportées
+def load_extensions_json():
+    """Charge le JSON des extensions supportées.
+    - Régénère une seule fois par exécution (au premier appel ou si le fichier est absent).
+    - Met en cache le résultat pour éviter les relectures et logs répétés.
+    """
+    global _extensions_cache, _extensions_json_regenerated
+    try:
+        # Retour immédiat si déjà en cache
+        if _extensions_cache is not None:
+            return _extensions_cache
+
+        os.makedirs(os.path.dirname(config.JSON_EXTENSIONS), exist_ok=True)
+
+        # Régénération unique au premier appel (ou si le fichier est manquant)
+        if not _extensions_json_regenerated or not os.path.exists(config.JSON_EXTENSIONS):
+            try:
+                generated = generate_extensions_json_from_es_systems()
+                if generated:
+                    with open(config.JSON_EXTENSIONS, 'w', encoding='utf-8') as wf:
+                        json.dump(generated, wf, ensure_ascii=False, indent=2)
+                    logger.info(f"rom_extensions régénéré ({len(generated)} systèmes): {config.JSON_EXTENSIONS}")
+                else:
+                    logger.warning("Aucune donnée générée depuis es_systems.cfg; on conserve l'existant si présent")
+                _extensions_json_regenerated = True
+            except Exception as ge:
+                logger.error(f"Échec lors de la régénération de {config.JSON_EXTENSIONS} depuis es_systems.cfg: {ge}")
+
+        # Lecture du fichier (nouveau ou existant)
+        if os.path.exists(config.JSON_EXTENSIONS):
+            with open(config.JSON_EXTENSIONS, 'r', encoding='utf-8') as f:
+                _extensions_cache = json.load(f)
+                return _extensions_cache
+        _extensions_cache = []
+        return _extensions_cache
+    except Exception as e:
+        logger.error(f"Erreur lors de la lecture de {config.JSON_EXTENSIONS}: {e}")
+        _extensions_cache = []
+        return _extensions_cache
+
+def _detect_es_systems_cfg_paths():
+    """Retourne une liste de chemins possibles pour es_systems.cfg selon l'OS.
+    - RetroBat (Windows): {config.USERDATA_FOLDER}\\system\\templates\\emulationstation\\es_systems.cfg
+    - Batocera (Linux): /usr/share/emulationstation/es_systems.cfg
+      Ajoute aussi les fichiers customs: /userdata/system/configs/emulationstation/es_systems_*.cfg
+    """
+    candidates = []
+    try:
+        if config.OPERATING_SYSTEM == 'Windows':
+            base = getattr(config, 'USERDATA_FOLDER', None)
+            if base:
+                candidates.append(os.path.join(base, 'system', 'templates', 'emulationstation', 'es_systems.cfg'))
+        else:
+            # Batocera / Linux classiques
+            candidates.append('/usr/share/emulationstation/es_systems.cfg')
+            candidates.append('/etc/emulationstation/es_systems.cfg')
+            # Batocera customs
+            custom_dir = '/userdata/system/configs/emulationstation'
+            try:
+                for p in glob.glob(os.path.join(custom_dir, 'es_systems_*.cfg')):
+                    candidates.append(p)
+                direct_cfg = os.path.join(custom_dir, 'es_systems.cfg')
+                if os.path.exists(direct_cfg):
+                    candidates.append(direct_cfg)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    existing = [p for p in candidates if p and os.path.exists(p)]
+    # Logs réduits: on ne conserve que les résumés plus loin
+    return existing
+
+def _parse_es_systems_cfg(cfg_path):
+    """Parse un es_systems.cfg minimalement pour extraire (folder, extensions).
+    Retourne une liste de dicts: { 'folder': <str>, 'extensions': [..] }
+    - folder: dérivé de la balise <path> en prenant la partie après 'roms/' (ou '\\roms\\' sous Windows)
+    - extensions: liste normalisée de .ext (point + minuscule)
+    """
+    try:
+        # Lire tel quel (pas besoin d'un parseur XML strict, mais ElementTree suffit)
+        import xml.etree.ElementTree as ET
+    # Log détaillé supprimé pour alléger les traces
+        tree = ET.parse(cfg_path)
+        root = tree.getroot()
+        out = []
+        for sys_elem in root.findall('system'):
+            path_text = (sys_elem.findtext('path') or '').strip()
+            ext_text = (sys_elem.findtext('extension') or '').strip()
+            if not path_text:
+                continue
+            # Extraire le dossier après 'roms'
+            folder = None
+            norm = path_text.replace('\\', '/').lower()
+            marker = '/roms/'
+            if marker in norm:
+                after = norm.split(marker, 1)[1]
+                folder = after.strip().strip('/\\')
+            if not folder:
+                # fallback: si le chemin finit par .../roms/<folder>
+                parts = norm.strip('/').split('/')
+                if len(parts) >= 2 and parts[-2] == 'roms':
+                    folder = parts[-1]
+            if not folder:
+                continue
+
+            # Extensions: split par espaces, normaliser en .ext
+            exts = []
+            for tok in ext_text.split():
+                tok = tok.strip().lower()
+                if not tok:
+                    continue
+                if not tok.startswith('.'):
+                    # Certaines entrées peuvent omettre le point
+                    tok = '.' + tok
+                exts.append(tok)
+            # Dédupliquer tout en conservant l'ordre
+            seen = set()
+            norm_exts = []
+            for e in exts:
+                if e not in seen:
+                    seen.add(e)
+                    norm_exts.append(e)
+            out.append({'folder': folder, 'extensions': norm_exts})
+    # Résumé final affiché ailleurs
+        return out
+    except Exception as e:
+        logger.error(f"Erreur parsing es_systems.cfg ({cfg_path}): {e}")
+        return []
+
+def generate_extensions_json_from_es_systems():
+    """Essaie de construire la liste des extensions à partir des es_systems.cfg disponibles.
+    Priorité: RetroBat si présent, sinon Batocera. Fusionne si plusieurs trouvés, en préférant RetroBat.
+    """
+    combined = {}
+    paths = _detect_es_systems_cfg_paths()
+    if not paths:
+        logger.warning("Aucun chemin es_systems.cfg détecté (RetroBat/Batocera)")
+        return []
+    # Prioriser RetroBat en tête si présent
+    def score(p):
+        return 0 if 'templates' in p.replace('\\', '/').lower() else 1
+    for cfg in sorted(paths, key=score):
+        if not os.path.exists(cfg):
+            continue
+        items = _parse_es_systems_cfg(cfg)
+        for itm in items:
+            folder = itm['folder']
+            exts = itm['extensions']
+            if folder in combined:
+                # Fusionner: ajouter extensions manquantes
+                present = set(combined[folder])
+                for e in exts:
+                    if e not in present:
+                        combined[folder].append(e)
+                        present.add(e)
+            else:
+                combined[folder] = list(exts)
+    # Convertir en liste triée par dossier
+    result = [{'folder': k, 'extensions': v} for k, v in sorted(combined.items(), key=lambda x: x[0])]
+    logger.info(f"Extensions combinées totales: {len(result)} systèmes")
+    return result
+    
+def check_extension_before_download(url, platform, game_name):
+    """Vérifie l'extension avant de lancer le téléchargement et retourne un tuple de 4 éléments."""
+    try:
+        sanitized_name = sanitize_filename(game_name)
+        extensions_data = load_extensions_json()
+        # Si le cache des extensions est vide/introuvable, ne bloquez pas: traitez comme "inconnu"
+        # afin d'afficher l'avertissement d'extension au lieu d'une erreur fatale.
+        if not extensions_data:
+            logger.warning(f"Fichier {config.JSON_EXTENSIONS} vide ou introuvable; poursuite avec extensions inconnues")
+            extensions_data = []
+
+        is_supported = is_extension_supported(sanitized_name, platform, extensions_data)
+        extension = os.path.splitext(sanitized_name)[1].lower()
+        is_archive = extension in (".zip", ".rar", ".7z")
+
+        # Déterminer si le système (dossier) est connu dans extensions_data
+        dest_folder_name = _get_dest_folder_name(platform)
+        system_known = any(s.get("folder") == dest_folder_name for s in extensions_data)
+
+        # Traitement spécifique BIOS: forcer extraction des archives même si le système n'est pas connu
+        try:
+            bios_like = {"BIOS", "- BIOS by TMCTV -", "- BIOS"}
+            if (dest_folder_name == "bios" or platform in bios_like) and is_archive:
+                logger.debug(f"Plateforme BIOS détectée pour {sanitized_name}, extraction auto forcée pour {extension}")
+                return (url, platform, game_name, True)
+        except Exception:
+            pass
+
+        # Traitement spécifique PS Vita: ne pas extraire les archives ZIP même si non supportées
+        try:
+            if dest_folder_name == "psvita" and extension == ".zip":
+                logger.debug(f"Plateforme PS Vita détectée pour {sanitized_name}, pas d'extraction automatique pour {extension}")
+                return (url, platform, game_name, False)
+        except Exception:
+            pass
+
+        # Traitement spécifique DOS: forcer extraction des ZIP et RAR pour structurer en dossiers .pc
+        try:
+            if dest_folder_name == "dos" and is_archive:
+                logger.debug(f"Plateforme DOS détectée pour {sanitized_name}, extraction forcée pour {extension}")
+                return (url, platform, game_name, True)
+        except Exception:
+            pass
+
+        if is_supported:
+            logger.debug(f"L'extension de {sanitized_name} est supportée pour {platform}")
+            return (url, platform, game_name, False)
+        elif is_archive:
+            # Même si le système n'est pas connu ou que l'extension n'est pas listée,
+            # on force l'extraction des archives (ZIP/RAR) à la fin du téléchargement
+            # puis suppression du fichier.
+            logger.debug(f"Archive {extension.upper()} détectée pour {sanitized_name}, extraction automatique prévue (extension non listée)")
+            return (url, platform, game_name, True)
+        else:
+            # Autoriser si l'utilisateur a choisi d'autoriser les extensions inconnues
+            allow_unknown = False
+            try:
+                allow_unknown = get_allow_unknown_extensions()
+            except Exception:
+                allow_unknown = False
+            if allow_unknown:
+                logger.debug(f"Extension non supportée ({extension}) mais autorisée par l'utilisateur pour {sanitized_name}")
+                return (url, platform, game_name, False)
+            logger.debug(f"Extension non supportée ({extension}) pour {sanitized_name}, avertissement affiché")
+            return (url, platform, game_name, False)
+    except Exception as e:
+        logger.error(f"Erreur vérification extension {url}: {str(e)}")
+        return None
+
+# Fonction pour vérifier si l'extension est supportée pour une plateforme donnée
+def is_extension_supported(filename, platform_key, extensions_data):
+    """Vérifie si l'extension du fichier est supportée pour la plateforme donnée.
+    platform_key correspond maintenant à l'identifiant utilisé dans config.platforms (platform_name)."""
+    extension = os.path.splitext(filename)[1].lower()
+
+    dest_dir = None
+    for platform_dict in config.platform_dicts:
+        # Nouveau schéma: platform_name
+        if platform_dict.get("platform_name") == platform_key:
+            dest_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(platform_dict.get("folder")))
+            break
+
+    if not dest_dir:
+        logger.warning(f"Aucun dossier 'folder' trouvé pour la plateforme {platform_key}")
+        dest_dir = os.path.join(os.path.dirname(os.path.dirname(config.APP_FOLDER)), platform_key)
+    
+    dest_folder_name = os.path.basename(dest_dir)
+    logger.debug(f"Vérification extension {extension} pour {filename} dans dossier {dest_folder_name}, {len(extensions_data)} systèmes disponibles")
+    
+    for i, system in enumerate(extensions_data):
+        if system["folder"] == dest_folder_name:
+            result = extension in system["extensions"]
+            logger.debug(f"Système trouvé: {dest_folder_name}, extensions: {system['extensions']}, résultat: {result}")
+            return result
+    
+    logger.warning(f"Aucun système trouvé pour le dossier {dest_dir}")
+    return False
+
+
+def _get_dest_folder_name(platform_key: str) -> str:
+    """Retourne le nom du dossier de destination pour une plateforme (basename du dossier)."""
+    dest_dir = None
+    for platform_dict in config.platform_dicts:
+        if platform_dict.get("platform_name") == platform_key:
+            folder = platform_dict.get("folder")
+            if folder:
+                dest_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
+            break
+    if not dest_dir:
+        dest_dir = os.path.join(os.path.dirname(os.path.dirname(config.APP_FOLDER)), platform_key)
+    return os.path.basename(dest_dir)
+
+
+
+
+# Fonction pour charger sources.json
+def load_sources(allow_torrent_manifest_fetch: bool | None = None):
+    try:
+        if allow_torrent_manifest_fetch is None:
+            allow_torrent_manifest_fetch = is_torrent_manifest_refresh_requested()
+        logger.debug(
+            "Chargement des sources (%s fetch manifest torrent)",
+            "avec" if allow_torrent_manifest_fetch else "sans",
+        )
+        sources = []
+        if os.path.exists(config.SOURCES_FILE):
+            with open(config.SOURCES_FILE, 'r', encoding='utf-8') as f:
+                sources = json.load(f)
+            if not isinstance(sources, list):
+                logger.error("systems_list.json n'est pas une liste JSON valide")
+                sources = []
+        else:
+            logger.warning(f"Fichier systems_list absent: {config.SOURCES_FILE}")
+
+        sources_file_changed = False
+        normalized_sources = []
+        # S'assurer que chaque entrée possède les clés attendues.
+        for raw_entry in sources:
+            if not isinstance(raw_entry, dict):
+                sources_file_changed = True
+                continue
+
+            s = dict(raw_entry)
+
+            if "platform_image" not in s:
+                # Supporter ancienne clé system_image -> platform_image si présente
+                legacy = s.pop("system_image", "")
+                s["platform_image"] = legacy or ""
+                sources_file_changed = True
+
+            # Normaliser clé dossier -> folder si besoin (legacy francophone)
+            if "folder" not in s:
+                legacy_folder = s.get("dossier") or s.get("folder_name")
+                if legacy_folder:
+                    s["folder"] = legacy_folder
+                    sources_file_changed = True
+
+            normalized_sources.append(s)
+
+        sources = normalized_sources
+
+        existing_names = {
+            str(s.get("platform_name", "")).strip()
+            for s in sources
+            if isinstance(s, dict) and str(s.get("platform_name", "")).strip()
+        }
+        added = []
+        if os.path.isdir(config.GAMES_FOLDER):
+            for fname in sorted(os.listdir(config.GAMES_FOLDER)):
+                if not fname.lower().endswith('.json'):
+                    continue
+                pname = os.path.splitext(fname)[0]
+                if not pname or pname in existing_names:
+                    continue
+                new_entry = {"platform_name": pname, "folder": pname, "platform_image": ""}
+                sources.append(new_entry)
+                added.append(pname)
+                existing_names.add(pname)
+                sources_file_changed = True
+
+        # Déterminer les plateformes orphelines (fichier manquant)
+        existing_files = set()
+        if os.path.isdir(config.GAMES_FOLDER):
+            existing_files = {os.path.splitext(f)[0] for f in os.listdir(config.GAMES_FOLDER) if f.lower().endswith('.json')}
+        removed = []
+        runtime_sources = []
+        for entry in sources:
+            pname = entry.get("platform_name", "")
+            # En runtime, garder seulement si un fichier existe.
+            # Important: on ne supprime plus ces entrées du fichier systems_list.json,
+            # car l'absence peut être transitoire pendant une mise à jour/extraction.
+            if pname in existing_files:
+                runtime_sources.append(entry)
+            else:
+                if pname:
+                    removed.append(pname)
+
+        if added:
+            logger.info(f"Plateformes ajoutées automatiquement: {', '.join(added)}")
+        if removed:
+            logger.info(f"Plateformes ignorées en runtime (fichiers absents): {', '.join(removed)}")
+
+        # Persister uniquement les changements non destructifs (ajouts / normalisations de clés).
+        if sources_file_changed:
+            try:
+                # Pas de tri avant persistance: conserver ordre d'origine + ajouts fins
+                os.makedirs(os.path.dirname(config.SOURCES_FILE), exist_ok=True)
+                with open(config.SOURCES_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(sources, f, ensure_ascii=False, indent=2)
+                logger.info("systems_list.json mis à jour (ajouts/normalisations, ordre conservé)")
+            except Exception as e:
+                logger.error(f"Échec écriture systems_list.json après maj auto: {e}")
+
+        # Pour l'affichage on veut un tri alphabétique sans toucher l'ordre de persistance
+        sorted_for_display = sorted(runtime_sources, key=lambda x: x.get("platform_name", "").lower())
+
+        # Construire structures config: platform_dicts = ordre fichier, platforms = tri (avec filtre masqués)
+        config.platform_dicts = runtime_sources  # ordre runtime (fichiers présents)
+        settings = load_rgsx_settings()
+        hidden = set(settings.get("hidden_platforms", [])) if isinstance(settings, dict) else set()
+        all_sorted_names = [s.get("platform_name", "") for s in sorted_for_display]
+        visible_names = [n for n in all_sorted_names if n and n not in hidden]
+
+        # Masquer automatiquement les systèmes dont le dossier ROM n'existe pas (selon le toggle)
+        unsupported = []
+        try:
+            from rgsx_settings import get_show_unsupported_platforms
+            show_unsupported = get_show_unsupported_platforms(settings)
+            sources_by_name = {s.get("platform_name", ""): s for s in sources if isinstance(s, dict)}
+            for name in list(visible_names):
+                entry = sources_by_name.get(name) or {}
+                folder = entry.get("folder")
+                # Conserver BIOS même sans dossier, et ignorer entrées sans folder
+                bios_name = name.strip()
+                if not folder or bios_name == "- BIOS by TMCTV -" or bios_name == "- BIOS":
+                    continue
+                expected_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
+                if not os.path.isdir(expected_dir):
+                    unsupported.append(name)
+            if show_unsupported:
+                config.unsupported_platforms = unsupported
+            else:
+                if unsupported:
+                    # Filtrer la liste visible
+                    visible_names = [n for n in visible_names if n not in set(unsupported)]
+                    config.unsupported_platforms = unsupported
+                    # Log concis + détaillé en DEBUG uniquement
+                    logger.info(f"Plateformes masquées (dossier rom absent): {len(unsupported)}")
+                    logger.debug("Détails plateformes masquées: " + ", ".join(unsupported))
+                else:
+                    config.unsupported_platforms = []
+        except Exception as e:
+            logger.error(f"Erreur détection plateformes non supportées (dossiers manquants): {e}")
+            config.unsupported_platforms = []
+
+        config.platforms = visible_names
+        config.platform_names = {p: p for p in config.platforms}
+        # Nouveau mapping par nom pour éviter décalages index après tri d'affichage
+        try:
+            config.platform_dict_by_name = {d.get("platform_name", ""): d for d in config.platform_dicts}
+        except Exception:
+            config.platform_dict_by_name = {}
+        _load_persistent_platform_game_count_cache()
+        config.games_count = {}
+        total_platforms = max(1, len(config.platforms))
+        for index, platform_name in enumerate(config.platforms, start=1):
+            progress_value = 80.0 + ((index - 1) / total_platforms) * 19.0
+            _refresh_loading_feedback(
+                current_system=_("loading_load_systems"),
+                progress=progress_value,
+                detail_lines=[
+                    _("loading_platform_counter").format(index, total_platforms),
+                    platform_name,
+                    _("loading_read_games_resolve_sources"),
+                ],
+                force=True,
+            )
+            config.games_count[platform_name] = get_platform_game_count(
+                platform_name,
+                allow_torrent_manifest_fetch=allow_torrent_manifest_fetch,
+            )
+            _refresh_loading_feedback(
+                current_system=_("loading_load_systems"),
+                progress=80.0 + (index / total_platforms) * 19.0,
+                detail_lines=[
+                    _("loading_platform_counter").format(index, total_platforms),
+                    platform_name,
+                    _("loading_read_games_resolve_sources"),
+                ],
+            )
+        if config.games_count:
+            try:
+                summary = ", ".join([f"{name}: {count}" for name, count in config.games_count.items()])
+                logger.debug(f"Nombre de jeux par système: {summary}")
+            except Exception:
+                pass
+        if allow_torrent_manifest_fetch:
+            clear_torrent_manifest_refresh_request()
+        _refresh_loading_feedback(detail_lines=[], force=True)
+        return sources
+    except Exception as e:
+        logger.error(f"Erreur fusion systèmes + détection jeux: {e}")
+        return []
+
+def load_games(platform_id:str) -> list[Game]:
+    try:
+        try:
+            from rgsx_settings import get_global_sort_option
+
+            current_sort_option = get_global_sort_option()
+        except Exception:
+            current_sort_option = 'name_asc'
+
+        game_file, resolved_platform_dict, candidates = _resolve_game_file(platform_id)
+        if not game_file:
+            _games_cache.pop(platform_id, None)
+            logger.warning(f"Aucun fichier de jeux trouvé pour {platform_id} (candidats: {candidates})")
+            return []
+
+        game_stat = os.stat(game_file)
+        game_mtime_ns = game_stat.st_mtime_ns
+        game_size_bytes = game_stat.st_size
+        cached_entry = _games_cache.get(platform_id)
+        if cached_entry and cached_entry.get("path") == game_file and cached_entry.get("mtime_ns") == game_mtime_ns:
+            if cached_entry.get("sort_option") != current_sort_option:
+                cached_entry["games"] = sort_games_list(list(cached_entry.get("games") or []), current_sort_option)
+                cached_entry["sort_option"] = current_sort_option
+            return cached_entry["games"]
+
+        with open(game_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        # Si dict avec clé 'games'
+        if isinstance(data, dict) and 'games' in data:
+            data = data['games']
+
+        normalized = []  # (name, url, size)
+
+        def extract_from_dict(d):
+            torrent_rows = _expand_torrent_source(d, platform_id)
+            if torrent_rows is not None:
+                normalized.extend(torrent_rows)
+                return
+            name = d.get('game_name') or d.get('name') or d.get('title') or d.get('game')
+            url = d.get('url') or d.get('download') or d.get('link') or d.get('href')
+            size = d.get('size') or d.get('filesize') or d.get('length')
+            if name:
+                normalized.append((str(name), url if isinstance(url, str) and url.strip() else None, str(size) if size else None))
+
+        if isinstance(data, list):
+            total_items = max(1, len(data))
+            for item_index, item in enumerate(data, start=1):
+                torrent_source = _extract_torrent_source(item)
+                if (item_index == 1 or item_index == total_items or item_index % 100 == 0) and torrent_source is None:
+                    _refresh_loading_feedback(
+                        detail_lines=[
+                            _("loading_platform_name").format(platform_id),
+                            _("loading_game_entries_progress").format(item_index, total_items),
+                            _("loading_read_games_resolve_sources"),
+                        ],
+                        force=True,
+                    )
+                if isinstance(item, (list, tuple)):
+                    torrent_rows = _expand_torrent_source(item, platform_id)
+                    if torrent_rows is not None:
+                        normalized.extend(torrent_rows)
+                        continue
+                    if len(item) == 0:
+                        continue
+                    name = str(item[0])
+                    url = item[1] if len(item) > 1 and isinstance(item[1], str) and item[1].strip() else None
+                    size = item[2] if len(item) > 2 and isinstance(item[2], str) and item[2].strip() else None
+                    normalized.append((name, url, size))
+                elif isinstance(item, dict):
+                    extract_from_dict(item)
+                elif isinstance(item, str):
+                    normalized.append((item, None, None))
+                else:
+                    normalized.append((str(item), None, None))
+        elif isinstance(data, dict):  # dict sans 'games'
+            extract_from_dict(data)
+        else:
+            logger.warning(f"Format de fichier jeux inattendu pour {platform_id}: {type(data)}")
+
+        if getattr(config, "games_count_log_verbose", False):
+            logger.debug(f"{os.path.basename(game_file)}: {len(normalized)} jeux")
+
+        games_list: list[Game] = []
+        for name, url, size in normalized:
+            display_name = get_clean_display_name(name, platform_id)
+            games_list.append(Game(name=name, url=url, size=size, display_name=display_name))
+
+        games_list = sort_games_list(games_list, current_sort_option)
+
+        _games_cache[platform_id] = {
+            "path": game_file,
+            "mtime_ns": game_mtime_ns,
+            "sort_option": current_sort_option,
+            "games": games_list,
+        }
+        _store_platform_game_count(platform_id, game_file, game_mtime_ns, game_size_bytes, len(games_list))
+        return games_list
+    except Exception as e:
+        _games_cache.pop(platform_id, None)
+        logger.error(f"Erreur lors du chargement des jeux pour {platform_id}: {e}")
+        return []
+
+def truncate_text_middle(text, font, max_width, is_filename=True):
+    """Tronque le texte en insérant '...' au milieu, en préservant le début et la fin.
+    Si is_filename=False, ne supprime pas l'extension."""
+    # Supprimer l'extension uniquement si is_filename est True
+    if is_filename:
+        text = text.rsplit('.', 1)[0] if '.' in text else text
+    text_width = font.size(text)[0]
+    if text_width <= max_width:
+        return text
+    ellipsis = "..."
+    ellipsis_width = font.size(ellipsis)[0]
+    max_text_width = max_width - ellipsis_width
+    if max_text_width <= 0:
+        return ellipsis
+
+    # Diviser la largeur disponible entre début et fin, en priorisant la fin
+    chars = list(text)
+    left = []
+    right = []
+    left_width = 0
+    right_width = 0
+    left_idx = 0
+    right_idx = len(chars) - 1
+
+    # Préserver plus de caractères à droite pour garder le '%'
+    while left_idx <= right_idx and (left_width + right_width) < max_text_width:
+        # Ajouter à droite en priorité
+        if left_idx <= right_idx:
+            right.insert(0, chars[right_idx])
+            right_width = font.size(''.join(right))[0]
+            if left_width + right_width > max_text_width:
+                right.pop(0)
+                break
+            right_idx -= 1
+        # Ajouter à gauche seulement si nécessaire
+        if left_idx < right_idx:
+            left.append(chars[left_idx])
+            left_width = font.size(''.join(left))[0]
+            if left_width + right_width > max_text_width:
+                left.pop()
+                break
+            left_idx += 1
+
+    # Reculer jusqu'à un espace pour éviter de couper un mot
+    while left and left[-1] != ' ' and left_width + right_width > max_text_width:
+        left.pop()
+        left_width = font.size(''.join(left))[0] if left else 0
+    while right and right[0] != ' ' and left_width + right_width > max_text_width:
+        right.pop(0)
+        right_width = font.size(''.join(right))[0] if right else 0
+
+    return ''.join(left).rstrip() + ellipsis + ''.join(right).lstrip()
+
+def truncate_text_end(text, font, max_width):
+    """Tronque le texte à la fin pour qu'il tienne dans max_width avec la police donnée."""
+    if not isinstance(text, str):
+        logger.error(f"Texte non valide: {text}")
+        return ""
+    if not isinstance(font, pygame.font.Font):
+        logger.error("Police non valide dans truncate_text_end")
+        return text  # Retourne le texte brut si la police est invalide
+
+    try:
+        if font.size(text)[0] <= max_width:
+            return text
+
+        truncated = text
+        while len(truncated) > 0 and font.size(truncated + "...")[0] > max_width:
+            truncated = truncated[:-1]
+        return truncated + "..." if len(truncated) < len(text) else text
+    except Exception as e:
+        logger.error(f"Erreur lors du rendu du texte '{text}': {str(e)}")
+        return text  # Retourne le texte brut en cas d'erreur
+
+def sanitize_filename(name):
+    """Sanitise les noms de fichiers en remplaçant les caractères interdits."""
+    return re.sub(r'[<>:"/\/\\|?*]', '_', name).strip()
+    
+def wrap_text(text, font, max_width):
+    """Divise le texte en lignes pour respecter la largeur maximale, en coupant les mots longs si nécessaire."""
+    if not isinstance(text, str):
+        text = str(text) if text is not None else ""
+    
+    words = text.split(' ')
+    lines = []
+    current_line = ''
+    
+    for word in words:
+        # Si le mot seul dépasse max_width, le couper caractère par caractère
+        if font.render(word, True, (255, 255, 255)).get_width() > max_width:
+            temp_line = current_line
+            for char in word:
+                test_line = temp_line + (' ' if temp_line else '') + char
+                test_surface = font.render(test_line, True, (255, 255, 255))
+                if test_surface.get_width() <= max_width:
+                    temp_line = test_line
+                else:
+                    if temp_line:
+                        lines.append(temp_line)
+                    temp_line = char
+            current_line = temp_line
+        else:
+            # Comportement standard pour les mots normaux
+            test_line = current_line + (' ' if current_line else '') + word
+            test_surface = font.render(test_line, True, (255, 255, 255))
+            if test_surface.get_width() <= max_width:
+                current_line = test_line
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+    
+    if current_line:
+        lines.append(current_line)
+    
+    return lines
+    
+def load_system_image(platform_dict):
+    """Charge une image système avec la priorité suivante:
+    1. platform_image explicite s'il est défini
+    2. <platform_name>.png
+    3. <folder>.png si disponible
+    4. Recherche fallback dans le dossier images de l'app (APP_FOLDER/images) avec le même ordre
+    5. default.png (dans SAVE_FOLDER/images), sinon default.png de l'app
+
+    Cela évite d'échouer lorsque le nom affiché ne correspond pas au fichier image
+    et respecte un mapping explicite fourni par systems_list.json."""
+    platform_name = platform_dict.get("platform_name", "unknown")
+    try:
+        image_path = _resolve_platform_image_path(platform_dict)
+        if not image_path:
+            logger.error(f"Aucune image trouvée pour {platform_name}.")
+            return None
+
+        return _safe_convert_alpha(pygame.image.load(image_path))
+    except Exception as e:
+        logger.error(f"Erreur lors du chargement de l'image pour {platform_name} : {str(e)}")
+        return None
+
+def extract_data(zip_path, dest_dir, url):
+    """Extrait le contenu de ZIP de DATA dans le dossier config.SAVE_FOLDER sans progression a l'ecran"""
+    logger.debug(f"Extraction de {zip_path} dans {dest_dir}")
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.testzip()  # Vérifier l'intégrité de l'archive
+            for info in zip_ref.infolist():
+                if info.is_dir():
+                    continue
+                file_path = os.path.join(dest_dir, info.filename)
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                with zip_ref.open(info) as source, open(file_path, 'wb') as dest:
+                    shutil.copyfileobj(source, dest)
+        logger.info(f"Extraction terminée de {zip_path}")
+        return True, "Extraction terminée avec succès"
+    except zipfile.BadZipFile as e:
+        logger.error(f"Erreur: Archive ZIP corrompue: {str(e)}")
+        return False, _("utils_corrupt_zip").format(str(e))
+
+    
+
+def _update_extraction_progress(url, extracted_size, total_size, lock, last_save_time_ref, save_interval=0.5):
+    """Fonction utilitaire pour mettre à jour la progression d'extraction."""
+    try:
+        current_time = time.time()
+        with lock:
+            if isinstance(config.history, list):
+                for entry in config.history:
+                    if "status" in entry and entry["status"] in ["Téléchargement", "Extracting", "Downloading"]:
+                        if "url" in entry and entry["url"] == url:
+                            progress_percent = int(extracted_size / total_size * 100) if total_size > 0 else 0
+                            progress_percent = max(0, min(100, progress_percent))
+                            entry["status"] = "Extracting"
+                            entry["progress"] = progress_percent
+                            entry["message"] = "Extraction en cours"
+                            if current_time - last_save_time_ref[0] >= save_interval:
+                                save_history(config.history)
+                                last_save_time_ref[0] = current_time
+                            config.needs_redraw = True
+                            break
+    except Exception as e:
+        logger.debug(f"Erreur mise à jour progression extraction: {e}")
+
+def _finalize_extraction(archive_path, dest_dir, url):
+    """Fonction utilitaire pour finaliser l'extraction (suppression fichier + historique).
+    NOTE: Ne met PAS à jour l'historique - c'est le rôle de network.py après le retour.
+    Cela évite les doublons d'entrées dans l'historique.
+    """
+    # Quelques tentatives avec un court délai : un antivirus/indexeur peut brièvement
+    # garder le fichier ouvert juste après extraction (Windows). Sans ceci, l'archive
+    # source resterait dupliquée sur le disque à côté des fichiers extraits.
+    last_error = None
+    for attempt in range(5):
+        try:
+            os.remove(archive_path)
+            logger.info(f"Fichier {archive_path} extrait dans {dest_dir} et supprimé")
+
+            # Mettre à jour l'état de progression à 100% (mais PAS l'historique)
+            if url in getattr(config, 'download_progress', {}):
+                try:
+                    config.download_progress[url]["status"] = "Download_OK"
+                    config.download_progress[url]["progress_percent"] = 100
+                except Exception:
+                    pass
+
+            return True, _("utils_extracted").format(os.path.basename(archive_path))
+        except Exception as e:
+            last_error = e
+            if attempt < 4:
+                time.sleep(0.5)
+    logger.error(f"Erreur lors de la finalisation de l'extraction: {str(last_error)}")
+    return True, _("utils_extracted").format(os.path.basename(archive_path))
+
+def _capture_directories_before_extraction(dest_dir):
+    """Capture les dossiers existants avant extraction pour détection PS3."""
+    try:
+        return set([d for d in os.listdir(dest_dir) if os.path.isdir(os.path.join(dest_dir, d))])
+    except Exception:
+        return set()
+
+def _capture_all_items_before_extraction(dest_dir):
+    """Capture tous les éléments (fichiers et dossiers) existants avant extraction pour DOS."""
+    try:
+        return set(os.listdir(dest_dir))
+    except Exception:
+        return set()
+
+def _handle_special_platforms(dest_dir, archive_path, before_dirs, iso_before=None, url=None, before_items=None):
+    """Gère les traitements spéciaux Xbox, PS3 et DOS après extraction.
+    
+    Args:
+        before_items: Set de tous les éléments (fichiers+dossiers) avant extraction (pour DOS)
+    """
+    # Xbox: conversion ISO
+    # Gérer les deux cas: symlink activé (xbox/xbox) ou désactivé (xbox)
+    xbox_dir_normal = os.path.join(config.ROMS_FOLDER, "xbox")
+    xbox_dir_symlink = os.path.join(config.ROMS_FOLDER, "xbox", "xbox")
+    is_xbox = (dest_dir == xbox_dir_normal or dest_dir == xbox_dir_symlink)
+    
+    if is_xbox and iso_before is not None:
+        iso_after = set()
+        for root, dirs, files in os.walk(dest_dir):
+            for file in files:
+                if file.lower().endswith('.iso'):
+                    iso_after.add(os.path.abspath(os.path.join(root, file)))
+        new_isos = list(iso_after - iso_before)
+        if new_isos:
+            success, error_msg = handle_xbox(dest_dir, new_isos, url)
+            if not success:
+                return False, error_msg
+        else:
+            logger.warning("Aucun nouvel ISO détecté après extraction pour conversion Xbox.")
+
+    # Dossier PS3: traitement spécifique
+    # Gérer les deux cas: symlink activé (ps3/ps3) ou désactivé (ps3)
+    ps3_dir_normal = os.path.join(config.ROMS_FOLDER, "ps3")
+    ps3_dir_symlink = os.path.join(config.ROMS_FOLDER, "ps3", "ps3")
+    is_ps3 = (dest_dir == ps3_dir_normal or dest_dir == ps3_dir_symlink)
+    
+    if is_ps3:
+        # PS3 Redump: décryptage et extraction
+        logger.info("Détection PS3 Redump - lancement du traitement spécifique")
+        
+        # Calculer les nouveaux dossiers créés lors de l'extraction
+        try:
+            after_dirs = set([d for d in os.listdir(dest_dir) if os.path.isdir(os.path.join(dest_dir, d))])
+        except Exception:
+            after_dirs = set()
+        
+        ignore_names = {"ps3", "images", "videos", "manuals", "media"}
+        new_dirs = [d for d in (after_dirs - before_dirs) if d not in ignore_names and not d.endswith('.ps3')]
+        expected_base = os.path.splitext(os.path.basename(archive_path))[0]
+        
+        success, error_msg = handle_ps3(
+            dest_dir=dest_dir,
+            new_dirs=new_dirs,
+            extracted_basename=expected_base,
+            url=url,
+            archive_name=os.path.basename(archive_path)
+        )
+        if not success:
+            return False, error_msg
+        return True, None
+
+    # DOS: organisation en dossiers .pc
+    dos_dir = os.path.join(config.ROMS_FOLDER, "dos")
+    if dest_dir == dos_dir:
+        expected_base = os.path.splitext(os.path.basename(archive_path))[0]
+        # Utiliser before_items si fourni, sinon before_dirs pour rétro-compatibilité
+        items_before = before_items if before_items is not None else before_dirs
+        success, error_msg = handle_dos(dest_dir, items_before, extracted_basename=expected_base)
+        if not success:
+            return False, error_msg
+    
+    # ScummVM: organisation en dossiers + fichier .scummvm
+    scummvm_dir = os.path.join(config.ROMS_FOLDER, "scummvm")
+    if dest_dir == scummvm_dir:
+        expected_base = os.path.splitext(os.path.basename(archive_path))[0]
+        # Utiliser before_items si fourni, sinon before_dirs pour rétro-compatibilité
+        items_before = before_items if before_items is not None else before_dirs
+        success, error_msg = handle_scummvm(dest_dir, items_before, extracted_basename=expected_base)
+        if not success:
+            return False, error_msg
+    
+    # PSVita: extraction dans ux0/app + création fichier .psvita
+    psvita_dir_normal = os.path.join(config.ROMS_FOLDER, "psvita")
+    psvita_dir_symlink = os.path.join(config.ROMS_FOLDER, "psvita", "psvita")
+    is_psvita = (dest_dir == psvita_dir_normal or dest_dir == psvita_dir_symlink)
+    
+    if is_psvita:
+        expected_base = os.path.splitext(os.path.basename(archive_path))[0]
+        items_before = before_items if before_items is not None else before_dirs
+        success, error_msg = handle_psvita(dest_dir, items_before, extracted_basename=expected_base)
+        if not success:
+            return False, error_msg
+    
+    return True, None
+
+def extract_zip(zip_path, dest_dir, url):
+    """Extrait le contenu du fichier ZIP dans le dossier cible avec un suivi progressif de la progression."""
+    logger.debug(f"Extraction de {zip_path} dans {dest_dir}")
+    try:
+        # Capture état initial
+        before_dirs = _capture_directories_before_extraction(dest_dir)
+        # Capture tous les items pour DOS
+        before_items = _capture_all_items_before_extraction(dest_dir)
+        iso_before = set()
+        for root, dirs, files in os.walk(dest_dir):
+            for file in files:
+                if file.lower().endswith('.iso'):
+                    iso_before.add(os.path.abspath(os.path.join(root, file)))
+
+        # Vérification et extraction
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.testzip()  # Vérifier l'intégrité de l'archive
+            
+            # Pré-analyse pour détecter les conflits fichier/dossier
+            all_paths = set()
+            file_paths = set()
+            for info in zip_ref.infolist():
+                normalized = info.filename.replace('/', os.sep)
+                if not info.is_dir():
+                    file_paths.add(normalized)
+                all_paths.add(normalized)
+            
+            # Identifier les conflits (un fichier existe avec un nom qui est aussi un dossier parent)
+            conflicts = set()
+            for file_path in file_paths:
+                # Vérifier si un parent de ce fichier existe aussi comme fichier
+                parts = file_path.split(os.sep)
+                for i in range(1, len(parts)):
+                    parent_path = os.sep.join(parts[:i])
+                    if parent_path in file_paths:
+                        conflicts.add(parent_path)
+                        logger.warning(f"Conflit détecté: '{parent_path}' est à la fois un fichier et un dossier parent")
+            
+            total_size = sum(info.file_size for info in zip_ref.infolist() if not info.is_dir())
+            logger.info(f"Taille totale à extraire: {total_size} octets")
+            
+            if total_size == 0:
+                logger.warning("ZIP vide ou ne contenant que des dossiers")
+                return True, "ZIP vide extrait avec succès"
+
+            # Variables de progression
+            extracted_size = 0
+            lock = threading.Lock()
+            last_save_time = [time.time()]  # Liste pour référence mutable
+            chunk_size = 2048
+            os.makedirs(dest_dir, exist_ok=True)
+
+            # Trier les fichiers par profondeur (nombre de séparateurs) pour extraire les fichiers racine d'abord
+            files_to_extract = [info for info in zip_ref.infolist() if not info.is_dir()]
+            files_to_extract.sort(key=lambda x: x.filename.count('/'))
+            
+            # Extraction avec progression
+            for info in files_to_extract:
+                # Normaliser le chemin pour Windows (remplacer / par \)
+                normalized_filename = info.filename.replace('/', os.sep)
+                
+                # Debug pour fichiers .nca
+                if normalized_filename.endswith('.nca'):
+                    logger.debug(f"Traitement fichier NCA: {normalized_filename}")
+                
+                # Ignorer les fichiers en conflit (ils sont des dossiers parents pour d'autres fichiers)
+                if normalized_filename in conflicts:
+                    logger.warning(f"Fichier ignoré (conflit avec dossier): {normalized_filename}")
+                    continue
+                
+                file_path = os.path.join(dest_dir, normalized_filename)
+                
+                try:
+                    # Créer uniquement le dossier parent, pas le fichier lui-même
+                    parent_dir = os.path.dirname(file_path)
+                    # Vérifier que parent_dir n'est pas vide et est différent de dest_dir
+                    if parent_dir and parent_dir != dest_dir:
+                        os.makedirs(parent_dir, exist_ok=True)
+                except Exception as dir_err:
+                    logger.error(f"Erreur création dossier parent pour {file_path}: {dir_err}")
+                    raise
+                
+                try:
+                    # Vérifier si un dossier existe avec le même nom (conflit)
+                    if os.path.isdir(file_path):
+                        logger.warning(f"Conflit: dossier existant avec le même nom que le fichier {file_path}, suppression du dossier")
+                        try:
+                            shutil.rmtree(file_path)
+                        except Exception as rm_err:
+                            logger.error(f"Impossible de supprimer le dossier {file_path}: {rm_err}")
+                            raise
+                    # Vérifier si le fichier existe déjà et est en lecture seule
+                    elif os.path.exists(file_path):
+                        try:
+                            # Retirer l'attribut lecture seule si présent (Windows)
+                            os.chmod(file_path, 0o644)
+                        except Exception:
+                            pass
+                    
+                    with zip_ref.open(info) as source, open(file_path, 'wb') as dest:
+                        while True:
+                            chunk = source.read(chunk_size)
+                            if not chunk:
+                                break
+                            dest.write(chunk)
+                            extracted_size += len(chunk)
+                            _update_extraction_progress(url, extracted_size, total_size, lock, last_save_time)
+                    
+                    # Définir les permissions (skip sur Windows si erreur)
+                    try:
+                        os.chmod(file_path, 0o644)
+                    except (OSError, PermissionError) as chmod_err:
+                        logger.debug(f"Impossible de définir chmod pour {file_path}: {chmod_err}")
+                except Exception as file_err:
+                    logger.error(f"Erreur extraction fichier {info.filename} vers {file_path}: {file_err}")
+                    raise
+
+        # Gestion plateformes spéciales
+        success, error_msg = _handle_special_platforms(dest_dir, zip_path, before_dirs, iso_before, url, before_items)
+        if not success:
+            return False, error_msg
+
+        # Finalisation
+        return _finalize_extraction(zip_path, dest_dir, url)
+
+    except zipfile.BadZipFile as e:
+        logger.error(f"Erreur: Archive ZIP corrompue: {str(e)}")
+        return False, _("utils_corrupt_zip").format(str(e))
+    except PermissionError as e:
+        logger.error(f"Erreur: Permission refusée lors de l'extraction: {str(e)}")
+        return False, _("utils_permission_denied").format(str(e))
+    except Exception as e:
+        logger.error(f"Erreur lors de l'extraction de {zip_path}: {str(e)}")
+        return False, _("utils_extraction_failed").format(str(e))
+     
+
+# Fonction pour extraire le contenu d'un fichier RAR
+def extract_rar(rar_path, dest_dir, url):
+    """Extrait le contenu du fichier RAR dans le dossier cible."""
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+
+        # macOS: no unrar formula in Homebrew, 7-Zip reads RAR natively
+        if config.OPERATING_SYSTEM == "Darwin" and shutil.which("unrar") is None:
+            return extract_7z(rar_path, dest_dir, url)
+        
+        # Configuration commande unrar selon l'OS
+        if config.OPERATING_SYSTEM == "Windows":
+            unrar_cmd = [config.UNRAR_EXE]
+        else:
+            unrar_cmd = ["unrar"]
+
+        # Vérification disponibilité unrar
+        result = subprocess.run(unrar_cmd, capture_output=True, text=True)
+        if result.returncode not in [0, 1]:
+            logger.error("Commande unrar non disponible")
+            return False, _("utils_unrar_unavailable")
+
+        # Analyse contenu RAR
+        result = subprocess.run(unrar_cmd + ['l', '-v', rar_path], capture_output=True, text=True)
+        if result.returncode != 0:
+            error_msg = result.stderr.strip()
+            logger.error(f"Erreur lors de la liste des fichiers RAR: {error_msg}")
+            return False, _("utils_rar_list_failed").format(error_msg)
+
+        # Parse liste fichiers
+        total_size = 0
+        files_to_extract = []
+        lines = result.stdout.splitlines()
+        in_file_list = False
+        for line in lines:
+            if line.startswith("----"):
+                in_file_list = not in_file_list
+                continue
+            if in_file_list:
+                match = re.match(r'^\s*(\S+)\s+(\d+)\s+\d*\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+(.+)$', line)
+                if match:
+                    attrs, file_size, file_date, file_name = match.groups()
+                    if 'D' not in attrs:  # Pas un dossier
+                        files_to_extract.append((file_name.strip(), int(file_size)))
+                        total_size += int(file_size)
+
+        logger.info(f"Taille totale à extraire (RAR): {total_size} octets")
+        if total_size == 0:
+            logger.warning("RAR vide, ne contenant que des dossiers, ou erreur de parsing")
+            return False, "RAR vide ou erreur lors de la liste des fichiers"
+
+        # Capture état initial
+        before_dirs = _capture_directories_before_extraction(dest_dir)
+
+        # Variables de progression
+        lock = threading.Lock()
+        last_save_time = [time.time()]  # Liste pour référence mutable
+
+        # Initialisation progression
+        if url not in getattr(config, 'download_progress', {}):
+            config.download_progress[url] = {}
+        config.download_progress[url].update({
+            "downloaded_size": 0,
+            "total_size": total_size,
+            "status": "Extracting",
+            "progress_percent": 0
+        })
+        config.needs_redraw = True
+
+        # Extraction RAR
+        process = subprocess.Popen(unrar_cmd + ['x', '-y', rar_path, dest_dir],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = process.communicate()
+
+        if process.returncode != 0:
+            logger.error(f"Erreur lors de l'extraction de {rar_path}: {stderr}")
+            return False, f"Erreur lors de l'extraction: {stderr}"
+
+        # Vérification et mise à jour progression des fichiers extraits
+        extracted_size = 0
+        total_files = len(files_to_extract)
+        for i, (expected_file, file_size) in enumerate(files_to_extract):
+            file_path = os.path.join(dest_dir, expected_file)
+            if os.path.exists(file_path):
+                extracted_size += file_size
+                os.chmod(file_path, 0o644)
+                
+                # Mise à jour progression basée sur nombre de fichiers
+                progress_percent = int(((i + 1) / total_files * 100)) if total_files > 0 else 0
+                _update_extraction_progress(url, progress_percent * total_size // 100, total_size, lock, last_save_time)
+                
+                # Mise à jour config.download_progress
+                with lock:
+                    if url in config.download_progress:
+                        config.download_progress[url]["downloaded_size"] = extracted_size
+                        config.download_progress[url]["progress_percent"] = progress_percent
+                        config.needs_redraw = True
+
+        # Permissions dossiers
+        for root, dirs, files in os.walk(dest_dir):
+            for dir_name in dirs:
+                os.chmod(os.path.join(root, dir_name), 0o755)
+
+        # Gestion plateformes spéciales (uniquement PS3 pour RAR)
+        success, error_msg = _handle_special_platforms(dest_dir, rar_path, before_dirs, url=url)
+        if not success:
+            return False, error_msg
+
+        # Finalisation
+        return _finalize_extraction(rar_path, dest_dir, url)
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de l'extraction de {rar_path}: {str(e)}")
+        return False, f"Erreur lors de l'extraction: {str(e)}"
+    finally:
+        # Nettoyage en cas d'erreur
+        if os.path.exists(rar_path):
+            try:
+                os.remove(rar_path)
+                logger.info(f"Fichier RAR {rar_path} supprimé après échec de l'extraction")
+            except Exception as e:
+                logger.error(f"Erreur lors de la suppression de {rar_path}: {str(e)}")
+
+
+def extract_7z(archive_path, dest_dir, url):
+    """Extrait le contenu d'un fichier 7z dans le dossier cible."""
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+
+        seven_z_cmd = _resolve_7z_command()
+
+        if not seven_z_cmd or (os.path.isabs(seven_z_cmd) and not os.path.exists(seven_z_cmd)):
+            return False, ("7zz not found - run: brew install sevenzip" if config.OPERATING_SYSTEM == "Darwin" else "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs")
+
+        # Capture état initial
+        before_dirs = _capture_directories_before_extraction(dest_dir)
+        before_items = _capture_all_items_before_extraction(dest_dir)
+        iso_before = set()
+        for root, dirs, files in os.walk(dest_dir):
+            for file in files:
+                if file.lower().endswith('.iso'):
+                    iso_before.add(os.path.abspath(os.path.join(root, file)))
+
+        # Calcul taille totale via 7z l -slt (best effort)
+        total_size = 0
+        try:
+            list_cmd = [seven_z_cmd, "l", "-slt", archive_path]
+            result = subprocess.run(list_cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                current_size = None
+                is_dir = False
+                for line in result.stdout.splitlines():
+                    line = line.strip()
+                    if not line:
+                        if current_size is not None and not is_dir:
+                            total_size += current_size
+                        current_size = None
+                        is_dir = False
+                        continue
+                    if line.startswith("Attributes ="):
+                        attrs = line.split("=", 1)[1].strip()
+                        if "D" in attrs:
+                            is_dir = True
+                    elif line.startswith("Size ="):
+                        try:
+                            current_size = int(line.split("=", 1)[1].strip())
+                        except Exception:
+                            current_size = None
+                if current_size is not None and not is_dir:
+                    total_size += current_size
+        except Exception as e:
+            logger.debug(f"Impossible de calculer la taille 7z: {e}")
+
+        if url not in getattr(config, 'download_progress', {}):
+            config.download_progress[url] = {}
+        config.download_progress[url].update({
+            "downloaded_size": 0,
+            "total_size": total_size,
+            "status": "Extracting",
+            "progress_percent": 0
+        })
+        config.needs_redraw = True
+
+        extract_cmd = [seven_z_cmd, "x", archive_path, f"-o{dest_dir}", "-y"]
+        logger.debug(f"Commande d'extraction 7z: {' '.join(extract_cmd)}")
+        result = subprocess.run(extract_cmd, capture_output=True, text=True)
+        if result.returncode > 2:
+            error_msg = result.stderr.strip() or f"Erreur extraction 7z (code {result.returncode})"
+            logger.error(error_msg)
+            return False, error_msg
+        if result.returncode != 0:
+            logger.warning(f"7z a retourné un avertissement (code {result.returncode}): {result.stderr}")
+
+        # Gestion plateformes spéciales
+        success, error_msg = _handle_special_platforms(dest_dir, archive_path, before_dirs, iso_before, url, before_items)
+        if not success:
+            return False, error_msg
+
+        return _finalize_extraction(archive_path, dest_dir, url)
+    except Exception as e:
+        logger.error(f"Erreur lors de l'extraction 7z: {str(e)}")
+        return False, _("utils_extraction_failed").format(str(e))
+
+def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archive_name=None):
+    """Gère le traitement spécifique des jeux PS3.
+   PS3 Redump (ps3): Décryptage ISO + extraction dans dossier .ps3
+    
+    Args:
+        dest_dir: Dossier de destination (ps3 ou ps3)
+        new_dirs: Liste des nouveaux dossiers créés (mode classique)
+        extracted_basename: Nom de base de l'archive extraite
+        url: URL du jeu (nécessaire pour PS3 Redump)
+        archive_name: Nom complet de l'archive avec extension (pour PS3 Redump)
+    
+    Returns:
+        (success: bool, message: str)
+    """
+    logger.debug(f"Traitement spécifique PS3 dans: {dest_dir}")
+    
+    # Détection du mode PS3 - supporter les deux cas: symlink activé (ps3/ps3) ou désactivé (ps3)
+    ps3_dir_normal = os.path.join(config.ROMS_FOLDER, "ps3")
+    ps3_dir_symlink = os.path.join(config.ROMS_FOLDER, "ps3", "ps3")
+    is_ps3 = (dest_dir == ps3_dir_normal or dest_dir == ps3_dir_symlink)
+    
+    if is_ps3:
+        # ============================================
+        # MODE PS3 : Décryptage et extraction
+        # ============================================
+        logger.info(f"Mode PS3  détecté pour: {archive_name}")
+
+        # L'extraction de l'archive est terminée; basculer l'UI en mode conversion/décryptage.
+        try:
+            if url:
+                if url not in getattr(config, 'download_progress', {}):
+                    config.download_progress[url] = {}
+                config.download_progress[url]["status"] = "Converting"
+                config.download_progress[url]["progress_percent"] = 0
+                config.needs_redraw = True
+
+                if isinstance(config.history, list):
+                    for entry in config.history:
+                        if entry.get("url") == url and entry.get("status") in ("Extracting", "Téléchargement", "Downloading"):
+                            entry["status"] = "Converting"
+                            entry["progress"] = 0
+                            entry["message"] = "PS3 conversion in progress"
+                            save_history(config.history)
+                            break
+        except Exception as e:
+            logger.debug(f"MAJ statut conversion PS3 ignorée: {e}")
+        
+        try:
+            ps3_keys_base_url = "https://retrogamesets.fr/softs/ps3/"
+            logger.debug(f"URL jeu: {url}")
+            logger.debug(f"Base URL des clés PS3: {ps3_keys_base_url}")
+            
+            # Chercher uniquement l'ISO correspondant au fichier téléchargé/extrait.
+            iso_files = [f for f in os.listdir(dest_dir) if f.endswith('.iso') and not f.endswith('_decrypted.iso')]
+            if not iso_files:
+                # Vérifier si le jeu est déjà extrait dans un dossier
+                game_folders = []
+                for f in os.listdir(dest_dir):
+                    f_path = os.path.join(dest_dir, f)
+                    if os.path.isdir(f_path):
+                        if f.endswith('.ps3'):
+                            game_folders.append(f)
+                        elif os.path.exists(os.path.join(f_path, 'PS3_GAME')):
+                            game_folders.append(f)
+                if game_folders:
+                    game_folder = game_folders[0]
+                    game_folder_path = os.path.join(dest_dir, game_folder)
+                    if not game_folder.endswith('.ps3'):
+                        new_name = game_folder + '.ps3'
+                        new_path = os.path.join(dest_dir, new_name)
+                        os.rename(game_folder_path, new_path)
+                        logger.info(f"Dossier renommé: {game_folder} -> {new_name}")
+                        game_folder = new_name
+                    logger.info(f"Dossier de jeu PS3 déjà présent: {game_folder}")
+                    return True, f"Jeu PS3 déjà extrait dans {game_folder}"
+                else:
+                    return False, "Aucun fichier .iso trouvé après extraction"
+
+            def _normalize_ps3_name(name: str) -> str:
+                base_name = os.path.splitext(os.path.basename(name or ""))[0]
+                return re.sub(r"\s+", " ", base_name).strip().casefold()
+
+            candidate_bases = []
+
+            def _add_candidate_base(base_name):
+                if not base_name:
+                    return
+                cleaned = str(base_name).strip()
+                if not cleaned:
+                    return
+                if cleaned.lower().endswith('.dkey'):
+                    cleaned = cleaned[:-5]
+                normalized = _normalize_ps3_name(cleaned)
+                if normalized and normalized not in candidate_bases:
+                    candidate_bases.append(normalized)
+
+            if archive_name:
+                _add_candidate_base(os.path.splitext(os.path.basename(archive_name))[0])
+            if extracted_basename:
+                _add_candidate_base(extracted_basename)
+
+            matching_iso_files = []
+            for iso_name in iso_files:
+                if _normalize_ps3_name(iso_name) in candidate_bases:
+                    matching_iso_files.append(iso_name)
+
+            if len(matching_iso_files) == 1:
+                iso_file = matching_iso_files[0]
+            elif len(matching_iso_files) > 1:
+                iso_file = sorted(matching_iso_files)[0]
+                logger.warning(
+                    "Plusieurs ISO PS3 correspondent au fichier téléchargé dans %s, sélection de %s",
+                    dest_dir,
+                    iso_file,
+                )
+            elif len(iso_files) == 1:
+                iso_file = iso_files[0]
+                logger.warning(
+                    "Un seul ISO PS3 présent dans %s, sélection par défaut de %s car aucun nom ne correspond au téléchargement courant",
+                    dest_dir,
+                    iso_file,
+                )
+            else:
+                logger.error(
+                    "Plusieurs ISO PS3 présents dans %s mais aucun ne correspond au téléchargement courant (%s / %s)",
+                    dest_dir,
+                    archive_name,
+                    extracted_basename,
+                )
+                return False, "Impossible d'identifier l'ISO PS3 correspondant au fichier téléchargé"
+
+            iso_path = os.path.join(dest_dir, iso_file)
+            logger.info(f"Fichier ISO correspondant trouvé: {iso_path}")
+            
+            # Étape 1: Télécharger directement la clé .dkey depuis la nouvelle source
+            dkey_path = None
+            logger.info("Téléchargement de la clé de décryption (.dkey)...")
+
+            candidate_bases = []
+
+            def _add_candidate_base(base_name):
+                if not base_name:
+                    return
+                cleaned = str(base_name).strip()
+                if not cleaned:
+                    return
+                if cleaned.lower().endswith('.dkey'):
+                    cleaned = cleaned[:-5]
+                if cleaned not in candidate_bases:
+                    candidate_bases.append(cleaned)
+
+            if archive_name:
+                _add_candidate_base(os.path.splitext(os.path.basename(archive_name))[0])
+            if extracted_basename:
+                _add_candidate_base(extracted_basename)
+            _add_candidate_base(os.path.splitext(os.path.basename(iso_file))[0])
+
+            for base_name in candidate_bases:
+                remote_name = f"{base_name}.dkey"
+                encoded_name = remote_name.replace(" ", "%20")
+                key_url = f"{ps3_keys_base_url}{encoded_name}"
+                logger.debug(f"Tentative clé distante: {key_url}")
+                try:
+                    response = requests.get(key_url, stream=True, timeout=30)
+                    if response.status_code != 200:
+                        logger.debug(f"Clé distante introuvable ({response.status_code}): {remote_name}")
+                        continue
+
+                    local_dkey_path = os.path.join(dest_dir, remote_name)
+                    with open(local_dkey_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+
+                    dkey_path = local_dkey_path
+                    logger.info(f"Clé téléchargée: {dkey_path}")
+                    break
+                except Exception as e:
+                    logger.warning(f"Échec téléchargement clé {remote_name}: {e}")
+            
+            # Chercher une clé .dkey si pas téléchargée
+            if not dkey_path:
+                dkey_files = [f for f in os.listdir(dest_dir) if f.endswith('.dkey')]
+                if dkey_files:
+                    dkey_path = os.path.join(dest_dir, dkey_files[0])
+                    logger.info(f"Clé trouvée localement: {dkey_path}")
+                else:
+                    return False, "Aucune clé de décryption trouvée (.dkey)"
+            
+            # Étape 2: Décrypter l'ISO
+            logger.info("Décryptage de l'ISO...")
+            decrypted_iso_path = iso_path.replace('.iso', '_decrypted.iso')
+            
+            if config.OPERATING_SYSTEM == "Darwin":
+                return False, "PS3 Redump decryption is not supported on macOS (no native ps3dec)"
+
+            # Vérifier et corriger les permissions de ps3dec sur Linux
+            if config.OPERATING_SYSTEM != "Windows":
+                ps3dec_tool = config.PS3DEC_LINUX
+                try:
+                    if os.path.exists(ps3dec_tool):
+                        current_perms = os.stat(ps3dec_tool).st_mode
+                        if not os.access(ps3dec_tool, os.X_OK):
+                            logger.warning(f"ps3dec_linux n'est pas exécutable, correction des permissions...")
+                            os.chmod(ps3dec_tool, 0o755)
+                            logger.info(f"Permissions corrigées pour {ps3dec_tool}")
+                        else:
+                            logger.debug(f"ps3dec_linux a déjà les permissions d'exécution")
+                    else:
+                        return False, f"ps3dec_linux non trouvé: {ps3dec_tool}"
+                except Exception as e:
+                    logger.error(f"Erreur lors de la vérification des permissions: {e}")
+                    # Continuer quand même, l'erreur sera capturée plus tard
+            
+            if config.OPERATING_SYSTEM == "Windows":
+                # Utiliser des guillemets doubles et échapper correctement pour PowerShell
+                # Doubler les guillemets doubles internes pour l'échappement PowerShell
+                dkey_escaped = dkey_path.replace('"', '""')
+                ps3dec_escaped = config.PS3DEC_EXE.replace('"', '""')
+                iso_escaped = iso_path.replace('"', '""')
+                decrypted_escaped = decrypted_iso_path.replace('"', '""')
+                
+                cmd = [
+                    "powershell", "-Command",
+                    f'$key = [System.IO.File]::ReadAllText("{dkey_escaped}").Trim(); ' +
+                    f'& "{ps3dec_escaped}" d key $key "{iso_escaped}" "{decrypted_escaped}"'
+                ]
+            else:  # Linux
+                # Utiliser des guillemets doubles avec échappement pour bash
+                # Échapper les caractères spéciaux: $, `, \, ", et !
+                def bash_escape(path):
+                    return path.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
+                
+                dkey_escaped = bash_escape(dkey_path)
+                ps3dec_escaped = bash_escape(config.PS3DEC_LINUX)
+                iso_escaped = bash_escape(iso_path)
+                decrypted_escaped = bash_escape(decrypted_iso_path)
+                
+                cmd = [
+                    "bash", "-c",
+                    f'key=$(cat "{dkey_escaped}" | tr -d \' \\n\\r\\t\'); ' +
+                    f'"{ps3dec_escaped}" d key "$key" "{iso_escaped}" "{decrypted_escaped}"'
+                ]
+            
+            logger.debug(f"Commande de décryptage: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                error_msg = f"Erreur lors du décryptage: {result.stderr}"
+                logger.error(error_msg)
+                return False, error_msg
+            
+            logger.info("Décryptage réussi")
+            os.remove(iso_path)
+            logger.debug(f"ISO original supprimé: {iso_path}")
+            
+            # Étape 3: Extraire l'ISO décrypté dans un dossier .ps3
+            logger.info("Extraction de l'ISO décrypté...")
+            game_folder_name = os.path.splitext(os.path.basename(iso_file))[0] + ".ps3"
+            game_folder_path = os.path.join(dest_dir, game_folder_name)
+            os.makedirs(game_folder_path, exist_ok=True)
+            
+            try:
+                seven_z_cmd = _resolve_7z_command()
+                if not seven_z_cmd or (os.path.isabs(seven_z_cmd) and not os.path.exists(seven_z_cmd)):
+                    return False, f"7zz non trouvé: {config.SEVEN_Z_LINUX}"
+                
+                extract_cmd = [seven_z_cmd, "x", decrypted_iso_path, f"-o{game_folder_path}", "-y"]
+                logger.debug(f"Commande d'extraction ISO: {' '.join(extract_cmd)}")
+                result = subprocess.run(extract_cmd, capture_output=True, text=True)
+                
+                if result.returncode > 2:
+                    error_msg = f"Erreur critique lors de l'extraction ISO (code {result.returncode}): {result.stderr}"
+                    logger.error(error_msg)
+                    return False, error_msg
+                
+                if result.returncode != 0:
+                    logger.warning(f"7z a retourné un avertissement (code {result.returncode}): {result.stderr}")
+                    logger.info("Extraction poursuivie malgré l'avertissement")
+                
+                logger.info(f"ISO extrait dans: {game_folder_path}")
+                
+            except FileNotFoundError:
+                return False, ("7zz not found - run: brew install sevenzip" if config.OPERATING_SYSTEM == "Darwin" else "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs")
+            except Exception as e:
+                return False, f"Erreur lors de l'extraction ISO: {str(e)}"
+            
+            # Nettoyage
+            os.remove(decrypted_iso_path)
+            logger.debug(f"ISO décrypté supprimé: {decrypted_iso_path}")
+            
+            if dkey_path and os.path.exists(dkey_path):
+                os.remove(dkey_path)
+                logger.debug(f"Fichier .dkey supprimé: {dkey_path}")
+            
+            logger.info(f"Traitement PS3 Redump terminé avec succès: {game_folder_name}")
+            return True, f"Jeu décrypté et extrait: {game_folder_name}"
+            
+        except Exception as e:
+            error_msg = f"Erreur lors du traitement PS3 Redump: {str(e)}"
+            logger.error(error_msg)
+            return False, error_msg
+    
+def handle_dos(dest_dir, before_items, extracted_basename=None):
+    """Gère l'organisation spécifique des dossiers DOS extraits.
+
+    - Si le ZIP contient un seul dossier: extraire et renommer ce dossier en <nom_zip>.pc
+    - Si le ZIP contient plusieurs fichiers/dossiers: déplacer tout dans un nouveau dossier <nom_zip>.pc
+    
+    Args:
+        before_items: Set des éléments (fichiers+dossiers) présents avant extraction
+    """
+    logger.debug(f"Traitement spécifique DOS dans: {dest_dir}")
+    time.sleep(2)  # petite latence post-extraction
+
+    try:
+        # Déterminer les nouveaux éléments extraits
+        after_items = set(os.listdir(dest_dir))
+    except Exception:
+        after_items = set()
+
+    ignore_names = {"dos", "images", "videos", "manuals", "media"}
+    # Filtrer les nouveaux éléments (fichiers ou dossiers)
+    new_items = [item for item in (after_items - before_items) 
+                 if item not in ignore_names and not item.endswith('.pc')]
+
+    if not new_items:
+        logger.warning("Aucun nouveau contenu DOS détecté après extraction")
+        return True, None
+
+    if not extracted_basename:
+        logger.warning("Nom de base du ZIP non fourni pour le traitement DOS")
+        return True, None
+
+    target_name = f"{extracted_basename}.pc"
+    target_path = os.path.join(dest_dir, target_name)
+
+    # Cas 1: Un seul dossier extrait -> le renommer en .pc
+    if len(new_items) == 1:
+        item_path = os.path.join(dest_dir, new_items[0])
+        if os.path.isdir(item_path):
+            logger.debug(f"DOS: Un seul dossier détecté '{new_items[0]}', renommage en '{target_name}'")
+            max_retries = 3
+            retry_delay = 2
+            for attempt in range(max_retries):
+                try:
+                    # Fermer les handles potentiellement ouverts
+                    for root, dirs, files in os.walk(item_path):
+                        for f in files:
+                            try:
+                                os.chmod(os.path.join(root, f), 0o644)
+                            except (OSError, PermissionError):
+                                pass
+                        for d in dirs:
+                            try:
+                                os.chmod(os.path.join(root, d), 0o755)
+                            except (OSError, PermissionError):
+                                pass
+
+                    if os.path.exists(target_path):
+                        shutil.rmtree(target_path, ignore_errors=True)
+                        time.sleep(1)
+
+                    os.rename(item_path, target_path)
+                    logger.info(f"Dossier DOS renommé avec succès: {item_path} -> {target_path}")
+                    return True, None
+
+                except Exception as e:
+                    logger.warning(f"Tentative {attempt + 1}/{max_retries} échouée: {str(e)}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                    else:
+                        error_msg = f"Erreur lors du renommage DOS de {item_path} en {target_path}: {str(e)}"
+                        logger.error(error_msg)
+                        return False, error_msg
+
+    # Cas 2: Un seul fichier OU plusieurs fichiers/dossiers -> créer un dossier .pc et tout y déplacer
+    logger.debug(f"DOS: {len(new_items)} élément(s) détecté(s), création du dossier '{target_name}'")
+    try:
+        # Créer le dossier .pc s'il n'existe pas
+        if os.path.exists(target_path):
+            logger.warning(f"Le dossier {target_path} existe déjà, il sera remplacé")
+            shutil.rmtree(target_path, ignore_errors=True)
+            time.sleep(1)
+
+        os.makedirs(target_path, exist_ok=True)
+
+        # Déplacer tous les nouveaux éléments dans le dossier .pc
+        for item in new_items:
+            src_path = os.path.join(dest_dir, item)
+            dst_path = os.path.join(target_path, item)
+            
+            try:
+                if os.path.isdir(src_path):
+                    shutil.move(src_path, dst_path)
+                else:
+                    shutil.move(src_path, dst_path)
+                    os.chmod(dst_path, 0o644)
+                logger.debug(f"Déplacé: {item} -> {target_name}/{item}")
+            except Exception as e:
+                logger.error(f"Erreur lors du déplacement de {item}: {str(e)}")
+                return False, f"Erreur lors du déplacement de {item}: {str(e)}"
+
+        logger.info(f"Contenu DOS organisé avec succès dans: {target_path}")
+        return True, None
+
+    except Exception as e:
+        error_msg = f"Erreur lors de l'organisation DOS dans {target_path}: {str(e)}"
+        logger.error(error_msg)
+        return False, error_msg
+
+
+def handle_scummvm(dest_dir, before_items, extracted_basename=None):
+    """Gère l'organisation spécifique des jeux ScummVM extraits.
+    
+    - Crée un sous-dossier avec le nom du jeu (sans extension)
+    - Extrait/déplace le contenu du ZIP dans ce dossier
+    - Crée un fichier .scummvm vide avec le même nom
+    
+    Exemple: Freddi_fish_1.zip -> dossier Freddi_fish_1/ + fichier Freddi_fish_1.scummvm
+    
+    Args:
+        dest_dir: Dossier de destination (scummvm)
+        before_items: Set des éléments présents avant extraction
+        extracted_basename: Nom de base du ZIP extrait (sans extension)
+    """
+    logger.debug(f"Traitement spécifique ScummVM dans: {dest_dir}")
+    time.sleep(2)  # Petite latence post-extraction
+    
+    try:
+        # Déterminer les nouveaux éléments extraits
+        after_items = set(os.listdir(dest_dir))
+    except Exception:
+        after_items = set()
+    
+    ignore_names = {"scummvm", "images", "videos", "manuals", "media"}
+    # Filtrer les nouveaux éléments (fichiers ou dossiers)
+    new_items = [item for item in (after_items - before_items) 
+                 if item not in ignore_names and not item.endswith('.scummvm')]
+    
+    if not new_items:
+        logger.warning("Aucun nouveau contenu ScummVM détecté après extraction")
+        return True, None
+    
+    if not extracted_basename:
+        logger.warning("Nom de base du ZIP non fourni pour le traitement ScummVM")
+        return True, None
+    
+    # Nom du dossier et du fichier .scummvm
+    game_folder_name = extracted_basename
+    game_folder_path = os.path.join(dest_dir, game_folder_name)
+    scummvm_file_path = os.path.join(game_folder_path, f"{game_folder_name}.scummvm")
+    
+    try:
+        # Créer le dossier du jeu s'il n'existe pas
+        if os.path.exists(game_folder_path):
+            logger.warning(f"Le dossier {game_folder_path} existe déjà, il sera utilisé")
+        else:
+            os.makedirs(game_folder_path, exist_ok=True)
+            logger.debug(f"Dossier créé: {game_folder_path}")
+        
+        # Déplacer tous les nouveaux éléments dans le dossier du jeu
+        for item in new_items:
+            src_path = os.path.join(dest_dir, item)
+            dst_path = os.path.join(game_folder_path, item)
+            
+            try:
+                if os.path.isdir(src_path):
+                    shutil.move(src_path, dst_path)
+                else:
+                    shutil.move(src_path, dst_path)
+                logger.debug(f"Déplacé: {item} -> {game_folder_name}/{item}")
+            except Exception as e:
+                logger.error(f"Erreur déplacement {item}: {e}")
+                return False, f"Erreur lors du déplacement de {item}: {str(e)}"
+        
+        # Créer le fichier .scummvm vide dans le sous-dossier
+        try:
+            with open(scummvm_file_path, 'w', encoding='utf-8') as f:
+                pass  # Fichier vide
+            logger.info(f"Fichier .scummvm créé: {scummvm_file_path}")
+        except Exception as e:
+            logger.error(f"Erreur création fichier .scummvm: {e}")
+            return False, f"Erreur lors de la création du fichier .scummvm: {str(e)}"
+        
+        logger.info(f"Contenu ScummVM organisé avec succès: dossier {game_folder_name}/ avec fichier {game_folder_name}.scummvm à l'intérieur")
+        return True, None
+        
+    except Exception as e:
+        error_msg = f"Erreur lors de l'organisation ScummVM dans {game_folder_path}: {str(e)}"
+        logger.error(error_msg)
+        return False, error_msg
+
+
+def handle_psvita(dest_dir, before_items, extracted_basename=None):
+    """Gère l'organisation spécifique des jeux PSVita extraits.
+    
+    Structure attendue:
+    - Archive RAR extraite → Dossier "Nom du jeu"/
+    - Dans ce dossier → Fichier "IDJeu.zip" (ex: PCSE00890.zip)
+    - Ce ZIP contient → Dossier "IDJeu" (ex: PCSE00890/)
+    
+    Actions:
+    1. Créer fichier "Nom du jeu [IDJeu].psvita" dans dest_dir
+    2. Extraire IDJeu.zip dans config.SAVE_FOLDER/psvita/ux0/app/
+    3. Supprimer le dossier temporaire "Nom du jeu"/
+    
+    Args:
+        dest_dir: Dossier de destination (psvita ou psvita/psvita)
+        before_items: Set des éléments présents avant extraction
+        extracted_basename: Nom de base de l'archive extraite (sans extension)
+    """
+    logger.debug(f"Traitement spécifique PSVita dans: {dest_dir}")
+    time.sleep(2)  # Petite latence post-extraction
+    
+    try:
+        after_items = set(os.listdir(dest_dir))
+    except Exception:
+        after_items = set()
+    
+    ignore_names = {"psvita", "images", "videos", "manuals", "media"}
+    # Filtrer les nouveaux éléments (fichiers ou dossiers)
+    new_items = [item for item in (after_items - before_items) 
+                 if item not in ignore_names and not item.endswith('.psvita')]
+    
+    if not new_items:
+        logger.warning("PSVita: Aucun nouveau dossier détecté après extraction")
+        return True, None
+    
+    if not extracted_basename:
+        extracted_basename = new_items[0] if new_items else "game"
+    
+    # Chercher le dossier du jeu (normalement il n'y en a qu'un)
+    game_folder = None
+    for item in new_items:
+        item_path = os.path.join(dest_dir, item)
+        if os.path.isdir(item_path):
+            game_folder = item
+            game_folder_path = item_path
+            break
+    
+    if not game_folder:
+        logger.error("PSVita: Aucun dossier de jeu trouvé après extraction")
+        return False, "PSVita: Aucun dossier de jeu trouvé"
+    
+    logger.debug(f"PSVita: Dossier de jeu trouvé: {game_folder}")
+    
+    # Chercher le fichier ZIP à l'intérieur (IDJeu.zip)
+    try:
+        contents = os.listdir(game_folder_path)
+        zip_files = [f for f in contents if f.lower().endswith('.zip')]
+        
+        if not zip_files:
+            logger.error(f"PSVita: Aucun fichier ZIP trouvé dans {game_folder}")
+            return False, f"PSVita: Aucun ZIP trouvé dans {game_folder}"
+        
+        # Prendre le premier ZIP trouvé
+        zip_filename = zip_files[0]
+        zip_path = os.path.join(game_folder_path, zip_filename)
+        
+        # Extraire l'ID du jeu (nom du ZIP sans extension)
+        game_id = os.path.splitext(zip_filename)[0]
+        logger.debug(f"PSVita: ZIP trouvé: {zip_filename}, ID du jeu: {game_id}")
+        
+        # 1. Créer le fichier .psvita dans dest_dir
+        psvita_filename = f"{game_folder} [{game_id}].psvita"
+        psvita_file_path = os.path.join(dest_dir, psvita_filename)
+        
+        try:
+            # Créer un fichier vide .psvita
+            with open(psvita_file_path, 'w', encoding='utf-8') as f:
+                f.write(f"# PSVita Game\n")
+                f.write(f"# Game: {game_folder}\n")
+                f.write(f"# ID: {game_id}\n")
+            logger.info(f"PSVita: Fichier .psvita créé: {psvita_filename}")
+        except Exception as e:
+            logger.error(f"PSVita: Erreur création fichier .psvita: {e}")
+            return False, f"Erreur création {psvita_filename}: {e}"
+        
+        # 2. Extraire le ZIP dans le dossier parent de config.SAVE_FOLDER/psvita/ux0/app/
+        save_parent2 = os.path.dirname(config.SAVE_FOLDER)
+        save_parent = os.path.dirname(save_parent2)
+        ux0_app_dir = os.path.join(save_parent, "psvita", "ux0", "app")
+        os.makedirs(ux0_app_dir, exist_ok=True)
+        
+        logger.debug(f"PSVita: Extraction de {zip_filename} dans {ux0_app_dir}")
+        
+        try:
+            import zipfile
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(ux0_app_dir)
+            logger.info(f"PSVita: ZIP extrait avec succès dans {ux0_app_dir}")
+            
+            # Vérifier que le dossier game_id existe bien
+            game_id_path = os.path.join(ux0_app_dir, game_id)
+            if not os.path.exists(game_id_path):
+                logger.warning(f"PSVita: Le dossier {game_id} n'a pas été trouvé dans l'extraction")
+            else:
+                logger.info(f"PSVita: Dossier {game_id} confirmé dans ux0/app/")
+        
+        except zipfile.BadZipFile as e:
+            logger.error(f"PSVita: Fichier ZIP corrompu: {e}")
+            return False, f"ZIP corrompu: {zip_filename}"
+        except Exception as e:
+            logger.error(f"PSVita: Erreur extraction ZIP: {e}")
+            return False, f"Erreur extraction {zip_filename}: {e}"
+        
+        # 3. Supprimer le dossier temporaire du jeu
+        try:
+            import shutil
+            shutil.rmtree(game_folder_path)
+            logger.info(f"PSVita: Dossier temporaire supprimé: {game_folder}")
+        except Exception as e:
+            logger.warning(f"PSVita: Impossible de supprimer {game_folder}: {e}")
+            # Ne pas échouer pour ça, le jeu est quand même installé
+        
+        logger.info(f"PSVita: Traitement terminé avec succès - {psvita_filename} créé, {game_id} installé dans ux0/app/")
+        return True, None
+        
+    except Exception as e:
+        logger.error(f"PSVita: Erreur générale: {e}", exc_info=True)
+        return False, f"Erreur PSVita: {str(e)}"
+
+
+def handle_xbox(dest_dir, iso_files, url=None):
+    """Gère la conversion des fichiers Xbox extraits et met à jour l'UI (Converting)."""
+    logger.debug(f"Traitement spécifique Xbox dans: {dest_dir}")
+    
+    # Attendre un peu que tous les processus d'extraction se terminent
+    time.sleep(2)
+    if config.OPERATING_SYSTEM == "Windows":
+        # Sur Windows; telecharger le fichier exe
+        XISO_EXE = config.XISO_EXE
+        extract_xiso_cmd = [XISO_EXE, "-r"]  # Liste avec 2 éléments
+
+    elif config.OPERATING_SYSTEM == "Darwin":
+        # macOS : extract-xiso depuis le PATH (pas de binaire fourni)
+        xiso_path = shutil.which("extract-xiso")
+        if not xiso_path:
+            logger.warning("extract-xiso introuvable dans le PATH (macOS)")
+            return False, "extract-xiso not found (build it from github.com/XboxDev/extract-xiso and put it on PATH)"
+        extract_xiso_cmd = [xiso_path, "-r"]
+
+    else:
+        # Linux/Batocera : télécharger le fichier xdvdfs  
+        XISO_LINUX = config.XISO_LINUX
+        try:
+            stat_info = os.stat(XISO_LINUX)
+            mode = stat_info.st_mode
+            logger.debug(f"Permissions de {XISO_LINUX}: {oct(mode)}")
+            logger.debug(f"Propriétaire: {stat_info.st_uid}, Groupe: {stat_info.st_gid}")
+            
+            # Vérifier si le fichier est exécutable
+            if not os.access(XISO_LINUX, os.X_OK):
+                logger.error(f"Le fichier {XISO_LINUX} n'est pas exécutable")
+                try:
+                    os.chmod(XISO_LINUX, 0o755)
+                    logger.info(f"Permissions corrigées pour {XISO_LINUX}")
+                except Exception as e:
+                    logger.error(f"Impossible de modifier les permissions: {str(e)}")
+                    return False, "Erreur de permissions sur xdvdfs"
+        except Exception as e:
+            logger.error(f"Erreur lors de la vérification des permissions: {str(e)}")
+    
+        extract_xiso_cmd = [XISO_LINUX, "-r"]  # Liste avec 2 éléments
+
+    try:
+        # Utiliser uniquement la liste fournie (nouveaux ISO extraits). Fallback scan uniquement si liste vide.
+        provided_list = iso_files
+        iso_files = []
+        if isinstance(provided_list, (list, tuple)) and len(provided_list) > 0:
+            # Normaliser/filtrer
+            for p in provided_list:
+                try:
+                    if isinstance(p, str) and p.lower().endswith('.iso') and os.path.exists(p):
+                        iso_files.append(os.path.abspath(p))
+                except Exception:
+                    continue
+        else:
+            # Fallback: scan (ancienne logique)
+            for root, dirs, files in os.walk(dest_dir):
+                for file in files:
+                    if file.lower().endswith('.iso'):
+                        iso_files.append(os.path.join(root, file))
+
+        if not iso_files:
+            logger.warning("Aucun fichier ISO xbox trouvé")
+            return True, None
+
+        total = len(iso_files)
+        # Marquer l'état comme Conversion en cours (0%)
+        try:
+            if url:
+                # Progress dict (pour l'écran en cours)
+                if url not in config.download_progress:
+                    config.download_progress[url] = {}
+                config.download_progress[url]["status"] = "Converting"
+                config.download_progress[url]["progress_percent"] = 0
+                config.needs_redraw = True
+                # Historique
+                if isinstance(config.history, list):
+                    for entry in config.history:
+                        if entry.get("url") == url and entry.get("status") in ["Extracting", "Téléchargement", "Downloading"]:
+                            entry["status"] = "Converting"
+                            entry["progress"] = 0
+                            entry["message"] = "Xbox conversion in progress"
+                            save_history(config.history)
+                            break
+        except Exception as e:
+            logger.debug(f"MAJ statut conversion ignorée: {e}")
+
+        logger.info(f"Démarrage conversion Xbox: {total} ISO(s)")
+        for idx, iso_xbox_source in enumerate(iso_files, start=1):
+            logger.debug(f"Traitement de l'ISO Xbox: {iso_xbox_source}")
+            
+            # extract-xiso -r repackage l'ISO en place
+            # Il faut exécuter la commande depuis le dossier contenant l'ISO
+            iso_dir = os.path.dirname(iso_xbox_source)
+            iso_filename = os.path.basename(iso_xbox_source)
+            
+            # Utiliser le nom de fichier relatif et définir le répertoire de travail
+            cmd = extract_xiso_cmd + [iso_filename]
+            logger.debug(f"Exécution de la commande: {' '.join(cmd)} (cwd: {iso_dir})")
+            
+            process = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=iso_dir
+            )
+
+            if process.returncode != 0:
+                err_msg = f"Erreur lors de la conversion de l'ISO: {process.stderr}"
+                logger.error(err_msg)
+                # Mettre à jour les statuts pour éviter de rester bloqué en 'Converting'
+                try:
+                    if url:
+                        if url not in config.download_progress:
+                            config.download_progress[url] = {}
+                        config.download_progress[url]["status"] = "Error"
+                        config.download_progress[url]["message"] = process.stderr
+                        config.download_progress[url]["progress_percent"] = 0
+                        config.needs_redraw = True
+                        if isinstance(config.history, list):
+                            for entry in config.history:
+                                if entry.get("url") == url and entry.get("status") in ("Converting", "Extracting", "Téléchargement", "Downloading"):
+                                    entry["status"] = "Error"
+                                    entry["message"] = process.stderr
+                                    save_history(config.history)
+                                    break
+                except Exception:
+                    pass
+                return False, err_msg
+
+            # Vérifier que l'ISO existe toujours (extract-xiso le modifie en place)
+            if os.path.exists(iso_xbox_source):
+                logger.info(f"ISO repackagé avec succès: {iso_xbox_source}")
+                logger.debug(f"ISO converti au format XISO en place")
+                
+                # Supprimer le fichier .old créé par extract-xiso (backup)
+                old_file = iso_xbox_source + ".old"
+                if os.path.exists(old_file):
+                    try:
+                        os.remove(old_file)
+                        logger.debug(f"Fichier backup .old supprimé: {old_file}")
+                    except Exception as e:
+                        logger.warning(f"Impossible de supprimer le fichier .old: {e}")
+                
+                # Mise à jour progression de conversion (coarse-grain)
+                try:
+                    percent = int(idx / total * 100) if total > 0 else 100
+                    if url:
+                        if url not in config.download_progress:
+                            config.download_progress[url] = {}
+                        config.download_progress[url]["status"] = "Converting"
+                        config.download_progress[url]["progress_percent"] = percent
+                        config.needs_redraw = True
+                        if isinstance(config.history, list):
+                            for entry in config.history:
+                                if entry.get("url") == url and entry.get("status") == "Converting":
+                                    entry["progress"] = percent
+                                    save_history(config.history)
+                                    break
+                except Exception:
+                    pass
+            else:
+                err_msg = f"L'ISO source a disparu après conversion: {iso_xbox_source}"
+                logger.error(err_msg)
+                try:
+                    if url:
+                        if url not in config.download_progress:
+                            config.download_progress[url] = {}
+                        config.download_progress[url]["status"] = "Error"
+                        config.download_progress[url]["message"] = err_msg
+                        config.download_progress[url]["progress_percent"] = 0
+                        config.needs_redraw = True
+                        if isinstance(config.history, list):
+                            for entry in config.history:
+                                if entry.get("url") == url and entry.get("status") in ("Converting", "Extracting", "Téléchargement", "Downloading"):
+                                    entry["status"] = "Error"
+                                    entry["message"] = err_msg
+                                    save_history(config.history)
+                                    break
+                except Exception:
+                    pass
+                return False, "Échec de la conversion de l'ISO"
+
+        # Conversion terminée avec succès - mettre à jour le statut final
+        try:
+            if url:
+                if url not in config.download_progress:
+                    config.download_progress[url] = {}
+                config.download_progress[url]["status"] = "Download_OK"
+                config.download_progress[url]["progress_percent"] = 100
+                config.needs_redraw = True
+                if isinstance(config.history, list):
+                    for entry in config.history:
+                        if entry.get("url") == url and entry.get("status") == "Converting":
+                            entry["status"] = "Download_OK"
+                            entry["progress"] = 100
+                            entry["message"] = "Xbox conversion completed successfully"
+                            save_history(config.history)
+                            break
+        except Exception as e:
+            logger.debug(f"MAJ statut final conversion ignorée: {e}")
+
+        return True, "Conversion Xbox terminée avec succès"
+
+    except Exception as e:
+        logger.error(f"Erreur lors de la conversion Xbox: {str(e)}")
+        return False, f"Erreur lors de la conversion: {str(e)}"
+
+
+
+def play_random_music(music_files, music_folder, current_music=None):
+    if not getattr(config, "music_enabled", True) or not is_mixer_available():
+        if is_mixer_available():
+            pygame.mixer.music.stop()
+        return current_music
+    if music_files:
+        # Éviter de rejouer la même musique consécutivement
+        available_music = [f for f in music_files if f != current_music]
+        if not available_music:  # Si une seule musique, on la reprend
+            available_music = music_files
+        music_file = random.choice(available_music)
+        music_path = os.path.join(music_folder, music_file)
+        logger.debug(f"Lecture de la musique : {music_path}")
+        
+        def load_and_play_music():
+            try:
+                if is_mixer_available():
+                    pygame.mixer.music.load(music_path)
+                    pygame.mixer.music.set_volume(0.5)
+                    pygame.mixer.music.play(loops=0)  # Jouer une seule fois
+                    pygame.mixer.music.set_endevent(pygame.USEREVENT + 1)  # Événement de fin
+                    set_music_popup(music_file)  # Afficher le nom de la musique dans la popup
+            except Exception as e:
+                logger.error(f"Erreur lors du chargement de la musique {music_path}: {str(e)}")
+        
+        # Charger et jouer la musique dans un thread séparé pour éviter le blocage
+        music_thread = threading.Thread(target=load_and_play_music, daemon=True)
+        music_thread.start()
+        
+        return music_file  # Retourner la nouvelle musique pour mise à jour
+    else:
+        logger.debug("Aucune musique trouvée dans /RGSX/assets/music")
+        return current_music
+
+def set_music_popup(music_name):
+    """Définit le nom de la musique à afficher dans la popup."""
+    config.current_music_name = f"♬ {os.path.splitext(music_name)[0]}"  # Utilise l'emoji ♬ directement
+    config.music_popup_start_time = pygame.time.get_ticks() / 1000  # Temps actuel en secondes
+    config.needs_redraw = True  # Forcer le redraw pour afficher le nom de la musique
+
+def load_api_keys(force: bool = False):
+    """Charge les clés API (1fichier, AllDebrid, Debrid-Link, RealDebrid, TorBox) en une seule passe.
+
+    - Crée les fichiers vides s'ils n'existent pas
+    - Met à jour config.API_KEY_1FICHIER, config.API_KEY_ALLDEBRID, config.API_KEY_DEBRIDLINK, config.API_KEY_REALDEBRID, config.API_KEY_TORBOX
+    - Utilise un cache basé sur le mtime pour éviter des relectures
+    - force=True ignore le cache et relit systématiquement
+
+    Retourne: { '1fichier': str, 'alldebrid': str, 'debridlink': str, 'realdebrid': str, 'torbox': str, 'reloaded': bool }
+    """
+    try:
+        paths = {
+            '1fichier': getattr(config, 'API_KEY_1FICHIER_PATH', ''),
+            'alldebrid': getattr(config, 'API_KEY_ALLDEBRID_PATH', ''),
+            'debridlink': getattr(config, 'API_KEY_DEBRIDLINK_PATH', ''),
+            'realdebrid': getattr(config, 'API_KEY_REALDEBRID_PATH', ''),
+            'torbox': getattr(config, 'API_KEY_TORBOX_PATH', ''),
+        }
+        cache_attr = '_api_keys_cache'
+        if not hasattr(config, cache_attr):
+            setattr(config, cache_attr, {'1fichier_mtime': None, 'alldebrid_mtime': None, 'debridlink_mtime': None, 'realdebrid_mtime': None, 'torbox_mtime': None})
+        cache_data = getattr(config, cache_attr)
+        reloaded = False
+
+        for key_name, path in paths.items():
+            if not path:
+                continue
+            # Création fichier vide si absent
+            try:
+                if not os.path.exists(path):
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write("")
+            except Exception as ce:
+                logger.error(f"Impossible de préparer le fichier clé {key_name}: {ce}")
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except Exception:
+                mtime = None
+            cache_key = f"{key_name}_mtime"
+            if force or (mtime is not None and mtime != cache_data.get(cache_key)):
+                # Lecture
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        value = f.read().strip()
+                except Exception as re:
+                    logger.error(f"Erreur lecture clé {key_name}: {re}")
+                    value = ""
+                # Assignation dans config
+                if key_name == '1fichier':
+                    config.API_KEY_1FICHIER = value
+                elif key_name == 'alldebrid':
+                    config.API_KEY_ALLDEBRID = value
+                elif key_name == 'debridlink':
+                    config.API_KEY_DEBRIDLINK = value
+                elif key_name == 'realdebrid':
+                    config.API_KEY_REALDEBRID = value
+                elif key_name == 'torbox':
+                    config.API_KEY_TORBOX = value
+                cache_data[cache_key] = mtime
+                reloaded = True
+        return {
+            '1fichier': getattr(config, 'API_KEY_1FICHIER', ''),
+            'alldebrid': getattr(config, 'API_KEY_ALLDEBRID', ''),
+            'debridlink': getattr(config, 'API_KEY_DEBRIDLINK', ''),
+            'realdebrid': getattr(config, 'API_KEY_REALDEBRID', ''),
+            'torbox': getattr(config, 'API_KEY_TORBOX', ''),
+            'reloaded': reloaded
+        }
+    except Exception as e:
+        logger.error(f"Erreur load_api_keys: {e}")
+        return {
+            '1fichier': getattr(config, 'API_KEY_1FICHIER', ''),
+            'alldebrid': getattr(config, 'API_KEY_ALLDEBRID', ''),
+            'debridlink': getattr(config, 'API_KEY_DEBRIDLINK', ''),
+            'realdebrid': getattr(config, 'API_KEY_REALDEBRID', ''),
+            'torbox': getattr(config, 'API_KEY_TORBOX', ''),
+            'reloaded': False
+        }
+
+
+def load_archive_org_cookie(force: bool = False) -> str:
+    """Charge le cookie Archive.org depuis un fichier texte.
+
+    - Fichier: config.ARCHIVE_ORG_COOKIE_PATH
+    - Accepte soit une ligne brute de cookie, soit une ligne "Cookie: ..."
+    - Utilise un cache mtime pour éviter les relectures
+    """
+    try:
+        path = getattr(config, 'ARCHIVE_ORG_COOKIE_PATH', '')
+        if not path:
+            return ""
+        cache_attr = '_archive_cookie_cache'
+        if not hasattr(config, cache_attr):
+            setattr(config, cache_attr, {'mtime': None, 'value': ''})
+        cache_data = getattr(config, cache_attr)
+
+        # Créer le fichier vide si absent
+        try:
+            if not os.path.exists(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write("")
+        except Exception as ce:
+            logger.error(f"Impossible de préparer le fichier cookie archive.org: {ce}")
+            return ""
+
+        try:
+            mtime = os.path.getmtime(path)
+        except Exception:
+            mtime = None
+
+        if force or (mtime is not None and mtime != cache_data.get('mtime')):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    value = f.read().strip()
+            except Exception as re:
+                logger.error(f"Erreur lecture cookie archive.org: {re}")
+                value = ""
+
+            if value.lower().startswith("cookie:"):
+                value = value.split(":", 1)[1].strip()
+
+            cache_data['mtime'] = mtime
+            cache_data['value'] = value
+
+        return cache_data.get('value', '') or ""
+    except Exception as e:
+        logger.error(f"Erreur load_archive_org_cookie: {e}")
+        return ""
+
+
+def save_api_keys(api_keys: dict):
+    """Sauvegarde les clés API (1fichier, AllDebrid, Debrid-Link, RealDebrid, TorBox) dans leurs fichiers respectifs.
+
+    Args:
+        api_keys: dict avec les clés '1fichier', 'alldebrid', 'debridlink', 'realdebrid', 'torbox'
+    
+    Retourne: True si au moins une clé a été sauvegardée avec succès
+    """
+    if not api_keys:
+        return False
+    
+    paths = {
+        '1fichier': getattr(config, 'API_KEY_1FICHIER_PATH', ''),
+        'alldebrid': getattr(config, 'API_KEY_ALLDEBRID_PATH', ''),
+        'debridlink': getattr(config, 'API_KEY_DEBRIDLINK_PATH', ''),
+        'realdebrid': getattr(config, 'API_KEY_REALDEBRID_PATH', ''),
+        'torbox': getattr(config, 'API_KEY_TORBOX_PATH', ''),
+    }
+    
+    saved_any = False
+    
+    for key_name, path in paths.items():
+        if not path:
+            continue
+        
+        # Récupérer la valeur (utiliser la clé telle quelle ou en minuscule)
+        value = api_keys.get(key_name, api_keys.get(key_name.lower(), None))
+        if value is None:
+            continue  # Ne pas modifier si la clé n'est pas fournie
+        
+        try:
+            # Créer le dossier si nécessaire
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            
+            # Écrire la clé (valeur nettoyée)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(value.strip())
+            
+            # Mettre à jour le cache config
+            if key_name == '1fichier':
+                config.API_KEY_1FICHIER = value.strip()
+            elif key_name == 'alldebrid':
+                config.API_KEY_ALLDEBRID = value.strip()
+            elif key_name == 'debridlink':
+                config.API_KEY_DEBRIDLINK = value.strip()
+            elif key_name == 'realdebrid':
+                config.API_KEY_REALDEBRID = value.strip()
+            elif key_name == 'torbox':
+                config.API_KEY_TORBOX = value.strip()
+            
+            # Invalider le cache mtime
+            cache_attr = '_api_keys_cache'
+            if hasattr(config, cache_attr):
+                cache_data = getattr(config, cache_attr)
+                cache_data[f"{key_name}_mtime"] = None
+            
+            saved_any = True
+            logger.info(f"Clé API {key_name} sauvegardée avec succès")
+            
+        except Exception as e:
+            logger.error(f"Erreur sauvegarde clé {key_name}: {e}")
+    
+    return saved_any
+
+
+# Wrappers rétro-compatibilité (dépréciés)
+def load_api_key_1fichier(force: bool = False):  # pragma: no cover
+    return load_api_keys(force).get('1fichier', '')
+
+def load_api_key_alldebrid(force: bool = False):  # pragma: no cover
+    return load_api_keys(force).get('alldebrid', '')
+
+def load_api_key_debridlink(force: bool = False):  # pragma: no cover
+    return load_api_keys(force).get('debridlink', '')
+
+def load_api_key_realdebrid(force: bool = False):  # pragma: no cover
+    return load_api_keys(force).get('realdebrid', '')
+
+def load_api_key_torbox(force: bool = False):  # pragma: no cover
+    return load_api_keys(force).get('torbox', '')
+
+# Ancien nom conservé comme alias
+def ensure_api_keys_loaded(force: bool = False):  # pragma: no cover
+    return load_api_keys(force)
+
+# ------------------------------
+# Helpers centralisés pour gestion des fournisseurs de téléchargement
+# ------------------------------
+def build_provider_paths_string():
+    """Retourne une chaîne listant les chemins des fichiers de clés pour affichage/erreurs."""
+    return f"{getattr(config, 'API_KEY_1FICHIER_PATH', '')} or {getattr(config, 'API_KEY_ALLDEBRID_PATH', '')} or {getattr(config, 'API_KEY_DEBRIDLINK_PATH', '')} or {getattr(config, 'API_KEY_REALDEBRID_PATH', '')} or {getattr(config, 'API_KEY_TORBOX_PATH', '')}"
+
+def ensure_download_provider_keys(force: bool = False):  # pragma: no cover
+    """S'assure que les clés 1fichier/AllDebrid/Debrid-Link/RealDebrid/TorBox sont chargées et retourne le dict.
+
+    Utilise load_api_keys (cache mtime). force=True invalide le cache.
+    """
+    return load_api_keys(force)
+
+def missing_all_provider_keys():  # pragma: no cover
+    """True si aucune des clés premium n'est définie."""
+    keys = load_api_keys(False)
+    return not keys.get('1fichier') and not keys.get('alldebrid') and not keys.get('debridlink') and not keys.get('realdebrid') and not keys.get('torbox')
+
+def provider_keys_status():  # pragma: no cover
+    """Retourne un dict de présence pour debug/log."""
+    keys = load_api_keys(False)
+    return {
+        '1fichier': bool(keys.get('1fichier')),
+        'alldebrid': bool(keys.get('alldebrid')),
+        'debridlink': bool(keys.get('debridlink')),
+        'realdebrid': bool(keys.get('realdebrid')),
+        'torbox': bool(keys.get('torbox')),
+    }
+
+def load_music_config():
+    """Charge la configuration musique depuis rgsx_settings.json."""
+    try:
+        settings = load_rgsx_settings()
+        config.music_enabled = settings.get("music_enabled", True)
+        return config.music_enabled
+    except Exception as e:
+        logger.error(f"Erreur lors du chargement de la configuration musique: {str(e)}")
+    config.music_enabled = True
+    return True
+
+def save_music_config():
+    """Sauvegarde la configuration musique dans rgsx_settings.json."""
+    try:
+        settings = load_rgsx_settings()
+        settings["music_enabled"] = config.music_enabled
+        save_rgsx_settings(settings)
+        logger.debug(f"Configuration musique sauvegardée: {config.music_enabled}")
+    except Exception as e:
+        logger.error(f"Erreur lors de la sauvegarde de la configuration musique: {str(e)}")
+
+def check_web_service_status():
+    """Vérifie si le service web est activé au démarrage.
+    
+    Returns:
+        bool: True si activé, False sinon
+    """
+    try:
+        if config.OPERATING_SYSTEM != "Linux":
+            return False
+        
+        # Lire l'état depuis rgsx_settings.json
+       
+        settings = load_rgsx_settings()
+        return settings.get("web_service_at_boot", False)
+        
+    except Exception as e:
+        logger.debug(f"Failed to check web service status: {e}")
+        return False
+
+
+
+def normalize_platform_name(platform):
+    """Normalise un nom de plateforme en supprimant espaces et convertissant en minuscules."""
+    return platform.lower().replace(" ", "")
+
+
+def resolve_platform_folder(platform):
+    """Résout le dossier ROM d'une plateforme de façon fiable, même si config.platform_dicts
+    n'est pas encore chargé en mémoire (ex: reprise de téléchargement au tout début du
+    démarrage, avant l'étape 'load_sources').
+
+    Ordre de résolution :
+    1) config.platform_dicts (rapide, déjà en mémoire si chargé)
+    2) Lecture directe de config.SOURCES_FILE (systems_list.json) sur disque
+    3) normalize_platform_name(platform) en dernier recours
+
+    Utiliser cette fonction partout où le dossier ROM est déterminé à partir du nom de
+    plateforme, pour garantir un chemin identique quel que soit le moment de l'appel.
+    """
+    try:
+        for platform_dict in getattr(config, 'platform_dicts', None) or []:
+            if platform_dict.get("platform_name") == platform:
+                folder = platform_dict.get("folder") or platform_dict.get("dossier")
+                if folder:
+                    return map_rom_folder(folder)
+    except Exception as e:
+        logger.debug(f"resolve_platform_folder: erreur lecture config.platform_dicts: {e}")
+
+    try:
+        sources_file = getattr(config, 'SOURCES_FILE', '')
+        if sources_file and os.path.isfile(sources_file):
+            with open(sources_file, 'r', encoding='utf-8') as f:
+                sources = json.load(f)
+            if isinstance(sources, list):
+                for entry in sources:
+                    if isinstance(entry, dict) and entry.get("platform_name") == platform:
+                        folder = entry.get("folder") or entry.get("dossier")
+                        if folder:
+                            return map_rom_folder(folder)
+    except Exception as e:
+        logger.debug(f"resolve_platform_folder: erreur lecture {getattr(config, 'SOURCES_FILE', '')}: {e}")
+
+    logger.warning(f"resolve_platform_folder: aucun dossier trouvé pour '{platform}', repli sur normalize_platform_name")
+    return map_rom_folder(normalize_platform_name(platform))
+
+
+def find_matching_files(base_path, filename):
+    """Return all matching files for a requested download name within a ROM folder."""
+    if not base_path or not os.path.exists(base_path):
+        return []
+
+    raw_filename = str(filename or "")
+    candidate_names = []
+    for candidate in (Path(raw_filename).name, sanitize_filename(raw_filename)):
+        if candidate and candidate not in candidate_names:
+            candidate_names.append(candidate)
+
+    if not candidate_names:
+        return []
+
+    requested_variants = []
+    for candidate_name in candidate_names:
+        requested_stem, requested_ext = os.path.splitext(candidate_name)
+        requested_normalized = re.sub(r'\s+', ' ', re.sub(r'\s*[\[(][^\])]*[\])]', '', requested_stem)).strip().lower()
+        requested_variants.append((candidate_name, requested_stem, requested_ext, requested_normalized))
+
+    archive_exts = {'.zip', '.7z', '.rar', '.tar', '.gz', '.xz', '.bz2'}
+    matches = []
+    seen_paths = set()
+
+    for candidate_name, _, _, _ in requested_variants:
+        full_path = os.path.join(base_path, candidate_name)
+        if os.path.exists(full_path) and os.path.isfile(full_path):
+            normalized_path = os.path.normcase(full_path)
+            if normalized_path not in seen_paths:
+                seen_paths.add(normalized_path)
+                matches.append((1000, candidate_name, full_path))
+
+    for existing_file in os.listdir(base_path):
+        existing_path = os.path.join(base_path, existing_file)
+        if not os.path.isfile(existing_path):
+            continue
+
+        normalized_path = os.path.normcase(existing_path)
+        if normalized_path in seen_paths:
+            continue
+
+        existing_stem, existing_ext = os.path.splitext(existing_file)
+        score = None
+
+        existing_normalized = re.sub(r'\s+', ' ', re.sub(r'\s*[\[(][^\])]*[\])]', '', existing_stem)).strip().lower()
+        for _, requested_stem, requested_ext, requested_normalized in requested_variants:
+            candidate_score = None
+            if requested_stem and existing_stem == requested_stem:
+                candidate_score = 900
+            elif requested_normalized and existing_normalized and existing_normalized == requested_normalized:
+                candidate_score = 0
+                if requested_ext and existing_ext.lower() == requested_ext.lower():
+                    candidate_score += 4
+                if existing_ext.lower() not in archive_exts:
+                    candidate_score += 3
+                candidate_score -= abs(len(existing_stem) - len(requested_stem))
+
+            if candidate_score is not None:
+                score = candidate_score if score is None else max(score, candidate_score)
+
+        if score is not None:
+            seen_paths.add(normalized_path)
+            matches.append((score, existing_file, existing_path))
+
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return [(actual_filename, actual_path) for _, actual_filename, actual_path in matches]
+
+
+def get_existing_history_matches(entry):
+    """Return persisted moved paths that still exist for a history entry."""
+    if not isinstance(entry, dict):
+        return []
+
+    moved_paths = entry.get("moved_paths", []) or []
+    local_path = entry.get("local_path")
+    local_filename = entry.get("local_filename")
+    game_name = entry.get("game_name", "")
+    if local_path:
+        moved_paths = [local_path, *moved_paths]
+
+    direct_matches = []
+    direct_candidates = []
+    if local_path:
+        direct_candidates.append(str(local_path))
+
+    platform_name = (entry.get("platform") or "").strip()
+    base_path = None
+    if platform_name:
+        try:
+            base_path = os.path.join(config.ROMS_FOLDER, _get_dest_folder_name(platform_name))
+        except Exception:
+            base_path = None
+
+    if local_filename and base_path:
+        direct_candidates.append(os.path.join(base_path, str(local_filename)))
+
+    seen_direct = set()
+    for candidate in direct_candidates:
+        actual_path = os.path.abspath(str(candidate))
+        normalized_path = os.path.normcase(actual_path)
+        if normalized_path in seen_direct:
+            continue
+        seen_direct.add(normalized_path)
+        exists = os.path.isfile(actual_path)
+        if exists:
+            direct_matches.append((os.path.basename(actual_path), actual_path))
+
+    if direct_matches:
+        _clear_history_no_match_log_cooldown(game_name, platform_name)
+        return direct_matches
+
+    candidate_paths = []
+    for raw_path in moved_paths:
+        if raw_path:
+            candidate_paths.append(str(raw_path))
+    if local_filename and base_path:
+        candidate_paths.insert(0, os.path.join(base_path, str(local_filename)))
+
+    matches = []
+    seen_paths = set()
+
+    for raw_path in candidate_paths:
+        if not raw_path:
+            continue
+
+        raw_path = str(raw_path)
+        fallback_paths = [os.path.abspath(raw_path)]
+        if base_path:
+            fallback_paths.append(os.path.join(base_path, os.path.basename(raw_path)))
+
+        for actual_path in fallback_paths:
+            normalized_path = os.path.normcase(actual_path)
+            exists = os.path.isfile(actual_path)
+            if normalized_path in seen_paths or not exists:
+                continue
+
+            seen_paths.add(normalized_path)
+            matches.append((os.path.basename(actual_path), actual_path))
+            break
+
+    if not matches:
+        _log_history_no_match_once(game_name, platform_name)
+    else:
+        _clear_history_no_match_log_cooldown(game_name, platform_name)
+
+    return matches
+
+
+def remember_history_local_match(entry, actual_filename, actual_path):
+    """Persist a resolved local path for a history entry so later lookups are exact."""
+    if not isinstance(entry, dict) or not actual_path:
+        return False
+
+    absolute_path = os.path.abspath(str(actual_path))
+    filename = actual_filename or os.path.basename(absolute_path)
+    changed = False
+
+    if entry.get("local_path") != absolute_path:
+        entry["local_path"] = absolute_path
+        changed = True
+    if entry.get("local_filename") != filename:
+        entry["local_filename"] = filename
+        changed = True
+
+    moved_paths = entry.get("moved_paths")
+    if not isinstance(moved_paths, list):
+        moved_paths = []
+    if absolute_path not in moved_paths:
+        moved_paths.insert(0, absolute_path)
+        changed = True
+    entry["moved_paths"] = moved_paths
+
+    if changed:
+        try:
+            from history import save_history
+
+            save_history(config.history)
+        except Exception as e:
+            logger.debug(f"Impossible de mémoriser le chemin local de l'historique: {e}")
+    return changed
+
+
+def move_files_to_directory(file_paths, destination_dir):
+    """Move files to a destination directory, avoiding name collisions."""
+    if not destination_dir:
+        return False, [], "Destination directory is empty"
+
+    if not any(file_paths or []):
+        return False, [], "No files to move"
+
+    try:
+        os.makedirs(destination_dir, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Impossible de créer le dossier de destination {destination_dir}: {e}")
+        return False, [], str(e)
+
+    moved_matches = []
+    seen_sources = set()
+    reserved_targets = set()
+
+    for raw_source in file_paths:
+        if not raw_source:
+            continue
+
+        source_path = os.path.abspath(str(raw_source))
+        normalized_source = os.path.normcase(source_path)
+        if normalized_source in seen_sources:
+            continue
+        seen_sources.add(normalized_source)
+
+        if not os.path.isfile(source_path):
+            error_message = f"File not found: {source_path}"
+            logger.warning(error_message)
+            return False, moved_matches, error_message
+
+        source_name = os.path.basename(source_path)
+        target_path = os.path.join(destination_dir, source_name)
+        target_root, target_ext = os.path.splitext(target_path)
+        suffix = 1
+
+        while os.path.normcase(target_path) in reserved_targets or (
+            os.path.exists(target_path)
+            and os.path.normcase(target_path) != os.path.normcase(source_path)
+        ):
+            target_path = f"{target_root} ({suffix}){target_ext}"
+            suffix += 1
+
+        reserved_targets.add(os.path.normcase(target_path))
+
+        try:
+            if os.path.normcase(source_path) != os.path.normcase(target_path):
+                shutil.move(source_path, target_path)
+                logger.info(f"Fichier déplacé: {source_path} -> {target_path}")
+            else:
+                logger.debug(f"Déplacement ignoré, même chemin source/destination: {source_path}")
+            moved_matches.append((os.path.basename(target_path), target_path))
+        except Exception as e:
+            logger.error(f"Erreur lors du déplacement de {source_path} vers {target_path}: {e}")
+            return False, moved_matches, str(e)
+
+    return True, moved_matches, None
+
+
+def find_file_with_or_without_extension(base_path, filename):
+    """
+    Cherche un fichier, avec son extension ou sans (cherche jeuxxx.* si jeuxxx.zip n'existe pas).
+    Retourne (file_exists, actual_filename, actual_path).
+    """
+    candidate_name = Path(str(filename or "")).name
+    full_path = os.path.join(base_path, candidate_name)
+    matches = find_matching_files(base_path, candidate_name)
+    if matches:
+        actual_filename, actual_path = matches[0]
+        return True, actual_filename, actual_path
+
+    return False, candidate_name, full_path
