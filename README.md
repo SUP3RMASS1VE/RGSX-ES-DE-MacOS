@@ -2,7 +2,7 @@
 
 **[Discord Support](https://discord.gg/XPK8YG8XYC)** • **[Installation](#-installation)** • **[French Documentation](https://github.com/RetroGameSets/RGSX/blob/main/README_FR.md)** • **[Troubleshoot / Common Errors](https://github.com/RetroGameSets/RGSX#%EF%B8%8F-troubleshooting)** •
 
-A free, user-friendly ROM downloader for Batocera, Knulli, and RetroBat with multi-source support.
+A free, user-friendly ROM downloader for Batocera, Knulli, RetroBat, and macOS (Apple Silicon) with multi-source support.
 
 <p align="center">
   <img width="69%" alt="main" src="https://github.com/user-attachments/assets/a98f1189-9a50-4cc3-b588-3f85245640d8" />
@@ -35,6 +35,56 @@ After installation:
    - **Batocera/Knulli**: Extract `ports` folder to `/roms/`
    - **RetroBat**: Extract both `ports` and `windows` folders to `/roms/`
 3. **Refresh**: `Menu > Game Settings > Update game list`
+
+### macOS (Apple Silicon)
+Native run from source on M-series Macs (Python + pygame, no EmulationStation needed).
+1. **Prerequisites** ([Homebrew](https://brew.sh)): `brew install python@3.12 sevenzip` (optional: `brew install unar`). Python 3.10 to 3.13 is required.
+2. **Get the code**: download `RGSX_macos_arm64.zip` from the [releases](https://github.com/RetroGameSets/RGSX/releases/latest), or clone this repository.
+3. **Run**: `cd ports/RGSX && ./run_macos.sh` (creates a virtual environment and installs dependencies on first launch).
+   - `--open-web`: open the web interface in your browser once it is up
+   - `--reinstall`: recreate the virtual environment
+4. **First run notes**: if macOS blocks the files, run `xattr -dr com.apple.quarantine <RGSX folder>`. macOS may ask permission to access `~/Documents`.
+
+**Where things live:**
+- Settings, logs, controls, history: `~/Library/Application Support/RGSX`
+- ROMs: `~/ROMs` if that folder exists (ES-DE's default ROM root), otherwise `~/Documents/RGSX/roms`
+- Overrides, highest priority first: the `roms_folder` setting, then the `RGSX_CONFIG_DIR` / `RGSX_DATA_DIR` environment variables (ROMs in `$RGSX_DATA_DIR/roms`), then the defaults above
+
+**ES-DE integration (macOS):**
+- RGSX downloads into the folder names ES-DE scans. RGSX uses Batocera/RetroBat names, so on macOS these are translated:
+
+| RGSX | ES-DE | RGSX | ES-DE |
+|---|---|---|---|
+| `3ds` | `n3ds` | `lynx` | `atarilynx` |
+| `amiga500` | `amiga` | `MSX2+ (Archive)` | `msx2` |
+| `amigacdtv` | `cdtv` | `o2em` | `odyssey2` |
+| `c20` | `vic20` | `sg1000` | `sg-1000` |
+| `cplus4` | `plus4` | `wswan` | `wonderswan` |
+| `cdi` | `cdimono1` | `wswanc` | `wonderswancolor` |
+| `gamecube` | `gc` | `jaguar` | `atarijaguar` |
+
+- Other systems already use the same name. BIOS files go to the `bios` folder (`~/ROMs/BIOS` on the default case-insensitive APFS volume). Systems ES-DE does not have (`advision`, `atom`, `chihiro`, `lindbergh`, `namco2x6`, `pico`, `teknoparrot`) keep the RGSX name and need a custom ES-DE system to show up.
+- Windows/Linux/Batocera behavior is unchanged. A per-platform custom folder is never translated.
+- Settings (`rgsx_settings.json`): `"esde_folder_mapping": false` turns the translation off; `"rom_folder_map": {"gamecube": "gc", "pico": "segapico"}` adds or overrides entries (a value equal to the key disables that default).
+- Games already downloaded under an old RGSX name (for example `gamecube`) are not detected after the change. Move them to the ES-DE folder yourself; nothing is moved automatically.
+- Launch RGSX from ES-DE: `ports/RGSX/RGSX_ESDE.sh` is a launcher for the ES-DE `ports` system. Symlink it so repo updates apply (adjust the first path to where you cloned RGSX), then reload ES-DE (Menu > Other settings > Reload, or restart it):
+  ```
+  ln -s /path/to/RGSX/ports/RGSX/RGSX_ESDE.sh ~/ROMs/ports/RGSX_ESDE.sh
+  ```
+  If you copy the file instead, set `RGSX_LAUNCH_DIR` at the top of the copy to the absolute path of `ports/RGSX`. Do not overwrite `RGSX.sh`, which is the Linux/Batocera script.
+
+**Keyboard controls:** Enter = confirm, Esc = cancel, arrows = navigate, `P` = start, `F` = filter, `H` = history, `X` = clear history, Fn+Up/Down = page up/down, Backspace = delete, Space.
+
+**Web interface:** `http://localhost:5000`, local only by default. Set `RGSX_WEB_HOST=0.0.0.0` to expose it on your network (there is no authentication). If port 5000 is taken by AirPlay Receiver, turn it off in System Settings > General > AirDrop & Handoff.
+
+**macOS limitations:**
+- Torrent sources are not supported (no embedded qBittorrent)
+- PS3 Redump decryption is not supported
+- Xbox ISO repack needs `extract-xiso` on your PATH
+- RAR archives use `unrar` if installed, otherwise 7-Zip (`7zz`)
+- Batocera-only features (boot services, custom DNS) are hidden
+- All game systems are listed, since there is no EmulationStation to define the supported ones
+- Windowed by default (toggle in Settings > Display mode)
 
 ### Manual Update (if automatic update failed)
 Download latest release : [RGSX_update_latest.zip](https://github.com/RetroGameSets/RGSX/releases/latest/download/RGSX_full_latest.zip)
@@ -224,6 +274,12 @@ RGSX includes a web interface that launched automatically when using RGSX for re
 └── TorBoxAPI.txt              # TorBox API key
 ```
 
+**macOS** (instead of the `/roms` and `/saves` layout above):
+```
+~/Library/Application Support/RGSX/   # settings, controls, history, logs/, games/, images/
+~/ROMs/ or ~/Documents/RGSX/roms/     # ROMs (~/ROMs is used when it exists)
+```
+
 ---
 
 ## 🛠️ Troubleshooting
@@ -235,6 +291,8 @@ RGSX includes a web interface that launched automatically when using RGSX for re
 | Missing systems on the list? | RGSX read es_systems.cfg to show only supported systems, if you want all systems : Pause Menu > Games > Show unsupported systems |
 | App crashes | Check `/roms/ports/RGSX/logs/RGSX.log` or `/roms/windows/logs/Retrobat_RGSX_log.txt` |
 | Layout change not applied | Restart RGSX after changing layout |
+| 7zz not found (macOS) | `brew install sevenzip` |
+| Where are the logs on macOS? | `~/Library/Application Support/RGSX/logs/RGSX.log` |
 | Problem downloading some Games ? | Open Pause Menu > Settings > Connection Status. If one or more required sites are red, enable Custom DNS in Settings and reboot. Also check ISP/router protections (especially ASUS web threat blocking). |
 
 **Need help?** Share logs from `/roms/ports/RGSX/logs/` on [Discord](https://discord.gg/XPK8YG8XYC).
