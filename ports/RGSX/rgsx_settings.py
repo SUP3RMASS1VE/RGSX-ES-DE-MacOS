@@ -95,6 +95,7 @@ def load_rgsx_settings():
     }
     if _IS_MACOS:
         default_settings["web_host"] = "127.0.0.1"  # macOS: web UI local only unless changed
+        default_settings["web_port"] = 5000  # macOS: preferred web UI port (1024-65535)
     
     try:
         if os.path.exists(RGSX_SETTINGS_PATH):
@@ -135,10 +136,123 @@ def is_loopback_host(host):
 def web_access_log_lines(host, lan_ip, port):
     """macOS startup log lines about network access: list of (level, message)."""
     if is_loopback_host(host):
-        return [("info", f"Web UI is local-only (bound to {host}). Set \"web_host\": \"0.0.0.0\" in rgsx_settings.json "
-                         "(or RGSX_WEB_HOST=0.0.0.0) and restart RGSX to allow LAN access.")]
+        return [("info", f"Web UI is local-only (bound to {host}). Enable Settings > Web interface access, or set "
+                         "\"web_host\": \"0.0.0.0\" in rgsx_settings.json (or RGSX_WEB_HOST=0.0.0.0) and restart RGSX "
+                         "to allow LAN access.")]
     return [("info", f"Accès réseau: http://{lan_ip}:{port}"),
             ("warning", f"WARNING: web UI is exposed on {host} with NO authentication. Only use trusted networks.")]
+WEB_PORT_DEFAULT = 5000
+WEB_PORT_MIN = 1024
+WEB_PORT_MAX = 65535
+def normalize_web_port(value):
+    """Return a valid web port (int in 1024-65535) from an int or digit string, else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not (value.isascii() and value.isdigit()) or len(value) > 6:
+            return None
+        value = int(value)
+    if not isinstance(value, int):
+        return None
+    return value if WEB_PORT_MIN <= value <= WEB_PORT_MAX else None
+def resolve_web_port(system, env_value=None, setting_value=None):
+    """macOS preferred web port: env RGSX_WEB_PORT > settings web_port > 5000 (invalid values are skipped).
+    Other systems keep the historical 5000."""
+    if system != "Darwin":
+        return WEB_PORT_DEFAULT
+    return normalize_web_port(env_value) or normalize_web_port(setting_value) or WEB_PORT_DEFAULT
+def step_web_port(value, delta):
+    """Move a port by delta, clamped to 1024-65535 (an invalid start value counts as the default)."""
+    base = normalize_web_port(value) or WEB_PORT_DEFAULT
+    return max(WEB_PORT_MIN, min(WEB_PORT_MAX, base + int(delta)))
+def pick_free_port(host="127.0.0.1", preferred=WEB_PORT_DEFAULT):
+    """First bindable port in preferred..preferred+10 (capped at 65535), else an OS-assigned port."""
+    import socket as _socket
+    for candidate in range(preferred, min(preferred + 10, WEB_PORT_MAX) + 1):
+        probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        try:
+            probe.bind((host, candidate))
+            return candidate
+        except OSError:
+            # A bind failure with nobody listening is only a leftover TIME_WAIT (e.g. right after a web server
+            # restart, rgsx_web reuses the address), so the port is still usable. A listener (AirPlay...) means busy.
+            if not _port_has_listener(host, candidate):
+                return candidate
+            continue
+        finally:
+            probe.close()
+    probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        probe.bind((host, 0))
+        return probe.getsockname()[1]
+    finally:
+        probe.close()
+def _port_has_listener(host, port):
+    import socket as _socket
+    c = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    c.settimeout(0.5)
+    try:
+        return c.connect_ex((host, port)) == 0
+    finally:
+        c.close()
+def web_port_note_lines(requested, actual):
+    """Log lines (level, message) when the port actually used differs from the requested one."""
+    if requested == actual:
+        return []
+    return [("warning", f"Web UI port {requested} is busy; using {actual} instead.")]
+def get_web_host():
+    return normalize_web_host(load_rgsx_settings().get("web_host")) or "127.0.0.1"
+def set_web_host(host):
+    """Save web_host; returns False (nothing saved) if invalid."""
+    host = normalize_web_host(host)
+    if host is None:
+        return False
+    settings = load_rgsx_settings()
+    settings["web_host"] = host
+    save_rgsx_settings(settings)
+    return True
+def get_web_port():
+    return normalize_web_port(load_rgsx_settings().get("web_port")) or WEB_PORT_DEFAULT
+def set_web_port(port):
+    """Save web_port clamped to 1024-65535; returns the saved port, or None if not a number."""
+    if isinstance(port, bool) or not isinstance(port, int):
+        port = normalize_web_port(port) if isinstance(port, str) else None
+        if port is None:
+            return None
+    port = max(WEB_PORT_MIN, min(WEB_PORT_MAX, port))
+    settings = load_rgsx_settings()
+    settings["web_port"] = port
+    save_rgsx_settings(settings)
+    return port
+def is_network_access(host):
+    return normalize_web_host(host) is not None and not is_loopback_host(host)
+def get_lan_ip():
+    """Best-effort LAN IPv4 address (no packet is sent), or None."""
+    import socket as _socket
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        if ip and not ip.startswith("127.") and ip != "0.0.0.0":
+            return ip
+    except OSError:
+        pass
+    finally:
+        s.close()
+    try:
+        ip = _socket.gethostbyname(_socket.gethostname())
+        if ip and not ip.startswith("127."):
+            return ip
+    except OSError:
+        pass
+    return None
+def web_urls(host, port, lan_ip=None):
+    """URLs to reach the web UI: localhost, plus the LAN address when network access is on."""
+    urls = [f"http://localhost:{port}"]
+    if is_network_access(host) and lan_ip:
+        urls.append(f"http://{lan_ip}:{port}")
+    return urls
 def save_rgsx_settings(settings):
     """Sauvegarde tous les paramètres dans rgsx_settings.json."""
     from config import RGSX_SETTINGS_PATH, SAVE_FOLDER

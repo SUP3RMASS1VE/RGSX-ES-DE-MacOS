@@ -4206,6 +4206,12 @@ def draw_pause_settings_menu(screen, selected_index):
         custom_dns_status = _("settings_custom_dns_enabled") if custom_dns_enabled else _("settings_custom_dns_disabled")
         custom_dns_txt = f"{_('settings_custom_dns')} : < {custom_dns_status} >"
     
+    # macOS: web interface access + port rows
+    web_access_txt = ""
+    web_port_txt = ""
+    web_status_txt = ""
+    if config.OPERATING_SYSTEM == "Darwin":
+        web_access_txt, web_port_txt, web_status_txt = _web_settings_rows()
     api_keys_txt = _("menu_api_keys_status") if _ else "API Keys"
     connection_status_txt = _("menu_connection_status") if _ else "Connection status"
     back_txt = _("menu_back") if _ else "Back"
@@ -4216,6 +4222,8 @@ def draw_pause_settings_menu(screen, selected_index):
         options.append(web_service_txt)
     if custom_dns_txt:  # Ajouter seulement si Linux/Batocera
         options.append(custom_dns_txt)
+    if web_access_txt:  # Ajouter seulement si macOS
+        options.extend([web_access_txt, web_port_txt])
     options.extend([api_keys_txt, connection_status_txt, back_txt])
 
     # Index de l'option Dossier ROMs
@@ -4233,6 +4241,8 @@ def draw_pause_settings_menu(screen, selected_index):
         instruction_keys.append("instruction_settings_web_service")
     if custom_dns_txt:
         instruction_keys.append("instruction_settings_custom_dns")
+    if web_access_txt:
+        instruction_keys.extend(["instruction_settings_web_access", "instruction_settings_web_port"])
     instruction_keys.extend([
         "instruction_settings_api_keys",
         "instruction_settings_connection_status",
@@ -4240,9 +4250,91 @@ def draw_pause_settings_menu(screen, selected_index):
     ])
     key = instruction_keys[selected_index] if 0 <= selected_index < len(instruction_keys) else None
     instruction_text = _(key) if key else None
-    
+    if web_access_txt and key in ("instruction_settings_web_access", "instruction_settings_web_port"):
+        defaults = {
+            "instruction_settings_web_access": "Allow other devices on your network to open the web interface",
+            "instruction_settings_web_port": "Left/right: port -/+1, shoulder buttons: -/+100, confirm: apply (1024-65535)",
+        }
+        if not instruction_text or instruction_text == key:
+            instruction_text = defaults[key]
+        instruction_text = f"{instruction_text} | {web_status_txt}"
     _draw_submenu_generic(screen, _("menu_settings_category") if _ else "Settings", options, selected_index, instruction_text)
 
+_lan_ip_cache = {"ip": None, "t": 0.0}
+def _cached_lan_ip():
+    """LAN IP lookup, refreshed at most every 30s (the menu redraws often)."""
+    import time as _time
+    now = _time.monotonic()
+    if now - _lan_ip_cache["t"] > 30 or _lan_ip_cache["t"] == 0.0:
+        from rgsx_settings import get_lan_ip
+        _lan_ip_cache["ip"] = get_lan_ip()
+        _lan_ip_cache["t"] = now
+    return _lan_ip_cache["ip"]
+def _web_settings_rows():
+    """macOS: (access row, port row, status line) for the Settings menu."""
+    from rgsx_settings import get_web_host, get_web_port, is_network_access, web_urls, normalize_web_host, normalize_web_port
+    host = get_web_host()
+    saved_port = get_web_port()
+    staged = getattr(config, "web_port_staged", None)
+    shown_port = staged if staged else saved_port
+    access_val = _("settings_web_access_network", "Local network") if is_network_access(host) else _("settings_web_access_local", "This Mac only")
+    access_txt = f"{_('settings_web_access', 'Web interface access')} : < {access_val} >"
+    if normalize_web_host(os.environ.get("RGSX_WEB_HOST")):
+        access_txt += " " + _("settings_web_env_suffix", "(set by {0})").format("RGSX_WEB_HOST")
+    port_txt = f"{_('settings_web_port', 'Web interface port')} : < {shown_port} >"
+    if staged and staged != saved_port:
+        port_txt += " *"
+    if normalize_web_port(os.environ.get("RGSX_WEB_PORT")):
+        port_txt += " " + _("settings_web_env_suffix", "(set by {0})").format("RGSX_WEB_PORT")
+    rt = getattr(config, "web_runtime", None)
+    if rt and rt.get("port"):
+        urls = web_urls(rt.get("host", host), rt["port"], _cached_lan_ip())
+        status = _("settings_web_url", "Web interface: {0}").format("  ".join(urls))
+        if rt.get("requested_port") and rt["requested_port"] != rt["port"]:
+            status += " " + _("settings_web_port_busy", "(port {0} was busy)").format(rt["requested_port"])
+    else:
+        status = _("settings_web_not_running", "Web server not running")
+    return access_txt, port_txt, status
+def draw_web_access_confirm_dialog(screen):
+    """macOS: warning before exposing the (password-less) web interface to the local network."""
+    global OVERLAY
+    if OVERLAY is None or OVERLAY.get_size() != (config.screen_width, config.screen_height):
+        OVERLAY = pygame.Surface((config.screen_width, config.screen_height), pygame.SRCALPHA)
+        OVERLAY.fill((0, 0, 0, 150))
+    screen.blit(OVERLAY, (0, 0))
+    title = _("web_access_confirm_title", "Allow network access?")
+    message = _("web_access_confirm_warning",
+                "The web interface has no password. Anyone on your network will be able to use it "
+                "(browse and download games, change settings). Only enable this on a network you trust.")
+    wrapped_message = []
+    for paragraph in str(message).split("\n"):
+        lines = wrap_text(paragraph, config.small_font, config.screen_width - 160) if paragraph else [""]
+        wrapped_message.extend(lines)
+    line_height = config.small_font.get_height() + 5
+    title_height = config.font.get_height() + 10
+    text_height = len(wrapped_message) * line_height
+    button_height = max(int(config.screen_height * 0.0463), config.small_font.get_height() + 15)
+    margin_top_bottom = 20
+    rect_height = title_height + text_height + button_height + 2 * margin_top_bottom + 8
+    max_text_width = max([config.small_font.size(line)[0] for line in wrapped_message], default=420)
+    rect_width = max(max_text_width + 80, config.font.size(title)[0] + 80)
+    rect_x = (config.screen_width - rect_width) // 2
+    rect_y = (config.screen_height - rect_height) // 2
+    pygame.draw.rect(screen, THEME_COLORS["button_idle"], (rect_x, rect_y, rect_width, rect_height), border_radius=12)
+    pygame.draw.rect(screen, THEME_COLORS["border"], (rect_x, rect_y, rect_width, rect_height), 2, border_radius=12)
+    title_surface = config.font.render(title, True, THEME_COLORS["text"])
+    screen.blit(title_surface, title_surface.get_rect(center=(config.screen_width // 2, rect_y + margin_top_bottom + title_height // 2)))
+    text_top = rect_y + margin_top_bottom + title_height
+    for i, line in enumerate(wrapped_message):
+        text = config.small_font.render(line, True, THEME_COLORS["text"])
+        screen.blit(text, text.get_rect(center=(config.screen_width // 2, text_top + i * line_height + line_height // 2)))
+    button_width = min(170, (rect_width - 60) // 2)
+    yes_x = rect_x + rect_width // 2 - button_width - 10
+    no_x = rect_x + rect_width // 2 + 10
+    buttons_y = rect_y + margin_top_bottom + title_height + text_height + 8
+    sel = int(getattr(config, 'web_access_confirm_selection', 0))
+    draw_stylized_button(screen, _("button_yes"), yes_x, buttons_y, button_width, button_height, selected=sel == 1)
+    draw_stylized_button(screen, _("button_no"), no_x, buttons_y, button_width, button_height, selected=sel == 0)
 def draw_pause_api_keys_status(screen):
     screen.blit(OVERLAY, (0,0))
     keys = load_api_keys()

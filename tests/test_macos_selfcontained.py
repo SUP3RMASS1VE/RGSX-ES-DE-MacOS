@@ -816,7 +816,8 @@ class LauncherDispatchTests(unittest.TestCase):
         self.assertLess(ends[0], set_idx)
         stripped = "".join(lines[:begins[0]] + lines[ends[0] + 1:])
         head = subprocess.run(["git", "-C", ROOT, "show", "HEAD:ports/RGSX/RGSX.sh"], capture_output=True, text=True)
-        if head.returncode != 0:
+        # once the macOS block is committed, HEAD itself carries the markers: compare to the pre-macOS fixture instead
+        if head.returncode != 0 or "# >>> RGSX-MACOS-BEGIN" in head.stdout:
             fixture = os.path.join(FIXTURES, "RGSX.sh.HEAD")
             if not os.path.exists(fixture):
                 self.skipTest("no git HEAD and no fixture")

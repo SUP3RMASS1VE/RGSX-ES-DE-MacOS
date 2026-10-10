@@ -186,19 +186,20 @@ Torrent sources run through libtorrent, installed automatically on macOS 14 or n
 
 RGSX starts a small web interface for browsing and downloading from a browser.
 
-- Local only by default: `http://localhost:5000`, or the next free port up to 5010. macOS AirPlay Receiver uses port 5000 and RGSX never stops it, so you will often get `5001`.
-- The chosen port is written to `~/Library/Application Support/RGSX/web_port.txt` and logged.
+- Local only by default: `http://localhost:5000`, or the next free port up to 5010 if the chosen one is busy. macOS AirPlay Receiver uses port 5000 and RGSX never stops it, so you will often get `5001`. Pick another port in Settings, or turn AirPlay Receiver off (System Settings > General > AirDrop & Handoff).
+- The port actually used is shown in Settings, logged, and written to `~/Library/Application Support/RGSX/web_port.txt`.
 - `RGSX_OPEN_WEB=1` opens it in your browser at launch.
-- `RGSX_WEB_HOST=0.0.0.0` exposes it on your network (takes precedence over the setting below). There is no authentication, so only do this on a network you trust.
 
-To open it from a phone or another computer on your network (ES-DE cannot set environment variables, so use the setting):
+Change it from the app: open the pause menu, then Settings.
+- **Web interface access**: "This Mac only" or "Local network". Turning on network access asks you to confirm (there is no password).
+- **Web interface port**: left/right changes the port by 1, the shoulder buttons (PageUp/PageDown on a keyboard) by 100, within 1024-65535. Confirm to apply; the web server restarts right away.
+- The selected row shows the current address (`http://localhost:<port>` and, with network access on, `http://<your Mac's LAN IP>:<port>`).
 
-1. Quit RGSX and edit `~/Library/Application Support/RGSX/rgsx_settings.json`: set `"web_host": "0.0.0.0"` (the default is `"127.0.0.1"`, this Mac only).
-2. Start RGSX again (a restart is required).
-3. Open `http://<your Mac's LAN IP>:<port>` in a browser. The port is in `~/Library/Application Support/RGSX/web_port.txt` and in the log (5000, or 5001 if AirPlay Receiver holds 5000).
-4. macOS may ask whether to allow incoming connections: allow it.
+Manual alternative: edit `~/Library/Application Support/RGSX/rgsx_settings.json` with `"web_host": "0.0.0.0"` (default `"127.0.0.1"`, this Mac only) and `"web_port": 5000` (default 5000; invalid values fall back to 5000), then restart RGSX. The environment variables `RGSX_WEB_HOST` and `RGSX_WEB_PORT` override these settings (Settings then shows "set by ..."). ES-DE cannot set environment variables, so use the Settings menu there.
 
-There is no login. Anyone on the same network can use the interface, so only enable this on networks you trust. RGSX logs a WARNING when it is exposed.
+When network access is on, open `http://<your Mac's LAN IP>:<port>` from a phone or another computer. macOS may ask whether to allow incoming connections: allow it.
+
+**Warning:** there is no login. Anyone on the same network can use the interface, so only enable network access on networks you trust. RGSX logs a WARNING when it is exposed.
 
 ---
 
@@ -211,7 +212,7 @@ There is no login. Anyone on the same network can use the interface, so only ena
 | Setup error naming a host | The message names the host that could not be reached (github.com for Python, www.7-zip.org for 7-Zip, pypi.org / files.pythonhosted.org for libraries). Check your connection, VPN or firewall and launch again. |
 | "RGSX is incomplete" dialog | Re-copy the whole `ports` folder (replace the old one, do not merge). |
 | Two RGSX entries in ES-DE | An old install is still in `<ROMs>/ports`. Delete the old `RGSX` folder and any old launcher scripts, then copy the new `ports` folder. |
-| Web interface not on port 5000 | AirPlay Receiver owns 5000. RGSX uses the next free port (usually 5001). See `~/Library/Application Support/RGSX/web_port.txt`. |
+| Web interface not on port 5000 | AirPlay Receiver owns 5000. RGSX uses the next free port (usually 5001), or pick another port in Settings. See `~/Library/Application Support/RGSX/web_port.txt`. |
 | Firewall prompt on first torrent | Deny still allows downloading. Set `RGSX_TORRENT_LISTEN=off` to never get the prompt. |
 | Torrents disabled | They need macOS 14 or newer. |
 | 7-Zip is missing | Launch RGSX again with internet, it repairs itself. See `logs/bootstrap.log`. |

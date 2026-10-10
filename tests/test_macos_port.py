@@ -343,6 +343,127 @@ class RomsFolderDefault(unittest.TestCase):
             with self.subTest(system=system), tempfile.TemporaryDirectory() as home:
                 os.mkdir(os.path.join(home, "ROMs"))
                 self.assertNotEqual(os.path.realpath(_run_config(system, home)[2]), os.path.realpath(os.path.join(home, "ROMs")))
+class WebPort(unittest.TestCase):
+    def setUp(self):
+        import rgsx_settings
+        self.s = rgsx_settings
+    def test_normalize(self):
+        n = self.s.normalize_web_port
+        for ok, expected in ((1024, 1024), (65535, 65535), ("5001", 5001), (" 5002 ", 5002), (5000, 5000)):
+            self.assertEqual(n(ok), expected)
+        for bad in (80, 1023, 65536, "abc", "", "-5", "5000.5", "99999999", True, False, 5000.5, None, [5000]):
+            with self.subTest(bad=bad):
+                self.assertIsNone(n(bad))
+    def test_precedence_darwin(self):
+        r = self.s.resolve_web_port
+        self.assertEqual(r("Darwin", "5100", 5200), 5100)
+        self.assertEqual(r("Darwin", None, 5200), 5200)
+        self.assertEqual(r("Darwin", "", 5200), 5200)
+        self.assertEqual(r("Darwin", "abc", 5200), 5200)
+        self.assertEqual(r("Darwin", "80", 70000), 5000)
+        self.assertEqual(r("Darwin", None, None), 5000)
+    def test_non_darwin_unchanged(self):
+        for system in ("Linux", "Windows"):
+            self.assertEqual(self.s.resolve_web_port(system, "5100", 5200), 5000)
+    def test_step_clamps(self):
+        st = self.s.step_web_port
+        self.assertEqual(st(5000, 1), 5001)
+        self.assertEqual(st(5000, -100), 4900)
+        self.assertEqual(st(1024, -1), 1024)
+        self.assertEqual(st(1050, -100), 1024)
+        self.assertEqual(st(65535, 1), 65535)
+        self.assertEqual(st(65500, 100), 65535)
+        self.assertEqual(st(None, 1), 5001)
+    def test_default_setting_darwin_only(self):
+        code = ("import platform, sys, json;platform.system = lambda: %r;sys.path.insert(0, %r);"
+                "import rgsx_settings as s;print(json.dumps(s.load_rgsx_settings().get('web_port')))")
+        for system, expected in (("Darwin", 5000), ("Linux", None), ("Windows", None)):
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as home:
+                env = dict(os.environ, HOME=home, RGSX_HEADLESS="1", RGSX_CONFIG_DIR=os.path.join(home, "cfg"))
+                out = subprocess.run([sys.executable, "-c", code % (system, APP)], env=env,
+                                     capture_output=True, text=True, check=True)
+                self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1]), expected)
+    def test_set_get_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(config, "SAVE_FOLDER", d), \
+                 mock.patch.object(config, "RGSX_SETTINGS_PATH", os.path.join(d, "rgsx_settings.json")):
+                self.assertEqual(self.s.set_web_port(5077), 5077)
+                self.assertEqual(self.s.get_web_port(), 5077)
+                self.assertEqual(self.s.set_web_port(80), 1024)
+                self.assertEqual(self.s.set_web_port(99999), 65535)
+                self.assertEqual(self.s.set_web_port("5088"), 5088)
+                self.assertIsNone(self.s.set_web_port("abc"))
+                self.assertIsNone(self.s.set_web_port(True))
+                self.assertEqual(self.s.get_web_port(), 5088)
+                self.assertTrue(self.s.set_web_host("0.0.0.0"))
+                self.assertEqual(self.s.get_web_host(), "0.0.0.0")
+                self.assertFalse(self.s.set_web_host("evil"))
+                self.assertEqual(self.s.get_web_host(), "0.0.0.0")
+                with open(os.path.join(d, "rgsx_settings.json"), encoding="utf-8") as f:
+                    saved = json.load(f)
+                self.assertEqual((saved["web_host"], saved["web_port"]), ("0.0.0.0", 5088))
+    def test_invalid_saved_port_gives_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "rgsx_settings.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"web_port": "nope"}, f)
+            with mock.patch.object(config, "SAVE_FOLDER", d), mock.patch.object(config, "RGSX_SETTINGS_PATH", path):
+                self.assertEqual(self.s.get_web_port(), 5000)
+    def test_network_access_and_urls(self):
+        self.assertFalse(self.s.is_network_access("127.0.0.1"))
+        self.assertTrue(self.s.is_network_access("0.0.0.0"))
+        self.assertFalse(self.s.is_network_access("bogus"))
+        self.assertEqual(self.s.web_urls("127.0.0.1", 5001, "192.168.1.83"), ["http://localhost:5001"])
+        self.assertEqual(self.s.web_urls("0.0.0.0", 5001, "192.168.1.83"),
+                         ["http://localhost:5001", "http://192.168.1.83:5001"])
+        self.assertEqual(self.s.web_urls("0.0.0.0", 5001, None), ["http://localhost:5001"])
+    def test_port_note_lines(self):
+        self.assertEqual(self.s.web_port_note_lines(5000, 5000), [])
+        lines = self.s.web_port_note_lines(5000, 5001)
+        self.assertEqual(lines[0][0], "warning")
+        self.assertIn("5000", lines[0][1])
+        self.assertIn("5001", lines[0][1])
+    def test_pick_free_port_busy_fallback(self):
+        import socket
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            blocker.bind(("127.0.0.1", 0))
+            blocker.listen(1)
+            busy = blocker.getsockname()[1]
+            picked = self.s.pick_free_port("127.0.0.1", busy)
+            self.assertNotEqual(picked, busy)
+            self.assertGreater(picked, 0)
+        finally:
+            blocker.close()
+    def test_pick_free_port_top_of_range(self):
+        picked = self.s.pick_free_port("127.0.0.1", 65535)
+        self.assertTrue(1 <= picked <= 65535)
+class WebSettingsMenuRows(unittest.TestCase):
+    """Settings menu rows: Darwin adds two rows, other systems keep the historical layout."""
+    def _options(self, system, selected=0):
+        import display
+        captured = {}
+        with mock.patch.object(config, "OPERATING_SYSTEM", system), \
+             mock.patch.object(display, "_draw_submenu_generic", lambda *a, **k: captured.update(args=a)), \
+             mock.patch.object(display, "check_web_service_status", lambda: False, create=True), \
+             mock.patch.object(display, "check_custom_dns_status", lambda: False, create=True):
+            display.draw_pause_settings_menu(None, selected)
+        return captured["args"]
+    def test_row_counts(self):
+        self.assertEqual(len(self._options("Windows")[2]), 8)
+        self.assertEqual(len(self._options("Linux")[2]), 10)
+        self.assertEqual(len(self._options("Darwin")[2]), 10)
+    def test_darwin_rows(self):
+        opts = self._options("Darwin")[2]
+        self.assertIn("< This Mac only >", opts[5])
+        self.assertIn("< 5000 >", opts[6])
+        for text in self._options("Windows")[2] + self._options("Linux")[2]:
+            self.assertNotIn("Web interface", text)
+    def test_darwin_instruction_has_url(self):
+        with mock.patch.object(config, "web_runtime", {"host": "0.0.0.0", "port": 5077, "requested_port": 5000}, create=True):
+            instruction = self._options("Darwin", 6)[4]
+        self.assertIn("http://localhost:5077", instruction)
+        self.assertIn("5000", instruction)
 def tearDownModule():
     shutil.rmtree(_TMP_HOME, ignore_errors=True)
 

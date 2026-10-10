@@ -440,6 +440,7 @@ VALID_STATES = [
     "extension_warning", "pause_menu", "controls_help", "history", "controls_mapping",
     "reload_games_data", "restart_popup", "error", "loading", "confirm_clear_history",
     "reset_settings_confirm",
+    "web_access_confirm",       # macOS: avertissement avant d'ouvrir l'interface web au réseau local
     "language_select", "filter_platforms", "display_menu", "confirm_cancel_download",
     "gamelist_update_prompt", "platform_folder_config",
     # Nouveaux sous-menus hiérarchiques (refonte pause menu)
@@ -2788,6 +2789,7 @@ def handle_controls(event, sources, joystick, screen):
                     config.needs_redraw = True
                 elif config.selected_option == 4:  # Settings submenu
                     config.menu_state = "pause_settings_menu"
+                    config.web_port_staged = None  # macOS: discard any unconfirmed web port edit
                     if not hasattr(config, 'pause_settings_selection'):
                         config.pause_settings_selection = 0
                     config.last_state_change_time = pygame.time.get_ticks()
@@ -3225,6 +3227,15 @@ def handle_controls(event, sources, joystick, screen):
                 api_keys_index = 7
                 connection_status_index = 8
                 back_index = 9
+            web_access_index = -1
+            web_port_index = -1
+            if config.OPERATING_SYSTEM == "Darwin":
+                total = 10  # ... max_dl_slots, web access, web port, api keys, connection_status, back
+                web_access_index = 5
+                web_port_index = 6
+                api_keys_index = 7
+                connection_status_index = 8
+                back_index = 9
             
             if is_input_matched(event, "up"):
                 config.pause_settings_selection = (sel - 1) % total
@@ -3344,6 +3355,18 @@ def handle_controls(event, sources, joystick, screen):
                         else:
                             logger.error(f"Erreur toggle custom DNS: {message}")
                     threading.Thread(target=toggle_dns, daemon=True).start()
+                # macOS: Web interface access toggle (This Mac only / Local network)
+                elif sel == web_access_index and web_access_index >= 0 and (is_input_matched(event, "confirm") or is_input_matched(event, "left") or is_input_matched(event, "right")):
+                    _toggle_web_access()
+                # macOS: Web interface port (left/right = -/+1, confirm = apply)
+                elif sel == web_port_index and web_port_index >= 0 and (is_input_matched(event, "confirm") or is_input_matched(event, "left") or is_input_matched(event, "right")):
+                    from rgsx_settings import step_web_port, get_web_port
+                    staged = getattr(config, 'web_port_staged', None) or get_web_port()
+                    if is_input_matched(event, "confirm"):
+                        _apply_web_port(staged)
+                    else:
+                        config.web_port_staged = step_web_port(staged, -1 if is_input_matched(event, "left") else 1)
+                    config.needs_redraw = True
                 # Option API Keys
                 elif sel == api_keys_index and is_input_matched(event, "confirm"):
                     config.menu_state = "pause_api_keys_status"
@@ -3358,6 +3381,12 @@ def handle_controls(event, sources, joystick, screen):
                     config.menu_state = "pause_menu"
                     config.last_state_change_time = pygame.time.get_ticks()
                     config.needs_redraw = True
+            elif config.OPERATING_SYSTEM == "Darwin" and sel == web_port_index and (is_input_matched(event, "page_up") or is_input_matched(event, "page_down")):
+                # macOS: shoulder buttons / PageUp-PageDown move the web port by 100
+                from rgsx_settings import step_web_port, get_web_port
+                staged = getattr(config, 'web_port_staged', None) or get_web_port()
+                config.web_port_staged = step_web_port(staged, 100 if is_input_matched(event, "page_up") else -100)
+                config.needs_redraw = True
             elif is_input_matched(event, "cancel") or is_input_matched(event, "start"):
                 config.menu_state = "pause_menu"
                 config.last_state_change_time = pygame.time.get_ticks()
@@ -3892,6 +3921,22 @@ def handle_controls(event, sources, joystick, screen):
                 config.needs_redraw = True
                 logger.debug(f"Retour à {config.menu_state} depuis reload_games_data")
 
+        # macOS: avertissement avant d'activer l'accès réseau à l'interface web
+        elif config.menu_state == "web_access_confirm":
+            if is_input_matched(event, "left") or is_input_matched(event, "right"):
+                config.web_access_confirm_selection = 1 - int(getattr(config, 'web_access_confirm_selection', 0))
+                config.needs_redraw = True
+            elif is_input_matched(event, "confirm"):
+                config.menu_state = "pause_settings_menu"
+                config.needs_redraw = True
+                if int(getattr(config, 'web_access_confirm_selection', 0)) == 1:  # Yes
+                    from rgsx_settings import set_web_host
+                    if set_web_host("0.0.0.0"):
+                        logger.warning("Web UI network access enabled via settings (no authentication)")
+                        _apply_web_settings_async()
+            elif is_input_matched(event, "cancel"):
+                config.menu_state = "pause_settings_menu"
+                config.needs_redraw = True
         # Confirmation reset settings (warning + yes/no)
         elif config.menu_state == "reset_settings_confirm":
             if is_input_matched(event, "left") or is_input_matched(event, "right"):
@@ -4919,3 +4964,64 @@ def get_emergency_controls():
         "confirm_joy": {"type": "button", "button": 0},
         "cancel_joy": {"type": "button", "button": 1},
     }
+
+def _web_popup(key, default, *args):
+    text = _(key, default) if _ else default
+    if not text or text == key:
+        text = default
+    try:
+        text = text.format(*args)
+    except Exception:
+        pass
+    config.popup_message = text
+    config.popup_timer = 5000
+    config.needs_redraw = True
+
+def _apply_web_settings_async():
+    """macOS: restart the web server in a background thread, then report the port really used."""
+    def _worker():
+        cb = getattr(config, "web_restart_callback", None)
+        if cb is None:
+            _web_popup("popup_web_saved", "Saved. Restart RGSX to apply.")
+            return
+        if not cb():
+            if getattr(config, "web_restart_status", "") == "restarting":
+                _web_popup("popup_web_restart_busy", "Web server is already restarting")
+            else:
+                _web_popup("popup_web_restart_failed", "Web server could not be restarted. See the RGSX log.")
+            return
+        rt = getattr(config, "web_runtime", None) or {}
+        if rt.get("port") and rt.get("port") != rt.get("requested_port"):
+            _web_popup("popup_web_port_fallback", "Port {0} is busy, using {1} instead",
+                       rt.get("requested_port"), rt.get("port"))
+        else:
+            _web_popup("popup_web_applied", "Web interface restarted on port {0}", rt.get("port"))
+    threading.Thread(target=_worker, daemon=True).start()
+
+def _toggle_web_access():
+    """macOS: flip web_host between 127.0.0.1 and 0.0.0.0 (turning ON asks for confirmation first)."""
+    from rgsx_settings import get_web_host, set_web_host, is_network_access, normalize_web_host
+    if is_network_access(get_web_host()):
+        set_web_host("127.0.0.1")
+        logger.info("Web UI network access disabled via settings")
+        if normalize_web_host(os.environ.get("RGSX_WEB_HOST")):
+            _web_popup("popup_web_env_override", "{0} is set and overrides this setting", "RGSX_WEB_HOST")
+        else:
+            _apply_web_settings_async()
+    else:
+        config.menu_state = "web_access_confirm"
+        config.web_access_confirm_selection = 0  # 0=No, 1=Yes
+    config.needs_redraw = True
+
+def _apply_web_port(port):
+    """macOS: save the staged web port and restart the web server on it."""
+    from rgsx_settings import set_web_port, normalize_web_port
+    saved = set_web_port(port)
+    config.web_port_staged = None
+    if saved is None:
+        return
+    logger.info(f"web_port set to {saved} via settings")
+    if normalize_web_port(os.environ.get("RGSX_WEB_PORT")):
+        _web_popup("popup_web_env_override", "{0} is set and overrides this setting", "RGSX_WEB_PORT")
+    else:
+        _apply_web_settings_async()

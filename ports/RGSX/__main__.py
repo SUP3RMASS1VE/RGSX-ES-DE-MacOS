@@ -566,6 +566,15 @@ def start_web_server():
                 if _web_host != "127.0.0.1":
                     logger.warning(f"Web UI bound to {_web_host} with no authentication: trusted networks only")
                 _web_port = _pick_web_port(_web_host if _web_host not in ("0.0.0.0", "") else "127.0.0.1")
+                # precedence: env RGSX_WEB_PORT > settings web_port > 5000, then fall back to the next free port
+                from rgsx_settings import resolve_web_port, pick_free_port, web_port_note_lines
+                _web_port_requested = resolve_web_port("Darwin", os.environ.get("RGSX_WEB_PORT"),
+                                                       load_rgsx_settings().get("web_port"))
+                _web_port = pick_free_port(_web_host if _web_host not in ("0.0.0.0", "") else "127.0.0.1",
+                                           _web_port_requested)
+                for _lvl, _msg in web_port_note_lines(_web_port_requested, _web_port):
+                    getattr(logger, _lvl)(_msg)
+                config.web_runtime = {"host": _web_host, "port": _web_port, "requested_port": _web_port_requested}
                 web_server_cmd += ["--port", str(_web_port)]
                 try:
                     with open(os.path.join(config.CONFIG_FOLDER, "web_port.txt"), "w", encoding="utf-8") as _pf:
@@ -620,6 +629,26 @@ def stop_web_server():
             logger.error(f"Erreur lors de l'arrêt du serveur web: {e}")
 
 
+_web_restart_lock = threading.Lock()
+def restart_web_server():
+    """macOS: restart the web server subprocess so new web_host/web_port settings apply. Returns True on success."""
+    if config.OPERATING_SYSTEM != "Darwin":
+        return False
+    if not _web_restart_lock.acquire(blocking=False):
+        logger.info("Redémarrage du serveur web déjà en cours")
+        return False
+    try:
+        config.web_restart_status = "restarting"
+        stop_web_server()
+        config.web_runtime = None
+        ok = start_web_server()
+        config.web_restart_status = "ok" if ok else "failed"
+        if not ok:
+            stop_web_server()
+            config.web_runtime = None
+        return ok
+    finally:
+        _web_restart_lock.release()
 def _is_arm_machine() -> bool:
     machine = (platform.machine() or "").lower()
     return ("arm" in machine) or ("aarch64" in machine)
@@ -675,6 +704,8 @@ async def main():
     
     # Démarrer le serveur web en arrière-plan
     start_web_server()
+    if config.OPERATING_SYSTEM == "Darwin":
+        config.web_restart_callback = restart_web_server
     if config.OPERATING_SYSTEM == "Darwin":
         _log_roms_source()
         _maybe_show_roms_warning()
@@ -968,6 +999,11 @@ async def main():
                 (event.type == pygame.JOYHATMOTION and start_config.get("type") == "hat" and event.value == tuple(start_config.get("value") if isinstance(start_config.get("value"), list) else start_config.get("value"))) or
                 (event.type == pygame.MOUSEBUTTONDOWN and start_config.get("type") == "mouse" and event.button == start_config.get("button"))
             ):
+                if config.menu_state == "web_access_confirm":
+                    # Start cancels the network-access warning without changing anything
+                    config.menu_state = "pause_settings_menu"
+                    config.needs_redraw = True
+                    continue
                 if config.menu_state not in ["pause_menu", "controls_help", "controls_mapping", "history", "confirm_clear_history", "reset_settings_confirm"]:
                     config.previous_menu_state = config.menu_state
                     # Capturer l'état d'origine pour une sortie fiable du menu pause
@@ -1000,6 +1036,7 @@ async def main():
                 "confirm_cancel_download",
                 "reload_games_data",
                 "reset_settings_confirm",
+                "web_access_confirm",
                 # Menus historique
                 "history_game_options",
                 "history_show_folder",
@@ -1464,6 +1501,9 @@ async def main():
             elif config.menu_state == "reset_settings_confirm":
                 from display import draw_reset_settings_confirm_dialog
                 draw_reset_settings_confirm_dialog(screen)
+            elif config.menu_state == "web_access_confirm":
+                from display import draw_web_access_confirm_dialog
+                draw_web_access_confirm_dialog(screen)
             elif config.menu_state == "gamelist_update_prompt":
                 from display import draw_gamelist_update_prompt
                 draw_gamelist_update_prompt(screen)
