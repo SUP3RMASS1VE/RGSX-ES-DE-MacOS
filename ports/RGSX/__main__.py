@@ -558,7 +558,13 @@ def start_web_server():
             if config.OPERATING_SYSTEM == "Darwin":
                 # macOS: local only by default (the web UI has no authentication); RGSX_WEB_HOST overrides
                 web_server_cmd += ["--host", os.environ.get("RGSX_WEB_HOST", "127.0.0.1")]
-                _web_host = os.environ.get("RGSX_WEB_HOST", "127.0.0.1")
+                # precedence: env RGSX_WEB_HOST > settings web_host > 127.0.0.1 (invalid values skipped)
+                from rgsx_settings import load_rgsx_settings, resolve_web_host
+                _web_host = resolve_web_host("Darwin", os.environ.get("RGSX_WEB_HOST"),
+                                             load_rgsx_settings().get("web_host"))
+                web_server_cmd[-1] = _web_host
+                if _web_host != "127.0.0.1":
+                    logger.warning(f"Web UI bound to {_web_host} with no authentication: trusted networks only")
                 _web_port = _pick_web_port(_web_host if _web_host not in ("0.0.0.0", "") else "127.0.0.1")
                 web_server_cmd += ["--port", str(_web_port)]
                 try:

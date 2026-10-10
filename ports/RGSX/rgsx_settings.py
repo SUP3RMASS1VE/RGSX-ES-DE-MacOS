@@ -93,6 +93,8 @@ def load_rgsx_settings():
     "platform_custom_paths": {},  # Chemins personnalisés par plateforme
     "max_simultaneous_downloads": 5  # Limite de téléchargements simultanés
     }
+    if _IS_MACOS:
+        default_settings["web_host"] = "127.0.0.1"  # macOS: web UI local only unless changed
     
     try:
         if os.path.exists(RGSX_SETTINGS_PATH):
@@ -113,6 +115,30 @@ def load_rgsx_settings():
     return default_settings
 
 
+def normalize_web_host(value):
+    """Return a valid bind host ("0.0.0.0" or an IPv4 address) or None if invalid."""
+    import ipaddress
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(ipaddress.IPv4Address(value.strip()))
+    except ValueError:
+        return None
+def resolve_web_host(system, env_value=None, setting_value=None):
+    """macOS web bind host: env RGSX_WEB_HOST > settings web_host > 127.0.0.1 (invalid values are skipped).
+    Other systems keep the historical 0.0.0.0 bind."""
+    if system != "Darwin":
+        return "0.0.0.0"
+    return normalize_web_host(env_value) or normalize_web_host(setting_value) or "127.0.0.1"
+def is_loopback_host(host):
+    return isinstance(host, str) and (host == "localhost" or host.startswith("127."))
+def web_access_log_lines(host, lan_ip, port):
+    """macOS startup log lines about network access: list of (level, message)."""
+    if is_loopback_host(host):
+        return [("info", f"Web UI is local-only (bound to {host}). Set \"web_host\": \"0.0.0.0\" in rgsx_settings.json "
+                         "(or RGSX_WEB_HOST=0.0.0.0) and restart RGSX to allow LAN access.")]
+    return [("info", f"Accès réseau: http://{lan_ip}:{port}"),
+            ("warning", f"WARNING: web UI is exposed on {host} with NO authentication. Only use trusted networks.")]
 def save_rgsx_settings(settings):
     """Sauvegarde tous les paramètres dans rgsx_settings.json."""
     from config import RGSX_SETTINGS_PATH, SAVE_FOLDER

@@ -189,7 +189,16 @@ RGSX starts a small web interface for browsing and downloading from a browser.
 - Local only by default: `http://localhost:5000`, or the next free port up to 5010. macOS AirPlay Receiver uses port 5000 and RGSX never stops it, so you will often get `5001`.
 - The chosen port is written to `~/Library/Application Support/RGSX/web_port.txt` and logged.
 - `RGSX_OPEN_WEB=1` opens it in your browser at launch.
-- `RGSX_WEB_HOST=0.0.0.0` exposes it on your network. There is no authentication, so only do this on a network you trust.
+- `RGSX_WEB_HOST=0.0.0.0` exposes it on your network (takes precedence over the setting below). There is no authentication, so only do this on a network you trust.
+
+To open it from a phone or another computer on your network (ES-DE cannot set environment variables, so use the setting):
+
+1. Quit RGSX and edit `~/Library/Application Support/RGSX/rgsx_settings.json`: set `"web_host": "0.0.0.0"` (the default is `"127.0.0.1"`, this Mac only).
+2. Start RGSX again (a restart is required).
+3. Open `http://<your Mac's LAN IP>:<port>` in a browser. The port is in `~/Library/Application Support/RGSX/web_port.txt` and in the log (5000, or 5001 if AirPlay Receiver holds 5000).
+4. macOS may ask whether to allow incoming connections: allow it.
+
+There is no login. Anyone on the same network can use the interface, so only enable this on networks you trust. RGSX logs a WARNING when it is exposed.
 
 ---
 

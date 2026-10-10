@@ -96,6 +96,53 @@ class SettingsDefaults(unittest.TestCase):
                 self.assertEqual(_run_settings(system, home), [True, False, False])
 
 
+class WebHost(unittest.TestCase):
+    def setUp(self):
+        import rgsx_settings
+        self.s = rgsx_settings
+
+    def test_precedence_darwin(self):
+        r = self.s.resolve_web_host
+        self.assertEqual(r("Darwin", "192.168.1.5", "0.0.0.0"), "192.168.1.5")
+        self.assertEqual(r("Darwin", None, "0.0.0.0"), "0.0.0.0")
+        self.assertEqual(r("Darwin", "", "10.0.0.2"), "10.0.0.2")
+        self.assertEqual(r("Darwin", None, None), "127.0.0.1")
+
+    def test_invalid_falls_back(self):
+        r = self.s.resolve_web_host
+        for bad in ("evil", "999.1.1.1", "::1", 5, "0.0.0.0/0", "1.2.3"):
+            with self.subTest(bad=bad):
+                self.assertEqual(r("Darwin", None, bad), "127.0.0.1")
+        self.assertEqual(r("Darwin", "bogus", "0.0.0.0"), "0.0.0.0")
+
+    def test_non_darwin_unchanged(self):
+        for system in ("Linux", "Windows"):
+            self.assertEqual(self.s.resolve_web_host(system, "127.0.0.1", "127.0.0.1"), "0.0.0.0")
+
+    def test_default_setting_darwin_only(self):
+        code = ("import platform, sys, json;platform.system = lambda: %r;sys.path.insert(0, %r);"
+                "import rgsx_settings as s;print(json.dumps(s.load_rgsx_settings().get('web_host')))")
+        for system, expected in (("Darwin", "127.0.0.1"), ("Linux", None), ("Windows", None)):
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as home:
+                env = dict(os.environ, HOME=home, RGSX_HEADLESS="1", RGSX_CONFIG_DIR=os.path.join(home, "cfg"))
+                out = subprocess.run([sys.executable, "-c", code % (system, APP)], env=env,
+                                     capture_output=True, text=True, check=True)
+                self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1]), expected)
+
+    def test_log_lines_local_only(self):
+        lines = self.s.web_access_log_lines("127.0.0.1", "192.168.1.83", 5001)
+        text = " ".join(m for _l, m in lines)
+        self.assertIn("local-only", text)
+        self.assertIn("web_host", text)
+        self.assertNotIn("192.168.1.83", text)
+        self.assertNotIn("Accès réseau", text)
+
+    def test_log_lines_lan(self):
+        lines = self.s.web_access_log_lines("0.0.0.0", "192.168.1.83", 5001)
+        self.assertIn(("info", "Accès réseau: http://192.168.1.83:5001"), lines)
+        self.assertTrue(any(l == "warning" and "NO authentication" in m for l, m in lines))
+
+
 def _fake_exe(directory, name):
     path = os.path.join(directory, name)
     with open(path, "w") as f:

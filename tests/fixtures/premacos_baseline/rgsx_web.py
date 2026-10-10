@@ -2155,13 +2155,23 @@ def run_server(host='0.0.0.0', port=5000):
         s.connect(("8.8.8.8", 80))
         local_ip = s.getsockname()[0]
         s.close()
-        logger.info(f"Accès réseau: http://{local_ip}:{port}")
+        if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin':
+            from rgsx_settings import web_access_log_lines
+            for level, msg in web_access_log_lines(host, local_ip, port):
+                getattr(logger, level)(msg)
+        else:
+            logger.info(f"Accès réseau: http://{local_ip}:{port}")
     except Exception as e:
         # Fallback: méthode classique
         try:
             hostname = socket.gethostname()
             local_ip = socket.gethostbyname(hostname)
-            logger.info(f"🌍 Accès réseau: http://{local_ip}:{port}")
+            if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin':
+                from rgsx_settings import web_access_log_lines
+                for level, msg in web_access_log_lines(host, local_ip, port):
+                    getattr(logger, level)(msg)
+            else:
+                logger.info(f"🌍 Accès réseau: http://{local_ip}:{port}")
         except:
             logger.warning("⚠️ Impossible de déterminer l'IP locale")
     
