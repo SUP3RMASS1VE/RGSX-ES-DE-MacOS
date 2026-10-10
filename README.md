@@ -1,47 +1,79 @@
-# 🎮 Retro Game Sets Xtra (RGSX)
+# 🎮 RGSX for macOS (ES-DE, Apple Silicon)
 
-**[Discord Support](https://discord.gg/XPK8YG8XYC)** • **[Installation](#-installation)** • **[French Documentation](https://github.com/RetroGameSets/RGSX/blob/main/README_FR.md)** • **[Troubleshoot / Common Errors](https://github.com/RetroGameSets/RGSX#%EF%B8%8F-troubleshooting)** •
+**[Installation](#-installation)** • **[Troubleshooting](#%EF%B8%8F-troubleshooting)** • **[French Documentation](README_FR.md)** • **[Issues](https://github.com/SUP3RMASS1VE/RGSX-ES-DE-MacOS/issues)** • **[Upstream project](https://github.com/RetroGameSets/RGSX)**
 
-A free, user-friendly ROM downloader for Batocera, Knulli, and RetroBat with multi-source support.
+A free, user-friendly ROM downloader that runs inside [ES-DE](https://es-de.org) (EmulationStation Desktop Edition) on Apple Silicon Macs, with multi-source support.
+
+This repository is a **macOS-only fork** of [RetroGameSets/RGSX](https://github.com/RetroGameSets/RGSX) (Retro Game Sets Xtra), the ROM downloader for Batocera, Knulli and RetroBat. All credit for RGSX itself goes to the upstream authors and contributors. This fork only contains the macOS (Apple Silicon, arm64) port that is launched from ES-DE. For Batocera, Knulli, RetroBat or Docker, use the [upstream project](https://github.com/RetroGameSets/RGSX).
 
 <p align="center">
   <img width="69%" alt="main" src="https://github.com/user-attachments/assets/a98f1189-9a50-4cc3-b588-3f85245640d8" />
   <img width="30%" alt="controls help" src="https://github.com/user-attachments/assets/38cac7e6-14f2-4e83-91da-0679669822ee" />
 </p>
-<p align="center">
-  <img width="49%" alt="web interface" src="https://github.com/user-attachments/assets/71f8bd39-5901-45a9-82b2-91426b3c31a7" />
-  <img width="49%" alt="api menu" src="https://github.com/user-attachments/assets/5bae018d-b7d9-4a95-9f1b-77db751ff24f" />
-</p>
-
+<p align="center"><sub>Screenshots from the upstream project.</sub></p>
 
 ---
 
 ## 🚀 Installation
 
-### Quick Install (Batocera / Knulli)
+Nothing to install: no Homebrew, no terminal, no Python. RGSX downloads what it needs on first launch.
 
-**SSH or Terminal access required:**
-```bash
-curl -L bit.ly/rgsx-install | sh
-```
+1. Download the zip from this fork's [releases](https://github.com/SUP3RMASS1VE/RGSX-ES-DE-MacOS/releases/latest) (`RGSX_macos_arm64.zip`) and unzip it. Or clone the repo: `git clone https://github.com/SUP3RMASS1VE/RGSX-ES-DE-MacOS.git`.
+2. Move the `ports` folder into your ES-DE ROMs folder (default `~/ES-DE/ROMs`). Any ROMs folder works as long as RGSX ends up in `<ROMs>/ports/RGSX`. If you already have an older `ports/RGSX`, replace it instead of merging into it.
+3. In ES-DE open **Ports > RGSX**.
+4. First launch only: RGSX downloads about 60 MB. Expect a few minutes depending on your connection. A Terminal window with the progress and a small dialog appear; a blank screen for a moment is normal. Keep the Mac online. Later launches start in a couple of seconds and work offline.
+   - A leftover Terminal window after setup is normal and can be closed.
+   - ES-DE may run the script with `/bin/sh`, bash or zsh; the launcher works with all of them.
+   - Optional artwork: copy `ports/gamelist.xml` and `ports/images` to `~/ES-DE/gamelists/ports` and `~/ES-DE/downloaded_media` (RGSX never writes into `~/ES-DE`).
 
-After installation:
-1. Update game lists: `Menu > Game Settings > Update game list`
-2. Find RGSX under **PORTS** or **Homebrew and ports**
+### What RGSX sets up automatically
 
-### Manual Install (All Systems)
-1. **Download**: [RGSX_full_latest.zip](https://github.com/RetroGameSets/RGSX/releases/latest/download/RGSX_full_latest.zip)
-2. **Extract**:
-   - **Batocera/Knulli**: Extract `ports` folder to `/roms/`
-   - **RetroBat**: Extract both `ports` and `windows` folders to `/roms/`
-3. **Refresh**: `Menu > Game Settings > Update game list`
+On first launch, into `~/Library/Application Support/RGSX/runtime` (about 200 MB):
 
-### Manual Update (if automatic update failed)
-Download latest release : [RGSX_update_latest.zip](https://github.com/RetroGameSets/RGSX/releases/latest/download/RGSX_full_latest.zip)
+- A pinned Python 3.12 runtime (arm64)
+- The Python packages RGSX needs (hash-locked)
+- libtorrent, for torrent sources
+- 7-Zip (`7zz`), for archives including RAR
 
-**Installed paths:**
-- `/roms/ports/RGSX` (all systems)
-- `/roms/windows/RGSX` (RetroBat only)
+The runtime survives replacing the `ports` folder, so updating does not download it again.
+
+### Where things live
+
+- Settings, logs, controls, history, API keys: `~/Library/Application Support/RGSX`
+- Logs: `~/Library/Application Support/RGSX/logs/` (`bootstrap.log` for setup, `RGSX.log` for the app)
+- Runtime (Python, libraries, 7-Zip): `~/Library/Application Support/RGSX/runtime`
+- ROMs: the folder that contains `ports` (`<ROMs>/ports/RGSX/RGSX.sh` gives `<ROMs>`), so downloads land where ES-DE looks. If RGSX is not inside a `ports` folder it falls back to `~/ROMs` if that exists, otherwise `~/Documents/RGSX/roms`.
+- Overrides, highest priority first: the `roms_folder` setting in `rgsx_settings.json`, the `RGSX_ROMS_DIR` environment variable, the folder derived from where RGSX lives, then the defaults above.
+
+### Updating
+
+Replace the `ports` folder with the new one (delete the old `ports/RGSX` first rather than merging). Settings and the runtime live outside it and are kept.
+
+### ES-DE folder names
+
+RGSX uses Batocera/RetroBat folder names, ES-DE uses its own. RGSX translates them on macOS so games land in the folders ES-DE scans:
+
+| RGSX | ES-DE | RGSX | ES-DE |
+|---|---|---|---|
+| `3ds` | `n3ds` | `lynx` | `atarilynx` |
+| `amiga500` | `amiga` | `MSX2+ (Archive)` | `msx2` |
+| `amigacdtv` | `cdtv` | `o2em` | `odyssey2` |
+| `c20` | `vic20` | `sg1000` | `sg-1000` |
+| `cplus4` | `plus4` | `wswan` | `wonderswan` |
+| `cdi` | `cdimono1` | `wswanc` | `wonderswancolor` |
+| `gamecube` | `gc` | `jaguar` | `atarijaguar` |
+
+- Other systems already use the same name.
+- Systems ES-DE does not have (`advision`, `atom`, `chihiro`, `lindbergh`, `namco2x6`, `pico`, `teknoparrot`) keep the RGSX name and need a custom ES-DE system to show up.
+- In `rgsx_settings.json`, `"esde_folder_mapping": false` turns the translation off. `"rom_folder_map": {"gamecube": "gc", "pico": "segapico"}` adds or overrides entries (a value equal to the key disables that default).
+- Games already downloaded under an old RGSX name (for example `gamecube`) are not detected after the change. Move them to the ES-DE folder yourself; nothing is moved automatically.
+
+### Requirements
+
+- Apple Silicon Mac (M1 or newer). Intel Macs are not supported: the launcher stops with a message.
+- ES-DE for macOS.
+- Internet on the first launch (about 60 MB). Later launches work offline, except for downloading games.
+- Torrent sources need macOS 14 (Sonoma) or newer. On macOS 11 to 13 everything else works and torrents are disabled with a clear message.
 
 ---
 
@@ -50,17 +82,26 @@ Download latest release : [RGSX_update_latest.zip](https://github.com/RetroGameS
 ### First Launch
 
 - Auto-downloads system images and game lists
-- Auto-configures controls if your controller is recognized
-- **Controls broken?** Delete `/saves/ports/rgsx/controls.json` and restart
+- All game systems are listed, since there is no EmulationStation config to define the supported ones here
+- Windowed by default (toggle in Settings > Display mode)
 
-**Retrobat / first Windows launch**
+### Controls
 
-- It is recommended to launch `RGSX Retrobat.bat` manually once, outside the Retrobat interface, to verify that everything is working.
-- Allow Windows firewall prompts when they appear, especially for qBittorrent on first launch.
-- Retrobat hides some system windows by default, so a first manual launch helps avoid missing an important prompt.
-- The launcher then configures a local rule for the embedded qBittorrent binary and for the TCP `18572` WebUI.
+**Keyboard** (when no controller is detected, controls display as `[Key]` instead of icons):
 
-**Keyboard Mode**: When no controller is detected, controls display as `[Key]` instead of icons.
+| Action | Key |
+|---|---|
+| Confirm / Cancel | `Enter` / `Esc` |
+| Navigate | Arrow keys |
+| Start (pause menu) | `P` |
+| Filter | `F` |
+| History | `H` |
+| Clear history | `X` |
+| Page up / down | `Fn+↑` / `Fn+↓` |
+| Delete | `Backspace` |
+| Space | `Space` |
+
+Controllers are auto-mapped when recognized, and you can remap them from the pause menu. **Controls broken?** Delete `~/Library/Application Support/RGSX/controls.json` and restart.
 
 ### Pause Menu Structure
 
@@ -82,7 +123,6 @@ Download latest release : [RGSX_update_latest.zip](https://github.com/RetroGameS
 - Font Size submenu (general UI + footer text)
 - Font Family (Pixel or DejaVu)
 - Monitor selection (when multiple monitors are detected)
-- Screen Mode (Windows only)
 - Light Mode (performance-friendly rendering)
 - Hide Unknown Extension Warning (toggle unsupported extension warnings)
 
@@ -98,8 +138,6 @@ Download latest release : [RGSX_update_latest.zip](https://github.com/RetroGameS
 - Symlink Options (choose copy/symlink behavior)
 - Auto Extract Toggle (automatic archive extraction)
 - ROMs Folder Selector (set custom ROM root folder)
-- Web Service (Batocera/Knulli) (start web UI at boot)
-- Custom DNS (Batocera/Knulli) (workaround for ISP/domain blocking)
 - API Keys Status (check provider key presence)
 - Connection Status (test required updates/sources sites)
 
@@ -107,23 +145,23 @@ Download latest release : [RGSX_update_latest.zip](https://github.com/RetroGameS
 
 ## ✨ Features
 
-- 🎯 **Smart System Detection** – Auto-discovers supported systems from `es_systems.cfg`
-- 📦 **Intelligent Archive Handling** – Auto-extracts archives when systems don't support ZIP files
+- 📦 **Intelligent Archive Handling** – Auto-extracts archives when systems don't support ZIP files (RAR via the bundled 7-Zip)
 - 🔑 **Premium Unlocking** – 1Fichier API + AllDebrid/Debrid-Link/Real-Debrid/TorBox fallback for unlimited downloads
 - 🎨 **Fully Customizable** – Layout (3×3 to 4×4), fonts, font sizes (UI + footer), languages (EN/FR/DE/ES/IT/PT)
 - 🎮 **Controller-First Design** – Auto-mapping for popular controllers + custom remapping support
+- 🧲 **Torrent sources** – Built-in libtorrent, no extra app needed
 - 🔍 **Advanced Filtering** – Search by name, hide/show unsupported systems, filter platforms
 - 📊 **Download Management** – Queue system, history tracking, progress notifications
 - ♿ **Accessibility** – Separate font scaling for UI and footer, keyboard-only mode support
 
 > ### 🔑 API Keys Setup
-> For unlimited 1Fichier downloads, add your API key(s) to `/saves/ports/rgsx/`:
+> For unlimited 1Fichier downloads, add your API key(s) to `~/Library/Application Support/RGSX/`:
 > - `1FichierAPI.txt` – 1Fichier API key (recommended)
 > - `AllDebridAPI.txt` – AllDebrid fallback (optional)
 > - `DebridLinkAPI.txt` – Debrid-Link fallback (optional)
 > - `RealDebridAPI.txt` – Real-Debrid fallback (optional)
 > - `TorBoxAPI.txt` – TorBox fallback (optional)
-> 
+>
 > **Each file must contain ONLY the key, no extra text.**
 
 ### Downloading Games
@@ -133,96 +171,25 @@ Download latest release : [RGSX_update_latest.zip](https://github.com/RetroGameS
 3. **Queue Download**: Press `X` (West button)
 4. Track progress in **History** menu or via popup notifications
 
-## Embedded qBittorrent torrent backend
+### Torrents
 
-Torrent downloads now run through an embedded qBittorrent binary on both Windows and Linux/Batocera.
+Torrent sources run through libtorrent, installed automatically on macOS 14 or newer.
 
-- LAN debug WebUI: `http://YOUR_DEVICE_IP:18572`
-- Default credentials: `admin` / `RGSXqbt`
-- The RGSX web interface now includes a `qBittorrent` button that opens this WebUI directly.
-
-Useful notes:
-- This WebUI is intended for debugging and advanced torrent monitoring from a phone or another PC on the same local network.
-- If LAN access to the WebUI does not work, first check the local Windows firewall.
-- Do not expose port `18572` directly to the Internet: it is the WebUI admin port, not the BitTorrent performance port.
-- If torrent connectivity is poor, prefer UPnP or forwarding the actual BitTorrent listening port configured inside qBittorrent.
-
-## 🌐 Web Interface (Batocera/Knulli Only)
-
-RGSX includes a web interface that launched automatically when using RGSX for remote browsing and downloading games from any device on your network.
-
-### Accessing the Web Interface
-
-1. **Find your Batocera IP address**:
-   - Check Batocera menu: `Network Settings`
-   - Or from terminal: `ip addr show`
-
-2. **Open in browser**: `http://[BATOCERA_IP]:5000` or `http://BATOCERA:5000`
-   - Example: `http://192.168.1.100:5000`
-
-3. **Available from any device**: Phone, tablet, PC on the same network
-
-### Web Interface Features
-
-- 📱 **Mobile-Friendly** – Responsive design works on all screen sizes
-- 🔍 **Browse All Systems** – View all platforms and games
-- ⬇️ **Remote Downloads** – Queue downloads directly to your Batocera
-- 📊 **Real-Time Status** – See active downloads and history
-- 🎮 **Same Game Lists** – Uses identical sources as the main app
-
-
-### Enable/Disable Web Service at Boot, without the need to launch RGSX
-
-**From RGSX Menu**
-1. Open **Pause Menu** (Start/ALTGr)
-2. Navigate to **Settings > Web Service**
-3. Toggle **Enable at Boot**
-4. Restart your device
-
-
-**Port Configuration**: The web service runs on port `5000` by default. Ensure this port is not blocked by firewall rules.
+- Seeding only happens while RGSX is open.
+- On the first torrent the macOS firewall may ask about incoming connections. Choosing Deny still allows downloading.
+- To never get that prompt, set `RGSX_TORRENT_LISTEN=off`: RGSX then listens on loopback only and disables DHT, LSD and UPnP.
+- When seeding across volumes, a second copy of the file is kept until RGSX exits.
 
 ---
 
-## 📁 File Structure
+## 🌐 Web Interface
 
-```
-/roms/
-├── ports/
-│   ├── RGSX/
-│   │   ├── __main__.py                # Entry point
-│   │   ├── controls.py                # Input handling
-│   │   ├── display.py                 # Rendering engine
-│   │   ├── network.py                 # Download manager
-│   │   ├── rgsx_settings.py           # Settings manager
-│   │   ├── assets/controls/           # Controller profiles
-│   │   ├── languages/                 # Translations (EN/FR/DE/ES/IT/PT)
-│   │   └── logs/RGSX.log              # Runtime logs
-│   ├── gamelist.xml
-│   ├── images/
-│   └── videos/
-└── windows/
-    ├── RGSX Retrobat.bat              # Launcher for Windows only (can be used without retrobat too)
-    ├── gamelist.xml
-    ├── images/
-    └── videos/
+RGSX starts a small web interface for browsing and downloading from a browser.
 
-/saves/ports/rgsx/
-├── rgsx_settings.json        # User preferences
-├── controls.json             # Control mapping
-├── history.json              # Download history
-├── systems_list.json         # Detected systems
-├── global_search_index.json  # Global search index cache
-├── platform_games_count_cache.json
-├── torrent_manifest_cache.json
-├── games/                    # Game databases (per platform)
-├── images/                   # Platform images
-├── 1FichierAPI.txt           # 1Fichier API key
-├── AllDebridAPI.txt          # AllDebrid API key
-├── DebridLinkAPI.txt         # Debrid-Link API key
-├── RealDebridAPI.txt         # Real-Debrid API key
-└── TorBoxAPI.txt              # TorBox API key
-```
+- Local only by default: `http://localhost:5000`, or the next free port up to 5010. macOS AirPlay Receiver uses port 5000 and RGSX never stops it, so you will often get `5001`.
+- The chosen port is written to `~/Library/Application Support/RGSX/web_port.txt` and logged.
+- `RGSX_OPEN_WEB=1` opens it in your browser at launch.
+- `RGSX_WEB_HOST=0.0.0.0` exposes it on your network. There is no authentication, so only do this on a network you trust.
 
 ---
 
@@ -230,40 +197,45 @@ RGSX includes a web interface that launched automatically when using RGSX for re
 
 | Issue | Solution |
 |-------|----------|
-| Controls not working | Delete `/saves/ports/rgsx/controls.json` + restart app, you can try delete /roms/ports/RGSX/assets/controls/xx.json too |
-| No games ? | Pause Menu > Games > Update Game Cache, then check Pause Menu > Games > Filter Platforms and Show Unsupported Platforms. Check in rgsx_settings.json in `/saves/ports/rgsx/` if the value of `sources :  mode` is  `rgsx` and not `custom` |
-| Missing systems on the list? | RGSX read es_systems.cfg to show only supported systems, if you want all systems : Pause Menu > Games > Show unsupported systems |
-| App crashes | Check `/roms/ports/RGSX/logs/RGSX.log` or `/roms/windows/logs/Retrobat_RGSX_log.txt` |
-| Layout change not applied | Restart RGSX after changing layout |
-| Problem downloading some Games ? | Open Pause Menu > Settings > Connection Status. If one or more required sites are red, enable Custom DNS in Settings and reboot. Also check ISP/router protections (especially ASUS web threat blocking). |
+| Nothing happens / macOS blocks the files | Run `xattr -dr com.apple.quarantine <ports folder>` in Terminal (the launcher also tries this itself), then launch again. |
+| First launch seems stuck | The first launch downloads about 60 MB. Wait a few minutes and keep the Mac online. Check `~/Library/Application Support/RGSX/logs/bootstrap.log`. |
+| Setup error naming a host | The message names the host that could not be reached (github.com for Python, www.7-zip.org for 7-Zip, pypi.org / files.pythonhosted.org for libraries). Check your connection, VPN or firewall and launch again. |
+| "RGSX is incomplete" dialog | Re-copy the whole `ports` folder (replace the old one, do not merge). |
+| Two RGSX entries in ES-DE | An old install is still in `<ROMs>/ports`. Delete the old `RGSX` folder and any old launcher scripts, then copy the new `ports` folder. |
+| Web interface not on port 5000 | AirPlay Receiver owns 5000. RGSX uses the next free port (usually 5001). See `~/Library/Application Support/RGSX/web_port.txt`. |
+| Firewall prompt on first torrent | Deny still allows downloading. Set `RGSX_TORRENT_LISTEN=off` to never get the prompt. |
+| Torrents disabled | They need macOS 14 or newer. |
+| 7-Zip is missing | Launch RGSX again with internet, it repairs itself. See `logs/bootstrap.log`. |
+| Python or 7zz does not start | Run `xattr -dr com.apple.quarantine ~/Library/Application\ Support/RGSX/runtime` and launch again. |
+| Reset the runtime | Delete `~/Library/Application Support/RGSX/runtime`; the next launch downloads it again. |
+| Controls not working | Delete `~/Library/Application Support/RGSX/controls.json` and restart the app. |
+| No games? | Pause Menu > Games > Update Game Cache, then check Filter Platforms and Show Unsupported Platforms. In `rgsx_settings.json`, make sure `sources` > `mode` is `rgsx` and not `custom`. |
+| App crashes | Check `~/Library/Application Support/RGSX/logs/RGSX.log`. |
+| Layout change not applied | Restart RGSX after changing layout. |
+| Problem downloading some games | Open Pause Menu > Settings > Connection Status. If required sites are red, check your network, VPN, DNS and router protections. |
 
-**Need help?** Share logs from `/roms/ports/RGSX/logs/` on [Discord](https://discord.gg/XPK8YG8XYC).
+---
+
+## ⚠️ Limitations
+
+- Apple Silicon only. Intel Macs are not supported.
+- PS3 and Xbox conversions (`ps3dec`, `xdvdfs`, `extract-xiso`) are not supported; those downloads are kept as archives.
+- Batocera-only features (boot services, custom DNS) are hidden.
+- Not verified on real hardware by the fork author: a Gatekeeper block on a second Mac, and controller input on macOS (keyboard is tested).
 
 ---
 
 ## 🤝 Contributing
 
-- **Bug Reports**: Open GitHub issue with logs or post on Discord
-- **Feature Requests**: Discuss on Discord first, then open issue
-- **Code Contributions**: 
-  ```bash
-  git checkout -b feature/your-feature
-  # Test on Batocera/RetroBat
-  # Submit Pull Request
-  ```
+- **Bug reports / feature requests for this macOS fork**: open an [issue](https://github.com/SUP3RMASS1VE/RGSX-ES-DE-MacOS/issues) with the logs from `~/Library/Application Support/RGSX/logs/`.
+- Issues about Batocera, Knulli, RetroBat or the core app belong to the [upstream project](https://github.com/RetroGameSets/RGSX) (upstream Discord: [discord.gg/XPK8YG8XYC](https://discord.gg/XPK8YG8XYC)).
 
 ---
 
-## 📝 License
+## 📝 License and credits
 
-Free and open-source software. Use, modify, and distribute freely.
+RGSX is created by [RetroGameSets](https://github.com/RetroGameSets/RGSX). Upstream describes it as free and open-source software that you can use, modify and distribute freely, and this fork follows the same terms. No separate LICENSE file is present in this repository.
 
-## Thanks to all contributors, and followers of this app
-
-**If you want to support my project you can buy me a beer :  https://bit.ly/donate-to-rgsx**
-<a href="https://github.com/RetroGameSets/RGSX/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=RetroGameSets/RGSX" />
-</a>
-[![Stargazers over time](https://starchart.cc/RetroGameSets/RGSX.svg?variant=adaptive)](https://starchart.cc/RetroGameSets/RGSX)
+Thanks to all [upstream contributors](https://github.com/RetroGameSets/RGSX/graphs/contributors) and followers of the app.
 
 **Developed with ❤️ for the retro gaming community.**
