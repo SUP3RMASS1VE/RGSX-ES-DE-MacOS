@@ -49,6 +49,10 @@ Le runtime est conservé si vous remplacez le dossier `ports` : une mise à jour
 
 Remplacez le dossier `ports` par le nouveau (supprimez d'abord l'ancien `ports/RGSX` au lieu de fusionner). Les paramètres et le runtime sont hors de ce dossier et sont conservés.
 
+La mise à jour intégrée sur macOS **prévient seulement** : quand le fork publie une version plus récente, un message renvoie vers la [page des releases du fork](https://github.com/SUP3RMASS1VE/RGSX-ES-DE-MacOS/releases). Elle ne télécharge ni n'installe rien, et ne touche jamais `~/Library/Application Support/RGSX` (vos paramètres et le runtime). Téléchargez `RGSX_macos_arm64.zip` depuis la page des releases et remplacez le dossier `ports` comme ci-dessus. Le paquet de mise à jour d'upstream n'est pas prévu pour macOS et n'est jamais installé par ce fork.
+
+Ce fork est synchronisé avec RGSX upstream v2.7.0.7 (la version affichée dans l'app). Au premier lancement après la mise à jour, RGSX construit sa base locale du catalogue de jeux (`rgsx.sqlite3` dans `~/Library/Application Support/RGSX`), ce qui peut prendre un moment.
+
 ### Noms de dossiers ES-DE
 
 RGSX utilise les noms de dossiers Batocera/RetroBat, ES-DE les siens. Sur macOS RGSX les traduit pour que les jeux arrivent dans les dossiers scannés par ES-DE :
@@ -119,7 +123,7 @@ Les manettes sont mappées automatiquement si elles sont reconnues, et vous pouv
 - Remapper les contrôles (reconfigurer clavier/manette)
 
 **Affichage**
-- Disposition (3×3, 3×4, 4×3, 4×4)
+- Disposition (3×3 jusqu'à 8×6)
 - Sous-menu taille de police (interface générale + pied de page)
 - Famille de police (Pixel ou DejaVu)
 - Sélection du moniteur (si plusieurs sont détectés)
@@ -147,7 +151,7 @@ Les manettes sont mappées automatiquement si elles sont reconnues, et vous pouv
 
 - 📦 **Gestion intelligente des archives** – Extraction automatique quand un système ne supporte pas les ZIP (RAR via le 7-Zip intégré)
 - 🔑 **Déblocage premium** – API 1Fichier + AllDebrid/Debrid-Link/Real-Debrid/TorBox en secours pour des téléchargements illimités
-- 🎨 **Entièrement personnalisable** – Disposition (3×3 à 4×4), polices, tailles (interface + pied de page), langues (EN/FR/DE/ES/IT/PT)
+- 🎨 **Entièrement personnalisable** – Disposition (3×3 jusqu'à 8×6), polices, tailles (interface + pied de page), langues (EN/FR/DE/ES/IT/PT/TR)
 - 🎮 **Pensé pour la manette** – Mapping automatique des manettes courantes + remappage personnalisé
 - 🧲 **Sources torrent** – libtorrent intégré, aucune application supplémentaire
 - 🔍 **Filtrage avancé** – Recherche par nom, affichage/masquage des systèmes non supportés, filtre de plateformes
@@ -219,7 +223,7 @@ Avec l'accès réseau activé, ouvrez `http://<IP locale de votre Mac>:<port>` d
 | Python ou 7zz ne démarre pas | Exécutez `xattr -dr com.apple.quarantine ~/Library/Application\ Support/RGSX/runtime` puis relancez. |
 | Réinitialiser le runtime | Supprimez `~/Library/Application Support/RGSX/runtime` ; le prochain lancement le retélécharge. |
 | Contrôles qui ne fonctionnent pas | Supprimez `~/Library/Application Support/RGSX/controls.json` et relancez l'application. |
-| Pas de jeux ? | Menu pause > Jeux > Mettre à jour le cache, puis vérifiez Filtrer les plateformes et Afficher les plateformes non supportées. Dans `rgsx_settings.json`, vérifiez que `sources` > `mode` vaut `rgsx` et non `custom`. |
+| Pas de jeux ? | Menu pause > Jeux > Mettre à jour le cache, puis vérifiez Filtrer les plateformes et Afficher les plateformes non supportées. La liste des jeux vient du service de catalogue RGSX, une connexion internet est donc nécessaire la première fois. |
 | L'application plante | Consultez `~/Library/Application Support/RGSX/logs/RGSX.log`. |
 | Changement de disposition non appliqué | Relancez RGSX après avoir changé la disposition. |
 | Problème de téléchargement de certains jeux | Menu pause > Paramètres > État de la connexion. Si des sites requis sont en rouge, vérifiez réseau, VPN, DNS et protections du routeur. |

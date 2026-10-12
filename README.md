@@ -49,6 +49,10 @@ The runtime survives replacing the `ports` folder, so updating does not download
 
 Replace the `ports` folder with the new one (delete the old `ports/RGSX` first rather than merging). Settings and the runtime live outside it and are kept.
 
+The in-app updater on macOS only **notifies**: when the fork publishes a newer version it shows a message pointing to the [fork's releases page](https://github.com/SUP3RMASS1VE/RGSX-ES-DE-MacOS/releases). It never downloads or installs anything, and it never touches `~/Library/Application Support/RGSX` (your settings and runtime). Download `RGSX_macos_arm64.zip` from the releases page and replace the `ports` folder as above. Upstream's own update package is not for macOS and is never installed by this fork.
+
+This fork is synced with upstream RGSX v2.7.0.7 (the version shown in the app). On first launch after the upgrade RGSX builds its local game catalog database (`rgsx.sqlite3` in `~/Library/Application Support/RGSX`), which can take a moment.
+
 ### ES-DE folder names
 
 RGSX uses Batocera/RetroBat folder names, ES-DE uses its own. RGSX translates them on macOS so games land in the folders ES-DE scans:
@@ -119,7 +123,7 @@ Controllers are auto-mapped when recognized, and you can remap them from the pau
 - Remap Controls (reconfigure keyboard/controller mapping)
 
 **Display**
-- Layout (3×3, 3×4, 4×3, 4×4)
+- Layout (3×3 up to 8×6)
 - Font Size submenu (general UI + footer text)
 - Font Family (Pixel or DejaVu)
 - Monitor selection (when multiple monitors are detected)
@@ -147,7 +151,7 @@ Controllers are auto-mapped when recognized, and you can remap them from the pau
 
 - 📦 **Intelligent Archive Handling** – Auto-extracts archives when systems don't support ZIP files (RAR via the bundled 7-Zip)
 - 🔑 **Premium Unlocking** – 1Fichier API + AllDebrid/Debrid-Link/Real-Debrid/TorBox fallback for unlimited downloads
-- 🎨 **Fully Customizable** – Layout (3×3 to 4×4), fonts, font sizes (UI + footer), languages (EN/FR/DE/ES/IT/PT)
+- 🎨 **Fully Customizable** – Layout (3×3 up to 8×6), fonts, font sizes (UI + footer), languages (EN/FR/DE/ES/IT/PT/TR)
 - 🎮 **Controller-First Design** – Auto-mapping for popular controllers + custom remapping support
 - 🧲 **Torrent sources** – Built-in libtorrent, no extra app needed
 - 🔍 **Advanced Filtering** – Search by name, hide/show unsupported systems, filter platforms
@@ -219,7 +223,7 @@ When network access is on, open `http://<your Mac's LAN IP>:<port>` from a phone
 | Python or 7zz does not start | Run `xattr -dr com.apple.quarantine ~/Library/Application\ Support/RGSX/runtime` and launch again. |
 | Reset the runtime | Delete `~/Library/Application Support/RGSX/runtime`; the next launch downloads it again. |
 | Controls not working | Delete `~/Library/Application Support/RGSX/controls.json` and restart the app. |
-| No games? | Pause Menu > Games > Update Game Cache, then check Filter Platforms and Show Unsupported Platforms. In `rgsx_settings.json`, make sure `sources` > `mode` is `rgsx` and not `custom`. |
+| No games? | Pause Menu > Games > Update Game Cache, then check Filter Platforms and Show Unsupported Platforms. The game list comes from the RGSX catalog service, so an internet connection is needed the first time. |
 | App crashes | Check `~/Library/Application Support/RGSX/logs/RGSX.log`. |
 | Layout change not applied | Restart RGSX after changing layout. |
 | Problem downloading some games | Open Pause Menu > Settings > Connection Status. If required sites are red, check your network, VPN, DNS and router protections. |

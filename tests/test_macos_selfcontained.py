@@ -1335,6 +1335,140 @@ class WebTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------------
+class UpdaterTests(unittest.TestCase):
+    """macOS updater is notify-only and reads the fork's version.json; other OSes keep upstream behavior."""
+
+    def setUp(self):
+        import network
+        self.network = network
+        self.save = tempfile.mkdtemp(prefix="rgsx_upd_save_")
+        self.settings = os.path.join(self.save, "rgsx_settings.json")
+        _write(self.settings, '{"web_host": "0.0.0.0", "web_port": 5001}')
+        self.before = _read(self.settings)
+        self.addCleanup(shutil.rmtree, self.save, True)
+
+    def _run(self, coro):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def _resp(self, version):
+        r = mock.Mock(status_code=200, headers={"content-type": "application/json"})
+        r.json.return_value = {"version": version}
+        r.raise_for_status.return_value = None
+        return r
+
+    def test_darwin_apply_pending_update_does_nothing_on_disk(self):
+        n = self.network
+        with mock.patch.object(config, "OPERATING_SYSTEM", "Darwin"), \
+                mock.patch.object(config, "SAVE_FOLDER", self.save), \
+                mock.patch.object(config, "RGSX_SETTINGS_PATH", self.settings), \
+                mock.patch.object(n.requests, "get") as get, mock.patch.object(n.zipfile, "ZipFile") as zf, \
+                mock.patch.object(n.shutil, "copy2") as cp, mock.patch.object(n.os, "makedirs") as mk, \
+                mock.patch.object(n, "extract_update") as ex:
+            ok, msg = self._run(n.apply_pending_update("9.9.9.9"))
+        self.assertTrue(ok)
+        self.assertIn(config.FORK_RELEASES_URL, msg)
+        for m in (get, zf, cp, mk, ex):
+            m.assert_not_called()
+        self.assertEqual(config.pending_update_version, "")
+        self.assertEqual(_read(self.settings), self.before)
+
+    def test_darwin_check_for_updates_only_requests_fork_endpoint(self):
+        n = self.network
+        with mock.patch.object(config, "OPERATING_SYSTEM", "Darwin"), mock.patch.object(config, "app_version", "2.7.0.7"), \
+                mock.patch.object(n.requests, "get", return_value=self._resp("2.7.0.7.1")) as get:
+            self._run(n.check_for_updates())
+        urls = [c.args[0] for c in get.call_args_list]
+        self.assertEqual(urls, [config.FORK_VERSION_ENDPOINT])
+        self.assertEqual(config.pending_update_version, "2.7.0.7.1")
+        self.assertIn(config.FORK_RELEASES_URL, config.text_file_content)
+        self.assertNotIn("api.github.com", " ".join(urls))
+
+    def test_darwin_same_version_means_no_update(self):
+        n = self.network
+        with mock.patch.object(config, "OPERATING_SYSTEM", "Darwin"), mock.patch.object(config, "app_version", "2.7.0.7"), \
+                mock.patch.object(n.requests, "get", return_value=self._resp("2.7.0.7")):
+            config.pending_update_version = ""
+            self._run(n.check_for_updates())
+        self.assertEqual(config.pending_update_version, "")
+
+    def test_non_darwin_check_for_updates_keeps_upstream_endpoints(self):
+        n = self.network
+        for system in ("Linux", "Windows"):
+            with self.subTest(system=system), mock.patch.object(config, "OPERATING_SYSTEM", system), \
+                    mock.patch.object(n.requests, "get", side_effect=n.requests.exceptions.ConnectionError("x")) as get, \
+                    mock.patch.object(n.asyncio, "sleep", new=mock.AsyncMock()):
+                self._run(n.check_for_updates())
+            urls = [c.args[0] for c in get.call_args_list]
+            self.assertIn(config.OTA_VERSION_ENDPOINT, urls)
+            self.assertIn("https://retrogamesets.fr/softs/version.json", urls)
+            self.assertNotIn(config.FORK_VERSION_ENDPOINT, urls)
+
+    def test_non_darwin_apply_pending_update_still_downloads_upstream_zip(self):
+        n = self.network
+        with mock.patch.object(config, "OPERATING_SYSTEM", "Linux"), \
+                mock.patch.object(n, "UPDATE_FOLDER", os.path.join(self.save, "upd")), \
+                mock.patch.object(n.requests, "get", side_effect=RuntimeError("stop")) as get:
+            with self.assertRaises(RuntimeError):
+                self._run(n.apply_pending_update("9.9.9.9"))
+        self.assertEqual(get.call_args.args[0], config.OTA_UPDATE_ZIP)
+
+    def test_darwin_extract_update_refuses_upstream_url(self):
+        n = self.network
+        zpath = os.path.join(self.save, "u.zip")
+        import zipfile
+        with zipfile.ZipFile(zpath, "w") as z:
+            z.writestr("evil.txt", "x")
+        dest = os.path.join(self.save, "dest")
+        with mock.patch.object(config, "OPERATING_SYSTEM", "Darwin"):
+            ok, _msg = n.extract_update(zpath, dest, config.OTA_UPDATE_ZIP)
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(dest))
+
+    def test_fork_constants_and_version_json(self):
+        self.assertTrue(config.FORK_VERSION_ENDPOINT.startswith("https://raw.githubusercontent.com/SUP3RMASS1VE/RGSX-ES-DE-MacOS/"))
+        self.assertTrue(config.FORK_UPDATE_ZIP.endswith("/RGSX_macos_arm64.zip"))
+        data = json.loads(_read(os.path.join(ROOT, "version.json")))
+        self.assertEqual(data["version"], config.app_version)
+        self.assertEqual(data.get("variant"), "macos")
+        self.assertTrue(all(p.isdigit() for p in config.app_version.split(".")))
+
+    def test_new_i18n_key_in_all_languages(self):
+        langs = os.path.join(APP, "languages")
+        for name in os.listdir(langs):
+            if name.endswith(".json"):
+                with self.subTest(lang=name):
+                    text = json.loads(_read(os.path.join(langs, name)))["network_update_macos_manual"]
+                    self.assertIn("{url}", text)
+
+
+class SettingsMigrationTests(unittest.TestCase):
+    def test_roundtrip_keeps_unknown_and_our_keys_and_fills_new_defaults(self):
+        import rgsx_settings
+        save = tempfile.mkdtemp(prefix="rgsx_mig_")
+        self.addCleanup(shutil.rmtree, save, True)
+        path = os.path.join(save, "rgsx_settings.json")
+        saved = {"language": "fr", "sources": {"mode": "rgsx", "custom_url": ""}, "web_host": "0.0.0.0", "web_port": 5001,
+                 "display": {"grid": "3x4", "background_theme": "midnight", "light_mode": True}, "global_sort_option": "date_asc"}
+        _write(path, json.dumps(saved))
+        with mock.patch.object(config, "RGSX_SETTINGS_PATH", path), mock.patch.object(config, "SAVE_FOLDER", save), \
+                mock.patch.object(rgsx_settings, "_IS_MACOS", True):
+            loaded = rgsx_settings.load_rgsx_settings()
+            for key, value in saved.items():
+                self.assertEqual(loaded[key], value, key)
+            self.assertIn("max_simultaneous_downloads", loaded)  # default filled in
+            self.assertEqual(rgsx_settings.get_global_sort_option(loaded), "date_asc")
+            rgsx_settings.save_rgsx_settings(loaded)
+            again = json.loads(_read(path))
+        for key, value in saved.items():
+            self.assertEqual(again[key], value, key)
+        self.assertIn((8, 6), rgsx_settings.DISPLAY_GRID_LAYOUTS)
+
+
 class RegressionGuardTests(unittest.TestCase):
     GUARDED = ("rgsx_web.py", "network.py", "__main__.py", "qbittorrent_backend.py", "utils.py", "config.py", "controls.py", "RGSX.sh", "requirements.txt")
 
