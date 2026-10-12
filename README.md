@@ -6,11 +6,7 @@ A free, user-friendly ROM downloader that runs inside [ES-DE](https://es-de.org)
 
 This repository is a **macOS-only fork** of [RetroGameSets/RGSX](https://github.com/RetroGameSets/RGSX) (Retro Game Sets Xtra), the ROM downloader for Batocera, Knulli and RetroBat. All credit for RGSX itself goes to the upstream authors and contributors. This fork only contains the macOS (Apple Silicon, arm64) port that is launched from ES-DE. For Batocera, Knulli, RetroBat or Docker, use the [upstream project](https://github.com/RetroGameSets/RGSX).
 
-<p align="center">
-  <img width="69%" alt="main" src="https://github.com/user-attachments/assets/a98f1189-9a50-4cc3-b588-3f85245640d8" />
-  <img width="30%" alt="controls help" src="https://github.com/user-attachments/assets/38cac7e6-14f2-4e83-91da-0679669822ee" />
-</p>
-<p align="center"><sub>Screenshots from the upstream project.</sub></p>
+<img width="1718" height="1064" alt="Screenshot 2026-10-10 at 15 49 09" src="https://github.com/user-attachments/assets/3d937ed4-0696-4c42-beb1-3a250ebdbc30" />
 
 ---
 
