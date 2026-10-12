@@ -681,6 +681,62 @@ class RomsRootTests(unittest.TestCase):
         self.assertTrue(os.path.isdir(real))
         self.assertEqual(got, [roms, "derived"])
 
+    def _cfg_stderr(self, env):
+        code = ("import platform, sys;platform.system = lambda: 'Darwin';"
+                f"sys.path.insert(0, {APP!r});import config;print(config.ROMS_FOLDER, config.ROMS_FOLDER_SOURCE)")
+        e = {k: v for k, v in os.environ.items() if not k.startswith("RGSX_")}
+        e.update(HOME=self.home, RGSX_HEADLESS="1")
+        e.update(env)
+        res = subprocess.run([sys.executable, "-c", code], env=e, capture_output=True, text=True, check=True)
+        return res.stdout.split(), res.stderr
+
+    def test_nested_ports_folder_derives_outermost_root_and_warns(self):
+        roms = self.tree("ROMs")
+        launcher = self.launcher(os.path.join(roms, "ports"))  # <ROMs>/ports/ports/RGSX/RGSX.sh
+        self.assertTrue(launcher.endswith(os.path.join("ROMs", "ports", "ports", "RGSX", "RGSX.sh")))
+        self.assertEqual(_cfg("Darwin", self.home, {"RGSX_LAUNCHER_PATH": launcher}), [roms, "derived"])
+        out, err = self._cfg_stderr({"RGSX_LAUNCHER_PATH": launcher})
+        self.assertEqual(out, [roms, "derived"])
+        self.assertIn("nested ports folder detected", err)
+
+    def test_triple_nested_ports(self):
+        roms = self.tree("ROMs")
+        launcher = self.launcher(os.path.join(roms, "ports", "ports"))
+        self.assertEqual(_cfg("Darwin", self.home, {"RGSX_LAUNCHER_PATH": launcher}), [roms, "derived"])
+
+    def test_normal_layout_has_no_nested_warning(self):
+        roms = self.tree("ROMs")
+        out, err = self._cfg_stderr({"RGSX_LAUNCHER_PATH": self.launcher(roms)})
+        self.assertEqual(out, [roms, "derived"])
+        self.assertNotIn("nested ports folder", err)
+
+    def test_nested_through_symlink(self):
+        roms = self.tree("ROMs")
+        inner = self.tree("disk", "ports", "RGSX")  # real dir holding RGSX
+        outer = self.tree("ROMs", "ports")
+        os.symlink(os.path.join(self.t, "disk", "ports"), os.path.join(outer, "ports"))  # <ROMs>/ports/ports -> disk/ports
+        self.assertTrue(os.path.isdir(inner))
+        launcher = os.path.join(outer, "ports", "RGSX", "RGSX.sh")
+        out, err = self._cfg_stderr({"RGSX_LAUNCHER_PATH": launcher})
+        self.assertEqual(out, [roms, "derived"])
+        self.assertIn("nested ports folder detected", err)
+
+    def test_ports_segment_elsewhere_is_not_consumed(self):
+        roms = self.tree("x", "ports", "projects", "ROMs")
+        self.assertEqual(_cfg("Darwin", self.home, {"RGSX_LAUNCHER_PATH": self.launcher(roms)}), [roms, "derived"])
+        # non-consecutive: <ROMs>/ports/other/ports/RGSX -> <ROMs>/ports/other
+        base = self.tree("ROMs2", "ports", "other")
+        got = _cfg("Darwin", self.home, {"RGSX_LAUNCHER_PATH": self.launcher(base)})
+        self.assertEqual(got, [base, "derived"])
+        out, err = self._cfg_stderr({"RGSX_LAUNCHER_PATH": self.launcher(base)})
+        self.assertNotIn("nested ports folder", err)
+
+    def test_launcher_directly_in_nested_ports(self):
+        roms = self.tree("ROMs")
+        ports = self.tree("ROMs", "ports", "ports")
+        got = _cfg("Darwin", self.home, {"RGSX_LAUNCHER_PATH": os.path.join(ports, "RGSX.sh")})
+        self.assertEqual(got, [roms, "derived"])
+
     def test_launcher_directly_in_ports(self):
         roms = self.tree("ROMs")
         ports = self.tree("ROMs", "ports")

@@ -188,6 +188,7 @@ RGSX starts a small web interface for browsing and downloading from a browser.
 
 - Local only by default: `http://localhost:5000`, or the next free port up to 5010 if the chosen one is busy. macOS AirPlay Receiver uses port 5000 and RGSX never stops it, so you will often get `5001`. Pick another port in Settings, or turn AirPlay Receiver off (System Settings > General > AirDrop & Handoff).
 - The port actually used is shown in Settings, logged, and written to `~/Library/Application Support/RGSX/web_port.txt`.
+- Quitting RGSX stops the web interface too, even after a crash or `kill`; a leftover server from an earlier session is stopped at the next start.
 - `RGSX_OPEN_WEB=1` opens it in your browser at launch.
 
 Change it from the app: open the pause menu, then Settings.
@@ -212,6 +213,7 @@ When network access is on, open `http://<your Mac's LAN IP>:<port>` from a phone
 | Setup error naming a host | The message names the host that could not be reached (github.com for Python, www.7-zip.org for 7-Zip, pypi.org / files.pythonhosted.org for libraries). Check your connection, VPN or firewall and launch again. |
 | "RGSX is incomplete" dialog | Re-copy the whole `ports` folder (replace the old one, do not merge). |
 | Two RGSX entries in ES-DE | An old install is still in `<ROMs>/ports`. Delete the old `RGSX` folder and any old launcher scripts, then copy the new `ports` folder. |
+| Downloads go to `ROMs/ports/<system>` | You copied `ports` inside `ports`. The folder must be `<ROMs>/ports/RGSX`. Move it, or set `roms_folder` in `rgsx_settings.json`. |
 | Web interface not on port 5000 | AirPlay Receiver owns 5000. RGSX uses the next free port (usually 5001), or pick another port in Settings. See `~/Library/Application Support/RGSX/web_port.txt`. |
 | Firewall prompt on first torrent | Deny still allows downloading. Set `RGSX_TORRENT_LISTEN=off` to never get the prompt. |
 | Torrents disabled | They need macOS 14 or newer. |

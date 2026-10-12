@@ -53,18 +53,32 @@ def get_application_root():
 
 
 ### macOS: ROMs root derived from the launcher location (ES-DE layout: <ROMs>/ports/RGSX/RGSX.sh)
-def _roms_root_from_dir(_d):
-    """Rules 1-2: <ROMs>/ports/RGSX -> <ROMs>; <ROMs>/ports -> <ROMs>. Case-insensitive (APFS)."""
+def _ports_levels(_d):
+    """Return (ports_dir, levels): the OUTERMOST directory of a consecutive 'ports' chain and its length, or (None, 0).
+    <ROMs>/ports/RGSX -> (<ROMs>/ports, 1); <ROMs>/ports/ports/RGSX (ports copied inside ports) -> (<ROMs>/ports, 2)."""
     _d = os.path.normpath(_d)
     _base = os.path.basename(_d).lower()
     _parent = os.path.dirname(_d)
     if _base == "rgsx" and os.path.basename(_parent).lower() == "ports":
-        return os.path.dirname(_parent)
-    if _base == "ports":
-        return _parent
-    return None
+        _ports = _parent
+    elif _base == "ports":
+        _ports = _d
+    else:
+        return None, 0
+    _levels = 1
+    while os.path.basename(os.path.dirname(_ports)).lower() == "ports":
+        _ports = os.path.dirname(_ports)
+        _levels += 1
+    return _ports, _levels
+_nested_ports_launcher = None
+def _roms_root_from_dir(_d):
+    """Rules 1-2: <ROMs>/ports/RGSX -> <ROMs>; <ROMs>/ports -> <ROMs>. Case-insensitive (APFS).
+    A nested <ROMs>/ports/ports/RGSX skips the extra 'ports' levels and still gives <ROMs>."""
+    _ports, _levels = _ports_levels(_d)
+    return os.path.dirname(_ports) if _ports else None
 def _derive_roms_from_launcher():
     """Return the ES-DE ROMs root implied by where RGSX lives, or None. macOS only."""
+    global _nested_ports_launcher
     try:
         _launcher = os.environ.get("RGSX_LAUNCHER_PATH", "").strip()
         _candidates = []
@@ -79,6 +93,8 @@ def _derive_roms_from_launcher():
         for _cand in _candidates:
             _root = _roms_root_from_dir(_cand)
             if _root and os.path.isdir(_root) and not os.path.lexists(os.path.join(_root, ".git")):
+                if _ports_levels(_cand)[1] > 1:
+                    _nested_ports_launcher = _launcher or os.path.abspath(__file__)
                 return _root
     except Exception:
         pass
@@ -190,6 +206,10 @@ if platform.system() == "Darwin":
         if _derived_roms:
             _default_roms_folder = _derived_roms
             _roms_src = "derived"
+            if _nested_ports_launcher:
+                logging.getLogger(__name__).warning(
+                    f"nested ports folder detected ({_nested_ports_launcher}); using ROMs root {_derived_roms}. "
+                    "Move the inner ports folder so RGSX lives in <ROMs>/ports/RGSX")
         elif _macos_default_dirs and _default_roms_folder == os.path.join(os.path.expanduser("~"), "ROMs"):
             _roms_src = "home_default"
         else:

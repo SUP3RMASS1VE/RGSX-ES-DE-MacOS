@@ -241,23 +241,37 @@ index 3d72fc4..229c047 100644
 +    elif config.OPERATING_SYSTEM == "Darwin":
 +        logger.debug("Mise à jour liste des jeux EmulationStation ignorée sur macOS")
 diff --git a/ports/RGSX/config.py b/ports/RGSX/config.py
-index 0b9bfe4..8d3b053 100644
+index 0b9bfe4..faa1ca7 100644
 --- a/ports/RGSX/config.py
 +++ b/ports/RGSX/config.py
-@@ -54,0 +55,31 @@ def get_application_root():
+@@ -54,0 +55,47 @@ def get_application_root():
 +### macOS: ROMs root derived from the launcher location (ES-DE layout: <ROMs>/ports/RGSX/RGSX.sh)
-+def _roms_root_from_dir(_d):
-+    """Rules 1-2: <ROMs>/ports/RGSX -> <ROMs>; <ROMs>/ports -> <ROMs>. Case-insensitive (APFS)."""
++def _ports_levels(_d):
++    """Return (ports_dir, levels): the OUTERMOST directory of a consecutive 'ports' chain and its length, or (None, 0).
++    <ROMs>/ports/RGSX -> (<ROMs>/ports, 1); <ROMs>/ports/ports/RGSX (ports copied inside ports) -> (<ROMs>/ports, 2)."""
 +    _d = os.path.normpath(_d)
 +    _base = os.path.basename(_d).lower()
 +    _parent = os.path.dirname(_d)
 +    if _base == "rgsx" and os.path.basename(_parent).lower() == "ports":
-+        return os.path.dirname(_parent)
-+    if _base == "ports":
-+        return _parent
-+    return None
++        _ports = _parent
++    elif _base == "ports":
++        _ports = _d
++    else:
++        return None, 0
++    _levels = 1
++    while os.path.basename(os.path.dirname(_ports)).lower() == "ports":
++        _ports = os.path.dirname(_ports)
++        _levels += 1
++    return _ports, _levels
++_nested_ports_launcher = None
++def _roms_root_from_dir(_d):
++    """Rules 1-2: <ROMs>/ports/RGSX -> <ROMs>; <ROMs>/ports -> <ROMs>. Case-insensitive (APFS).
++    A nested <ROMs>/ports/ports/RGSX skips the extra 'ports' levels and still gives <ROMs>."""
++    _ports, _levels = _ports_levels(_d)
++    return os.path.dirname(_ports) if _ports else None
 +def _derive_roms_from_launcher():
 +    """Return the ES-DE ROMs root implied by where RGSX lives, or None. macOS only."""
++    global _nested_ports_launcher
 +    try:
 +        _launcher = os.environ.get("RGSX_LAUNCHER_PATH", "").strip()
 +        _candidates = []
@@ -272,11 +286,13 @@ index 0b9bfe4..8d3b053 100644
 +        for _cand in _candidates:
 +            _root = _roms_root_from_dir(_cand)
 +            if _root and os.path.isdir(_root) and not os.path.lexists(os.path.join(_root, ".git")):
++                if _ports_levels(_cand)[1] > 1:
++                    _nested_ports_launcher = _launcher or os.path.abspath(__file__)
 +                return _root
 +    except Exception:
 +        pass
 +    return None
-@@ -76,2 +107,8 @@ _docker_data_dir = os.environ.get("RGSX_DATA_DIR", "").strip()
+@@ -76,2 +123,8 @@ _docker_data_dir = os.environ.get("RGSX_DATA_DIR", "").strip()
 -
 -# Determine if we're running in Docker mode
 +_macos_default_dirs = False  # True only when the macOS per-user defaults below were injected
@@ -287,11 +303,11 @@ index 0b9bfe4..8d3b053 100644
 +    _docker_data_dir = os.path.join(os.path.expanduser("~"), "Documents", "RGSX")
 +    _macos_default_dirs = True
 +# Determine if we're running in Docker mode (or macOS per-user mode)
-@@ -127,0 +165,3 @@ INSTALLATION_PATH_WARNING = not _is_docker_mode and not _has_expected_installati
+@@ -127,0 +181,3 @@ INSTALLATION_PATH_WARNING = not _is_docker_mode and not _has_expected_installati
 +if platform.system() == "Darwin":
 +    # macOS: ES-DE ROMs root may be any folder (<ROMs>/ports/RGSX); never show the Batocera-style path warning
 +    INSTALLATION_PATH_WARNING = False
-@@ -132,0 +173,24 @@ _default_roms_folder = os.path.join(DATA_FOLDER if _is_docker_mode else USERDATA
+@@ -132,0 +189,28 @@ _default_roms_folder = os.path.join(DATA_FOLDER if _is_docker_mode else USERDATA
 +# macOS + ES-DE: default to ~/ROMs (ES-DE's default ROM root) when it exists and RGSX_DATA_DIR/RGSX_CONFIG_DIR
 +# were not set explicitly. A roms_folder in rgsx_settings.json still wins (handled below).
 +if _macos_default_dirs and os.path.isdir(os.path.join(os.path.expanduser("~"), "ROMs")):
@@ -312,11 +328,15 @@ index 0b9bfe4..8d3b053 100644
 +        if _derived_roms:
 +            _default_roms_folder = _derived_roms
 +            _roms_src = "derived"
++            if _nested_ports_launcher:
++                logging.getLogger(__name__).warning(
++                    f"nested ports folder detected ({_nested_ports_launcher}); using ROMs root {_derived_roms}. "
++                    "Move the inner ports folder so RGSX lives in <ROMs>/ports/RGSX")
 +        elif _macos_default_dirs and _default_roms_folder == os.path.join(os.path.expanduser("~"), "ROMs"):
 +            _roms_src = "home_default"
 +        else:
 +            _roms_src = "data_default"
-@@ -167,0 +232,9 @@ except Exception as _e:
+@@ -167,0 +252,9 @@ except Exception as _e:
 +if platform.system() == "Darwin":
 +    # settings | env | derived | home_default | data_default (a settings path equal to the default reports the default's source)
 +    ROMS_FOLDER_SOURCE = "settings" if ROMS_FOLDER != _default_roms_folder else _roms_src
@@ -326,9 +346,9 @@ index 0b9bfe4..8d3b053 100644
 +            f"(expected <ROMs>/ports/RGSX/RGSX.sh); using {ROMS_FOLDER} ({ROMS_FOLDER_SOURCE})")
 +    else:
 +        logging.getLogger(__name__).info(f"ROMS_FOLDER={ROMS_FOLDER} (source: {ROMS_FOLDER_SOURCE})")
-@@ -190,0 +264 @@ connection_status_progress = {"done": 0, "total": 0}
+@@ -190,0 +284 @@ connection_status_progress = {"done": 0, "total": 0}
 +# macOS: ~/Library/Application Support/RGSX/logs
-@@ -244,0 +319,10 @@ OTA_VERSION_ENDPOINT = "https://raw.githubusercontent.com/RetroGameSets/RGSX/ref
+@@ -244,0 +339,10 @@ OTA_VERSION_ENDPOINT = "https://raw.githubusercontent.com/RetroGameSets/RGSX/ref
 +# --- macOS fork (SUP3RMASS1VE/RGSX-ES-DE-MacOS) ---
 +# The fork keeps upstream's numeric version (no suffix: the update check compares numeric parts only).
 +# The variant marker below + "variant" in version.json identify the fork. On Darwin the updater reads the
@@ -339,7 +359,7 @@ index 0b9bfe4..8d3b053 100644
 +FORK_RELEASES_URL = f"https://github.com/{FORK_REPO}/releases"
 +FORK_VERSION_ENDPOINT = f"https://raw.githubusercontent.com/{FORK_REPO}/refs/heads/main/version.json"
 +FORK_UPDATE_ZIP = f"{FORK_RELEASES_URL}/latest/download/RGSX_macos_arm64.zip"
-@@ -301,0 +386,4 @@ SEVEN_Z_EXE = os.path.join(APP_FOLDER,"assets", "progs", "7z.exe")
+@@ -301,0 +406,4 @@ SEVEN_Z_EXE = os.path.join(APP_FOLDER,"assets", "progs", "7z.exe")
 +# macOS: 7zz installed by macos/rgsx-macos into the runtime dir (RGSX_SEVENZIP overrides)
 +SEVEN_Z_DARWIN = os.environ.get("RGSX_SEVENZIP", "").strip() or os.path.join(
 +    os.environ.get("RGSX_RUNTIME_DIR", "").strip() or os.path.join(os.path.expanduser("~"), "Library", "Application Support", "RGSX", "runtime"),

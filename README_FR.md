@@ -192,6 +192,7 @@ RGSX démarre une petite interface web pour parcourir et télécharger depuis un
 
 - Locale par défaut : `http://localhost:5000`, ou le port libre suivant jusqu'à 5010 si le port choisi est occupé. Le récepteur AirPlay de macOS utilise le port 5000 et RGSX ne l'arrête jamais : vous aurez souvent `5001`. Choisissez un autre port dans les Paramètres, ou désactivez le récepteur AirPlay (Réglages Système > Général > AirDrop et Handoff).
 - Le port réellement utilisé est affiché dans les Paramètres, journalisé et écrit dans `~/Library/Application Support/RGSX/web_port.txt`.
+- Quitter RGSX arrête aussi l'interface web, même après un plantage ou un `kill` ; un serveur resté d'une session précédente est arrêté au démarrage suivant.
 - `RGSX_OPEN_WEB=1` ouvre l'interface dans le navigateur au lancement.
 
 Modifiable depuis l'application : menu pause, puis Paramètres.
@@ -216,6 +217,7 @@ Avec l'accès réseau activé, ouvrez `http://<IP locale de votre Mac>:<port>` d
 | Erreur d'installation citant un hôte | Le message nomme l'hôte injoignable (github.com pour Python, www.7-zip.org pour 7-Zip, pypi.org / files.pythonhosted.org pour les bibliothèques). Vérifiez connexion, VPN ou pare-feu et relancez. |
 | Boîte « RGSX is incomplete » | Recopiez tout le dossier `ports` (remplacez l'ancien, ne fusionnez pas). |
 | Deux entrées RGSX dans ES-DE | Une ancienne installation est restée dans `<ROMs>/ports`. Supprimez l'ancien dossier `RGSX` et les anciens scripts de lancement, puis copiez le nouveau dossier `ports`. |
+| Les téléchargements vont dans `ROMs/ports/<système>` | Vous avez copié `ports` dans `ports`. Le dossier doit être `<ROMs>/ports/RGSX`. Déplacez-le, ou définissez `roms_folder` dans `rgsx_settings.json`. |
 | Interface web pas sur le port 5000 | AirPlay occupe 5000. RGSX prend le port libre suivant (souvent 5001), ou choisissez un autre port dans les Paramètres. Voir `~/Library/Application Support/RGSX/web_port.txt`. |
 | Demande du pare-feu au premier torrent | Refuser permet quand même de télécharger. Définissez `RGSX_TORRENT_LISTEN=off` pour ne plus l'avoir. |
 | Torrents désactivés | Ils nécessitent macOS 14 ou plus récent. |
