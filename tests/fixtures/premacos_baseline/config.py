@@ -1,8 +1,11 @@
 
 import os
+import json
 import logging
 import platform
 import socket
+import sys
+import urllib.request
 from typing import Optional
 from dataclasses import dataclass
 
@@ -15,11 +18,14 @@ class Game:
     regions: Optional[list[str]] = None
     is_non_release: Optional[bool] = None
     base_name: Optional[str] = None
+    updated_at: Optional[str] = None
 
 # Headless mode for CLI: set env RGSX_HEADLESS=1 to avoid pygame and noisy prints
 HEADLESS = os.environ.get("RGSX_HEADLESS") == "1"
 try:
-    if not HEADLESS:
+    # The graphical entry point imports pygame before config. Keep that module
+    # available even if the CLI environment variable was inherited by mistake.
+    if not HEADLESS or "pygame" in sys.modules:
         import pygame  # type: ignore
     else:
         pygame = None  # type: ignore
@@ -27,7 +33,7 @@ except Exception:
     pygame = None  # type: ignore
 
 # Version actuelle de l'application
-app_version = "2.6.5.8"
+app_version = "2.7.0.7"
 
 # Nombre de jours avant de proposer la mise à jour de la liste des jeux
 GAMELIST_UPDATE_DAYS = 1
@@ -46,6 +52,20 @@ def get_application_root():
         return os.path.abspath(os.getcwd())
 
 
+def _has_expected_installation_layout(app_folder: str) -> bool:
+    path_parts = [
+        part.casefold()
+        for part in os.path.normpath(app_folder).replace("\\", "/").split("/")
+        if part
+    ]
+    expected_suffix = ["roms", "ports", "rgsx"]
+    roms_ports_count = sum(
+        path_parts[index:index + 2] == ["roms", "ports"]
+        for index in range(len(path_parts) - 1)
+    )
+    return path_parts[-3:] == expected_suffix and roms_ports_count == 1
+
+
 ### CONSTANTES DES CHEMINS DE BASE
 
 
@@ -53,7 +73,6 @@ def get_application_root():
 _docker_app_dir = os.environ.get("RGSX_APP_DIR", "").strip()
 _docker_config_dir = os.environ.get("RGSX_CONFIG_DIR", "").strip()
 _docker_data_dir = os.environ.get("RGSX_DATA_DIR", "").strip()
-_macos_default_dirs = False  # True only when the macOS per-user defaults below were injected
 
 # macOS: per-user locations. Reuses the external-dirs branch below; RGSX_CONFIG_DIR / RGSX_DATA_DIR still override.
 if platform.system() == "Darwin" and not (_docker_config_dir or _docker_data_dir):
@@ -110,14 +129,12 @@ else:
     SAVE_FOLDER = CONFIG_FOLDER
     DATA_FOLDER = USERDATA_FOLDER
 
+INSTALLATION_PATH_WARNING = not _is_docker_mode and not _has_expected_installation_layout(APP_FOLDER)
+
 # ROMS_FOLDER - Can be customized via rgsx_settings.json
 
 # Default ROM location
 _default_roms_folder = os.path.join(DATA_FOLDER if _is_docker_mode else USERDATA_FOLDER, "roms")
-# macOS + ES-DE: default to ~/ROMs (ES-DE's default ROM root) when it exists and RGSX_DATA_DIR/RGSX_CONFIG_DIR
-# were not set explicitly. A roms_folder in rgsx_settings.json still wins (handled below).
-if _macos_default_dirs and os.path.isdir(os.path.join(os.path.expanduser("~"), "ROMs")):
-    _default_roms_folder = os.path.join(os.path.expanduser("~"), "ROMs")
 
 try:
     # Try to load custom roms_folder from settings
@@ -176,7 +193,6 @@ connection_status_progress = {"done": 0, "total": 0}
 
 # Log directory
 # Docker mode: /config/logs (persisted in config volume)
-# macOS: ~/Library/Application Support/RGSX/logs
 # Traditional mode: /app/RGSX/logs (current behavior)
 if _is_docker_mode:
     log_dir = os.path.join(CONFIG_FOLDER, "logs")
@@ -196,23 +212,20 @@ GAMELISTXML_WINDOWS = os.path.join(ROMS_FOLDER, "windows","gamelist.xml")
 # Dans le Dossier de sauvegarde : /saves/ports/rgsx (traditional) or /config (Docker)
 IMAGES_FOLDER = os.path.join(SAVE_FOLDER, "images")
 
-# GAME_LISTS_FOLDER: Platform game database JSON files (extracted from games.zip)
-# Always in SAVE_FOLDER/games for both Docker and Traditional modes
-# These are small JSON files containing available games per platform
-GAME_LISTS_FOLDER = os.path.join(SAVE_FOLDER, "games")
+# Local SQLite cache for the HTTPS catalog and user-specific state.
+DB_PATH = os.path.join(SAVE_FOLDER, "rgsx.sqlite3")
 
-# Legacy alias for backwards compatibility (some code still uses GAMES_FOLDER)
-GAMES_FOLDER = GAME_LISTS_FOLDER
+# Public read-only catalog API. The database credentials stay on the PHP server.
+CATALOG_SYNC_URL = os.environ.get(
+    "RGSX_CATALOG_SYNC_URL",
+    "https://retrogamesets.fr/rgsx/manager/rgsx_catalog_api.php",
+).strip()
+CATALOG_SYNC_TIMEOUT_SEC = int(os.environ.get("RGSX_CATALOG_SYNC_TIMEOUT", "30"))
 
-SOURCES_FILE = os.path.join(SAVE_FOLDER, "systems_list.json")
-JSON_EXTENSIONS = os.path.join(SAVE_FOLDER, "rom_extensions.json")
 PRECONF_CONTROLS_PATH = os.path.join(APP_FOLDER, "assets", "controls")
 CONTROLS_CONFIG_PATH = os.path.join(SAVE_FOLDER, "controls.json")
 HISTORY_PATH = os.path.join(SAVE_FOLDER, "history.json")
 DOWNLOADED_GAMES_PATH = os.path.join(SAVE_FOLDER, "downloaded_games.json")
-TORRENT_MANIFEST_CACHE_PATH = os.path.join(SAVE_FOLDER, "torrent_manifest_cache.json")
-PLATFORM_GAME_COUNT_CACHE_PATH = os.path.join(SAVE_FOLDER, "platform_games_count_cache.json")
-GLOBAL_SEARCH_INDEX_CACHE_PATH = os.path.join(SAVE_FOLDER, "global_search_index.json")
 PENDING_TORRENT_REFRESH_MARKER_PATH = os.path.join(SAVE_FOLDER, "pending_torrent_refresh.marker")
 RGSX_SETTINGS_PATH = os.path.join(SAVE_FOLDER, "rgsx_settings.json")
 API_KEY_1FICHIER_PATH = os.path.join(SAVE_FOLDER, "1FichierAPI.txt")
@@ -234,10 +247,6 @@ GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
 OTA_UPDATE_ZIP = f"{GITHUB_RELEASES_URL}/latest/download/RGSX_update_latest.zip"
 OTA_UPDATE_WINDOWS_ZIP = f"{GITHUB_RELEASES_URL}/latest/download/RGSX_update_windows_latest.zip"
 OTA_VERSION_ENDPOINT = "https://raw.githubusercontent.com/RetroGameSets/RGSX/refs/heads/main/version.json"  # Endpoint pour vérifier la version disponible
-
-# URLs legacy (conservées pour compatibilité)
-OTA_SERVER_URL = "https://retrogamesets.fr/softs/"
-OTA_data_ZIP = os.path.join(OTA_SERVER_URL, "games.zip")
 
 # Sites testés dans le menu pause_connection_status.
 # Pour personnaliser: modifier cette liste (ajouter/supprimer/changer URL, label, catégorie).
@@ -414,10 +423,7 @@ if not HEADLESS:
     print(f"SAVE_FOLDER: {SAVE_FOLDER}")
     print(f"RGSX LOGS_FOLDER: {log_dir}")
     print(f"RGSX SETTINGS PATH: {RGSX_SETTINGS_PATH}")
-    print(f"JSON_EXTENSIONS: {JSON_EXTENSIONS}")
     print(f"IMAGES_FOLDER: {IMAGES_FOLDER}")
-    print(f"GAMES_FOLDER: {GAMES_FOLDER}")
-    print(f"SOURCES_FILE: {SOURCES_FILE}")
 
 # Récupérer les informations système au démarrage
 get_batocera_system_info()
@@ -467,6 +473,11 @@ platform_names = {}  # {platform_id: platform_name}
 games_count = {}  # Dictionnaire comptant le nombre de jeux par plateforme
 games_count_log_verbose = False  # Log détaillé par fichier (sinon résumé compact)
 platform_dicts = []  # Liste des dictionnaires de plateformes
+platform_sources = {}  # mapping clé interne de plateforme -> source séparée
+platform_groups = []  # Systèmes regroupés par nom d'affichage, avec leurs plateformes par source
+platform_group_index = {}  # nom interne de plateforme -> index de groupe affiché
+platform_source_group_index = 0  # Groupe ouvert dans le sélecteur de source
+platform_source_selected = 0  # Source sélectionnée dans le sélecteur
 
 # Filtre plateformes
 selected_filter_index = 0  # index dans la liste visible triée
@@ -497,8 +508,6 @@ transition_state = "idle"  # État de la transition d'écran
 transition_progress = 0.0  # Progression de la transition (0.0 à 1.0)
 transition_duration = 18  # Durée de la transition en frames
 music_enabled = True  # Par défaut la musique est activée
-sources_mode = "rgsx"  # Mode des sources de jeux (rgsx/custom)
-custom_sources_url = {OTA_data_ZIP}  # URL personnalisée si mode custom
 selected_language_index = 0  # Index de la langue sélectionnée dans la liste
 
 
@@ -510,6 +519,10 @@ filter_active = False  # Indicateur si un filtre est appliqué
 global_search_index = []  # Index de recherche global {platform, jeu} construit a l'ouverture
 global_search_results = []  # Resultats de la recherche globale inter-plateformes
 global_search_query = ""  # Texte saisi pour la recherche globale
+global_search_source_items = []
+global_search_source_signature = None
+global_search_applied_query = ""
+global_search_applied_signature = None
 global_search_selected = 0  # Index du resultat global selectionne
 global_search_scroll_offset = 0  # Offset de defilement des resultats globaux
 global_search_editing = False  # True si le clavier virtuel est actif pour la recherche globale
@@ -626,6 +639,14 @@ try:
 except Exception as e:
     logging.getLogger(__name__).debug(f"Impossible de charger la famille de police sauvegardée: {e}")
 
+def _resolve_font_family(family_id):
+    """Bell-centennial.otf n'a pas ğ Ğ İ ş Ş : on bascule sur DejaVu pour le turc."""
+    if family_id == "bell_centennial":
+        import language  # import tardif : language importe config
+        if language.current_language == "tr":
+            return "dejavu"
+    return family_id
+
 def init_font():
     """Initialise les polices après pygame.init() en fonction de la famille choisie."""
     global font, progress_font, title_font, search_font, small_font
@@ -633,6 +654,7 @@ def init_font():
 
     # Déterminer la famille sélectionnée
     family_id = FONT_FAMILIES[current_font_family_index] if 0 <= current_font_family_index < len(FONT_FAMILIES) else "pixel"
+    family_id = _resolve_font_family(family_id)
 
 
     def load_family(fam: str):
@@ -692,6 +714,7 @@ def init_footer_font():
     
     # Déterminer la famille sélectionnée
     family_id = FONT_FAMILIES[current_font_family_index] if 0 <= current_font_family_index < len(FONT_FAMILIES) else "pixel"
+    family_id = _resolve_font_family(family_id)
     
     footer_base_size = 20  # Taille de base pour le footer
     

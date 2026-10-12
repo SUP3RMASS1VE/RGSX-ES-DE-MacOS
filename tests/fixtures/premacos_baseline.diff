@@ -1,23 +1,167 @@
 diff --git a/ports/RGSX/__main__.py b/ports/RGSX/__main__.py
-index 8963857..f33b9c1 100644
+index 3d72fc4..c4f14cd 100644
 --- a/ports/RGSX/__main__.py
 +++ b/ports/RGSX/__main__.py
-@@ -510,0 +511,4 @@ def start_web_server():
+@@ -525,0 +526,46 @@ web_server_process = None
++def _pick_web_port(host="127.0.0.1", preferred=5000):
++    """macOS: first bindable port in preferred..preferred+10 on the server's own host (AirPlay Receiver owns 5000)."""
++    import socket as _socket
++    for candidate in range(preferred, preferred + 11):
++        probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
++        try:
++            probe.bind((host, candidate))
++            return candidate
++        except OSError:
++            continue
++        finally:
++            probe.close()
++    probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
++    try:
++        probe.bind((host, 0))
++        return probe.getsockname()[1]
++    finally:
++        probe.close()
++def _log_roms_source():
++    """macOS: record where ROMS_FOLDER came from (config logs before logging is configured)."""
++    src = getattr(config, "ROMS_FOLDER_SOURCE", "n/a")
++    launcher = os.environ.get("RGSX_LAUNCHER_PATH", "")
++    logger.info(f"ROMS_FOLDER={config.ROMS_FOLDER} (source: {src}) launcher={launcher or '<unset>'}")
++    if launcher and src in ("home_default", "data_default"):
++        logger.warning(f"ROMs folder not derived from launcher {launcher} (expected <ROMs>/ports/RGSX/RGSX.sh)")
++def _maybe_show_roms_warning():
++    """macOS: one-time non-blocking dialog when launched from ES-DE but the ROMs folder could not be derived."""
++    try:
++        launcher = os.environ.get("RGSX_LAUNCHER_PATH", "")
++        if not launcher or getattr(config, "ROMS_FOLDER_SOURCE", "") not in ("home_default", "data_default"):
++            return
++        marker = os.path.join(config.CONFIG_FOLDER, "roms_warning_shown")
++        if os.path.isfile(marker):
++            with open(marker, "r", encoding="utf-8") as fh:
++                if fh.read().strip() == launcher:
++                    return
++        text = (f"RGSX could not find your ES-DE ROMs folder; downloads go to {config.ROMS_FOLDER}. "
++                "Keep RGSX inside <ROMs>/ports/ or set roms_folder in rgsx_settings.json.").replace('"', "'")
++        subprocess.Popen(["/usr/bin/osascript", "-e",
++                          f'display dialog "{text}" buttons {{"OK"}} default button 1 with icon caution giving up after 60'],
++                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++        os.makedirs(config.CONFIG_FOLDER, exist_ok=True)
++        with open(marker, "w", encoding="utf-8") as fh:
++            fh.write(launcher)
++    except Exception as exc:
++        logger.debug(f"ROMs warning dialog skipped: {exc}")
+@@ -560,0 +607,27 @@ def start_web_server():
 +            web_server_cmd = [exe, web_server_script]
 +            if config.OPERATING_SYSTEM == "Darwin":
 +                # macOS: local only by default (the web UI has no authentication); RGSX_WEB_HOST overrides
 +                web_server_cmd += ["--host", os.environ.get("RGSX_WEB_HOST", "127.0.0.1")]
-@@ -513 +517 @@ def start_web_server():
++                # precedence: env RGSX_WEB_HOST > settings web_host > 127.0.0.1 (invalid values skipped)
++                from rgsx_settings import load_rgsx_settings, resolve_web_host
++                _web_host = resolve_web_host("Darwin", os.environ.get("RGSX_WEB_HOST"),
++                                             load_rgsx_settings().get("web_host"))
++                web_server_cmd[-1] = _web_host
++                if _web_host != "127.0.0.1":
++                    logger.warning(f"Web UI bound to {_web_host} with no authentication: trusted networks only")
++                _web_port = _pick_web_port(_web_host if _web_host not in ("0.0.0.0", "") else "127.0.0.1")
++                # precedence: env RGSX_WEB_PORT > settings web_port > 5000, then fall back to the next free port
++                from rgsx_settings import resolve_web_port, pick_free_port, web_port_note_lines
++                _web_port_requested = resolve_web_port("Darwin", os.environ.get("RGSX_WEB_PORT"),
++                                                       load_rgsx_settings().get("web_port"))
++                _web_port = pick_free_port(_web_host if _web_host not in ("0.0.0.0", "") else "127.0.0.1",
++                                           _web_port_requested)
++                for _lvl, _msg in web_port_note_lines(_web_port_requested, _web_port):
++                    getattr(logger, _lvl)(_msg)
++                config.web_runtime = {"host": _web_host, "port": _web_port, "requested_port": _web_port_requested}
++                web_server_cmd += ["--port", str(_web_port)]
++                try:
++                    with open(os.path.join(config.CONFIG_FOLDER, "web_port.txt"), "w", encoding="utf-8") as _pf:
++                        _pf.write(str(_web_port))
++                except OSError:
++                    pass
+@@ -563 +636 @@ def start_web_server():
 -                    [exe, web_server_script],
 +                    web_server_cmd,
-@@ -1865,0 +1870,2 @@ async def main():
+@@ -570,0 +644,2 @@ def start_web_server():
++        if config.OPERATING_SYSTEM == "Darwin":
++            logger.info(f"🌐 Web UI port on macOS: http://localhost:{_web_port}")
+@@ -606,0 +682,20 @@ def stop_web_server():
++_web_restart_lock = threading.Lock()
++def restart_web_server():
++    """macOS: restart the web server subprocess so new web_host/web_port settings apply. Returns True on success."""
++    if config.OPERATING_SYSTEM != "Darwin":
++        return False
++    if not _web_restart_lock.acquire(blocking=False):
++        logger.info("Redémarrage du serveur web déjà en cours")
++        return False
++    try:
++        config.web_restart_status = "restarting"
++        stop_web_server()
++        config.web_runtime = None
++        ok = start_web_server()
++        config.web_restart_status = "ok" if ok else "failed"
++        if not ok:
++            stop_web_server()
++            config.web_runtime = None
++        return ok
++    finally:
++        _web_restart_lock.release()
+@@ -658,0 +754,5 @@ async def main():
++    if config.OPERATING_SYSTEM == "Darwin":
++        config.web_restart_callback = restart_web_server
++    if config.OPERATING_SYSTEM == "Darwin":
++        _log_roms_source()
++        _maybe_show_roms_warning()
+@@ -954,0 +1055,5 @@ async def main():
++                if config.menu_state == "web_access_confirm":
++                    # Start cancels the network-access warning without changing anything
++                    config.menu_state = "pause_settings_menu"
++                    config.needs_redraw = True
++                    continue
+@@ -986,0 +1092 @@ async def main():
++                "web_access_confirm",
+@@ -1453,0 +1560,3 @@ async def main():
++            elif config.menu_state == "web_access_confirm":
++                from display import draw_web_access_confirm_dialog
++                draw_web_access_confirm_dialog(screen)
+@@ -1768,0 +1878,2 @@ async def main():
 +    elif config.OPERATING_SYSTEM == "Darwin":
 +        logger.debug("Mise à jour liste des jeux EmulationStation ignorée sur macOS")
 diff --git a/ports/RGSX/config.py b/ports/RGSX/config.py
-index 81df871..862f6b9 100644
+index 0b9bfe4..fdc3911 100644
 --- a/ports/RGSX/config.py
 +++ b/ports/RGSX/config.py
-@@ -56,2 +56,8 @@ _docker_data_dir = os.environ.get("RGSX_DATA_DIR", "").strip()
+@@ -54,0 +55,31 @@ def get_application_root():
++### macOS: ROMs root derived from the launcher location (ES-DE layout: <ROMs>/ports/RGSX/RGSX.sh)
++def _roms_root_from_dir(_d):
++    """Rules 1-2: <ROMs>/ports/RGSX -> <ROMs>; <ROMs>/ports -> <ROMs>. Case-insensitive (APFS)."""
++    _d = os.path.normpath(_d)
++    _base = os.path.basename(_d).lower()
++    _parent = os.path.dirname(_d)
++    if _base == "rgsx" and os.path.basename(_parent).lower() == "ports":
++        return os.path.dirname(_parent)
++    if _base == "ports":
++        return _parent
++    return None
++def _derive_roms_from_launcher():
++    """Return the ES-DE ROMs root implied by where RGSX lives, or None. macOS only."""
++    try:
++        _launcher = os.environ.get("RGSX_LAUNCHER_PATH", "").strip()
++        _candidates = []
++        if _launcher and os.path.isabs(_launcher):
++            # Logical path first (a symlinked 'ports' on another disk must keep its logical root),
++            # then the symlink-resolved path as a last candidate.
++            _candidates.append(os.path.dirname(_launcher))
++            _candidates.append(os.path.dirname(os.path.realpath(_launcher)))
++        elif not _launcher:
++            # Direct "python __main__.py" runs: no launcher env, use this file's real location
++            _candidates.append(os.path.dirname(os.path.realpath(os.path.abspath(__file__))))
++        for _cand in _candidates:
++            _root = _roms_root_from_dir(_cand)
++            if _root and os.path.isdir(_root) and not os.path.lexists(os.path.join(_root, ".git")):
++                return _root
++    except Exception:
++        pass
++    return None
+@@ -76,2 +107,8 @@ _docker_data_dir = os.environ.get("RGSX_DATA_DIR", "").strip()
 -
 -# Determine if we're running in Docker mode
 +_macos_default_dirs = False  # True only when the macOS per-user defaults below were injected
@@ -28,55 +172,236 @@ index 81df871..862f6b9 100644
 +    _docker_data_dir = os.path.join(os.path.expanduser("~"), "Documents", "RGSX")
 +    _macos_default_dirs = True
 +# Determine if we're running in Docker mode (or macOS per-user mode)
-@@ -110,0 +117,4 @@ _default_roms_folder = os.path.join(DATA_FOLDER if _is_docker_mode else USERDATA
+@@ -127,0 +165,3 @@ INSTALLATION_PATH_WARNING = not _is_docker_mode and not _has_expected_installati
++if platform.system() == "Darwin":
++    # macOS: ES-DE ROMs root may be any folder (<ROMs>/ports/RGSX); never show the Batocera-style path warning
++    INSTALLATION_PATH_WARNING = False
+@@ -132,0 +173,24 @@ _default_roms_folder = os.path.join(DATA_FOLDER if _is_docker_mode else USERDATA
 +# macOS + ES-DE: default to ~/ROMs (ES-DE's default ROM root) when it exists and RGSX_DATA_DIR/RGSX_CONFIG_DIR
 +# were not set explicitly. A roms_folder in rgsx_settings.json still wins (handled below).
 +if _macos_default_dirs and os.path.isdir(os.path.join(os.path.expanduser("~"), "ROMs")):
 +    _default_roms_folder = os.path.join(os.path.expanduser("~"), "ROMs")
-@@ -168,0 +179 @@ connection_status_progress = {"done": 0, "total": 0}
++# macOS: ROMs root precedence (below an explicit roms_folder in rgsx_settings.json, applied afterwards):
++# RGSX_ROMS_DIR env > derived from the launcher location > the defaults above.
++# Not gated by _macos_default_dirs, so RGSX_DATA_DIR / RGSX_CONFIG_DIR do not disable env/derived.
++_roms_src = "default"
++if platform.system() == "Darwin":
++    _env_roms = os.environ.get("RGSX_ROMS_DIR", "").strip()
++    if _env_roms and os.path.isabs(_env_roms) and os.path.isdir(_env_roms):
++        _default_roms_folder = _env_roms
++        _roms_src = "env"
++    else:
++        if _env_roms:
++            logging.getLogger(__name__).warning(f"RGSX_ROMS_DIR ignored (not an existing absolute directory): {_env_roms}")
++        _derived_roms = _derive_roms_from_launcher()
++        if _derived_roms:
++            _default_roms_folder = _derived_roms
++            _roms_src = "derived"
++        elif _macos_default_dirs and _default_roms_folder == os.path.join(os.path.expanduser("~"), "ROMs"):
++            _roms_src = "home_default"
++        else:
++            _roms_src = "data_default"
+@@ -167,0 +232,9 @@ except Exception as _e:
++if platform.system() == "Darwin":
++    # settings | env | derived | home_default | data_default (a settings path equal to the default reports the default's source)
++    ROMS_FOLDER_SOURCE = "settings" if ROMS_FOLDER != _default_roms_folder else _roms_src
++    if ROMS_FOLDER_SOURCE in ("home_default", "data_default") and os.environ.get("RGSX_LAUNCHER_PATH"):
++        logging.getLogger(__name__).warning(
++            f"ROMs folder not derived from launcher {os.environ.get('RGSX_LAUNCHER_PATH')} "
++            f"(expected <ROMs>/ports/RGSX/RGSX.sh); using {ROMS_FOLDER} ({ROMS_FOLDER_SOURCE})")
++    else:
++        logging.getLogger(__name__).info(f"ROMS_FOLDER={ROMS_FOLDER} (source: {ROMS_FOLDER_SOURCE})")
+@@ -190,0 +264 @@ connection_status_progress = {"done": 0, "total": 0}
 +# macOS: ~/Library/Application Support/RGSX/logs
+@@ -301,0 +376,4 @@ SEVEN_Z_EXE = os.path.join(APP_FOLDER,"assets", "progs", "7z.exe")
++# macOS: 7zz installed by macos/rgsx-macos into the runtime dir (RGSX_SEVENZIP overrides)
++SEVEN_Z_DARWIN = os.environ.get("RGSX_SEVENZIP", "").strip() or os.path.join(
++    os.environ.get("RGSX_RUNTIME_DIR", "").strip() or os.path.join(os.path.expanduser("~"), "Library", "Application Support", "RGSX", "runtime"),
++    "bin", "7zz")
 diff --git a/ports/RGSX/controls.py b/ports/RGSX/controls.py
-index 4df8dc6..d41f42a 100644
+index 7fb657b..0f939a2 100644
 --- a/ports/RGSX/controls.py
 +++ b/ports/RGSX/controls.py
-@@ -585 +585,4 @@ def load_controls_config(path=CONTROLS_CONFIG_PATH):
+@@ -224,0 +225,7 @@ def _is_arm_device() -> bool:
++    if getattr(config, "OPERATING_SYSTEM", "") == "Darwin":
++        try:
++            import qbittorrent_backend as _qb  # lazy: avoids import cycles at module load
++            if _qb.is_available():
++                return False  # libtorrent backend usable: this Mac is not "torrent-blocked ARM"
++        except Exception:
++            pass  # fall through to the original detection
+@@ -539,0 +547 @@ VALID_STATES = [
++    "web_access_confirm",       # macOS: avertissement avant d'ouvrir l'interface web au réseau local
+@@ -701 +709,4 @@ def load_controls_config(path=CONTROLS_CONFIG_PATH):
 -                src = os.path.join(config.PRECONF_CONTROLS_PATH, 'keyboard.json')
 +                kb_name = 'keyboard.json'
 +                if config.OPERATING_SYSTEM == 'Darwin' and os.path.exists(os.path.join(config.PRECONF_CONTROLS_PATH, 'keyboard_macos.json')):
 +                    kb_name = 'keyboard_macos.json'
 +                src = os.path.join(config.PRECONF_CONTROLS_PATH, kb_name)
-@@ -590 +593 @@ def load_controls_config(path=CONTROLS_CONFIG_PATH):
+@@ -706 +717 @@ def load_controls_config(path=CONTROLS_CONFIG_PATH):
 -                            logging.getLogger(__name__).info("Chargement des contrôles préréglés: keyboard.json")
 +                            logging.getLogger(__name__).info(f"Chargement des contrôles préréglés: {kb_name}")
-@@ -2887 +2890 @@ def handle_controls(event, sources, joystick, screen):
+@@ -2920,0 +2932 @@ def handle_controls(event, sources, joystick, screen):
++                    config.web_port_staged = None  # macOS: discard any unconfirmed web port edit
+@@ -3027 +3039 @@ def handle_controls(event, sources, joystick, screen):
 -            show_display_mode = getattr(config, 'OPERATING_SYSTEM', '') == "Windows"
 +            show_display_mode = getattr(config, 'OPERATING_SYSTEM', '') in ("Windows", "Darwin")
+@@ -3357,0 +3370,9 @@ def handle_controls(event, sources, joystick, screen):
++            web_access_index = -1
++            web_port_index = -1
++            if config.OPERATING_SYSTEM == "Darwin":
++                total = 10  # ... max_dl_slots, web access, web port, api keys, connection_status, back
++                web_access_index = 5
++                web_port_index = 6
++                api_keys_index = 7
++                connection_status_index = 8
++                back_index = 9
+@@ -3476,0 +3498,12 @@ def handle_controls(event, sources, joystick, screen):
++                # macOS: Web interface access toggle (This Mac only / Local network)
++                elif sel == web_access_index and web_access_index >= 0 and (is_input_matched(event, "confirm") or is_input_matched(event, "left") or is_input_matched(event, "right")):
++                    _toggle_web_access()
++                # macOS: Web interface port (left/right = -/+1, confirm = apply)
++                elif sel == web_port_index and web_port_index >= 0 and (is_input_matched(event, "confirm") or is_input_matched(event, "left") or is_input_matched(event, "right")):
++                    from rgsx_settings import step_web_port, get_web_port
++                    staged = getattr(config, 'web_port_staged', None) or get_web_port()
++                    if is_input_matched(event, "confirm"):
++                        _apply_web_port(staged)
++                    else:
++                        config.web_port_staged = step_web_port(staged, -1 if is_input_matched(event, "left") else 1)
++                    config.needs_redraw = True
+@@ -3490,0 +3524,6 @@ def handle_controls(event, sources, joystick, screen):
++            elif config.OPERATING_SYSTEM == "Darwin" and sel == web_port_index and (is_input_matched(event, "page_up") or is_input_matched(event, "page_down")):
++                # macOS: shoulder buttons / PageUp-PageDown move the web port by 100
++                from rgsx_settings import step_web_port, get_web_port
++                staged = getattr(config, 'web_port_staged', None) or get_web_port()
++                config.web_port_staged = step_web_port(staged, 100 if is_input_matched(event, "page_up") else -100)
++                config.needs_redraw = True
+@@ -3961,0 +4001,16 @@ def handle_controls(event, sources, joystick, screen):
++        # macOS: avertissement avant d'activer l'accès réseau à l'interface web
++        elif config.menu_state == "web_access_confirm":
++            if is_input_matched(event, "left") or is_input_matched(event, "right"):
++                config.web_access_confirm_selection = 1 - int(getattr(config, 'web_access_confirm_selection', 0))
++                config.needs_redraw = True
++            elif is_input_matched(event, "confirm"):
++                config.menu_state = "pause_settings_menu"
++                config.needs_redraw = True
++                if int(getattr(config, 'web_access_confirm_selection', 0)) == 1:  # Yes
++                    from rgsx_settings import set_web_host
++                    if set_web_host("0.0.0.0"):
++                        logger.warning("Web UI network access enabled via settings (no authentication)")
++                        _apply_web_settings_async()
++            elif is_input_matched(event, "cancel"):
++                config.menu_state = "pause_settings_menu"
++                config.needs_redraw = True
+@@ -4989,0 +5045,61 @@ def get_emergency_controls():
++
++def _web_popup(key, default, *args):
++    text = _(key, default) if _ else default
++    if not text or text == key:
++        text = default
++    try:
++        text = text.format(*args)
++    except Exception:
++        pass
++    config.popup_message = text
++    config.popup_timer = 5000
++    config.needs_redraw = True
++
++def _apply_web_settings_async():
++    """macOS: restart the web server in a background thread, then report the port really used."""
++    def _worker():
++        cb = getattr(config, "web_restart_callback", None)
++        if cb is None:
++            _web_popup("popup_web_saved", "Saved. Restart RGSX to apply.")
++            return
++        if not cb():
++            if getattr(config, "web_restart_status", "") == "restarting":
++                _web_popup("popup_web_restart_busy", "Web server is already restarting")
++            else:
++                _web_popup("popup_web_restart_failed", "Web server could not be restarted. See the RGSX log.")
++            return
++        rt = getattr(config, "web_runtime", None) or {}
++        if rt.get("port") and rt.get("port") != rt.get("requested_port"):
++            _web_popup("popup_web_port_fallback", "Port {0} is busy, using {1} instead",
++                       rt.get("requested_port"), rt.get("port"))
++        else:
++            _web_popup("popup_web_applied", "Web interface restarted on port {0}", rt.get("port"))
++    threading.Thread(target=_worker, daemon=True).start()
++
++def _toggle_web_access():
++    """macOS: flip web_host between 127.0.0.1 and 0.0.0.0 (turning ON asks for confirmation first)."""
++    from rgsx_settings import get_web_host, set_web_host, is_network_access, normalize_web_host
++    if is_network_access(get_web_host()):
++        set_web_host("127.0.0.1")
++        logger.info("Web UI network access disabled via settings")
++        if normalize_web_host(os.environ.get("RGSX_WEB_HOST")):
++            _web_popup("popup_web_env_override", "{0} is set and overrides this setting", "RGSX_WEB_HOST")
++        else:
++            _apply_web_settings_async()
++    else:
++        config.menu_state = "web_access_confirm"
++        config.web_access_confirm_selection = 0  # 0=No, 1=Yes
++    config.needs_redraw = True
++
++def _apply_web_port(port):
++    """macOS: save the staged web port and restart the web server on it."""
++    from rgsx_settings import set_web_port, normalize_web_port
++    saved = set_web_port(port)
++    config.web_port_staged = None
++    if saved is None:
++        return
++    logger.info(f"web_port set to {saved} via settings")
++    if normalize_web_port(os.environ.get("RGSX_WEB_PORT")):
++        _web_popup("popup_web_env_override", "{0} is set and overrides this setting", "RGSX_WEB_PORT")
++    else:
++        _apply_web_settings_async()
 diff --git a/ports/RGSX/network.py b/ports/RGSX/network.py
-index 8b4e340..cfbe250 100644
+index d5a1427..cb68825 100644
 --- a/ports/RGSX/network.py
 +++ b/ports/RGSX/network.py
 @@ -11,0 +12 @@ from config import HEADLESS
 +from esde_folders import map_rom_folder
-@@ -1119,0 +1121,5 @@ def _resolve_lolroms_external_command() -> tuple[str | None, str | None]:
+@@ -72,0 +74,7 @@ def _is_arm_device() -> bool:
++    if getattr(config, "OPERATING_SYSTEM", "") == "Darwin":
++        try:
++            import qbittorrent_backend as _qb  # lazy: avoids import cycles at module load
++            if _qb.is_available():
++                return False  # libtorrent backend usable: this Mac is not "torrent-blocked ARM"
++        except Exception:
++            pass  # fall through to the original detection
+@@ -236,0 +245,2 @@ def _should_prefer_qbittorrent_backend() -> bool:
++    if config.OPERATING_SYSTEM == "Darwin":
++        return qbittorrent_backend.is_available()
+@@ -532,0 +543,9 @@ def _download_torrent_with_aria2(
++    if config.OPERATING_SYSTEM == "Darwin" and _should_prefer_qbittorrent_backend():
++        logger.info("Téléchargement torrent via libtorrent (macOS)")
++        try:
++            return qbittorrent_backend.download_torrent_via_qbittorrent(
++                torrent_meta, dest_dir, dest_path, task_id, cancel_ev, progress_queue, original_history_url,
++                pause_ev=pause_ev,
++            )
++        except qbittorrent_backend.BackendUnavailableError as exc:
++            raise qbittorrent_backend.BackendUnavailableError(str(exc)) from exc
+@@ -1139,0 +1159,5 @@ def _resolve_lolroms_external_command() -> tuple[str | None, str | None]:
 +    if config.OPERATING_SYSTEM == 'Darwin':
 +        # macOS ships curl but not wget
 +        resolved = shutil.which('curl')
 +        return ('curl', resolved) if resolved else (None, None)
 +
-@@ -3100 +3106 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
+@@ -3120 +3144 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
 -                        platform_folder = platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform)
 +                        platform_folder = map_rom_folder(platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform))
-@@ -3105 +3111 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
+@@ -3125 +3149 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
 -                    platform_folder = resolve_platform_folder(platform)
 +                    platform_folder = map_rom_folder(resolve_platform_folder(platform))
-@@ -4295 +4301 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
+@@ -4323 +4347 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
 -                        platform_folder = platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform)
 +                        platform_folder = map_rom_folder(platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform))
-@@ -4300 +4306 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
+@@ -4328 +4352 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
 -                    platform_folder = resolve_platform_folder(platform)
 +                    platform_folder = map_rom_folder(resolve_platform_folder(platform))
 diff --git a/ports/RGSX/qbittorrent_backend.py b/ports/RGSX/qbittorrent_backend.py
-index 2026ff2..eef26eb 100644
+index befd09b..2764376 100644
 --- a/ports/RGSX/qbittorrent_backend.py
 +++ b/ports/RGSX/qbittorrent_backend.py
 @@ -230,0 +231,4 @@ def _find_qbittorrent_executable() -> str | None:
@@ -84,60 +409,132 @@ index 2026ff2..eef26eb 100644
 +    if config.OPERATING_SYSTEM == "Darwin":
 +        return shutil.which("qbittorrent-nox")
 +
+@@ -1333,0 +1338,24 @@ def shutdown() -> None:
++# macOS: in-process libtorrent backend (libtorrent_backend.py). Lazy trampolines resolve at call time, so
++# neither module needs the other fully initialised at import time. Other platforms keep the functions above.
++if config.OPERATING_SYSTEM == "Darwin":
++    def is_available() -> bool:
++        import libtorrent_backend as _lt
++        return _lt.is_available()
++    def download_torrent_via_qbittorrent(*args, **kwargs):
++        import libtorrent_backend as _lt
++        return _lt.download_torrent_via_qbittorrent(*args, **kwargs)
++    def has_active_seed(task_id=None, original_history_url=None) -> bool:
++        import libtorrent_backend as _lt
++        return _lt.has_active_seed(task_id, original_history_url)
++    def stop_seed(task_id=None, original_history_url=None) -> bool:
++        import libtorrent_backend as _lt
++        return _lt.stop_seed(task_id, original_history_url)
++    def prewarm_startup_async() -> None:
++        import libtorrent_backend as _lt
++        return _lt.prewarm_startup_async()
++    def is_process_running() -> bool:
++        import libtorrent_backend as _lt
++        return _lt.is_process_running()
++    def shutdown() -> None:
++        import libtorrent_backend as _lt
++        return _lt.shutdown()
 diff --git a/ports/RGSX/rgsx_web.py b/ports/RGSX/rgsx_web.py
-index 2d83555..ac72f76 100644
+index 88fc0e2..2e48a87 100644
 --- a/ports/RGSX/rgsx_web.py
 +++ b/ports/RGSX/rgsx_web.py
 @@ -22,0 +23 @@ import config
 +from esde_folders import map_rom_folder
-@@ -609 +610 @@ class RGSXHandler(BaseHTTPRequestHandler):
+@@ -554 +555 @@ class RGSXHandler(BaseHTTPRequestHandler):
 -                            expected_dir = os.path.join(config.ROMS_FOLDER, folder)
 +                            expected_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
-@@ -667 +668 @@ class RGSXHandler(BaseHTTPRequestHandler):
+@@ -612 +613 @@ class RGSXHandler(BaseHTTPRequestHandler):
 -                                expected_dir = os.path.join(config.ROMS_FOLDER, folder)
 +                                expected_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
+@@ -1989,0 +1991,2 @@ DO NOT share this file publicly as it may contain sensitive information.
++        if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin':
++            html = html.replace('</head>', '<style>[onclick="openQbittorrentWebUi()"]{display:none !important}</style></head>', 1)
+@@ -2033,0 +2037,2 @@ def run_server(host='0.0.0.0', port=5000):
++        elif getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin':
++            pass  # never kill whatever owns the port on macOS (AirPlay Receiver)
+@@ -2069 +2074,6 @@ def run_server(host='0.0.0.0', port=5000):
+-        logger.info(f"Accès réseau: http://{local_ip}:{port}")
++        if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin':
++            from rgsx_settings import web_access_log_lines
++            for level, msg in web_access_log_lines(host, local_ip, port):
++                getattr(logger, level)(msg)
++        else:
++            logger.info(f"Accès réseau: http://{local_ip}:{port}")
+@@ -2075 +2085,6 @@ def run_server(host='0.0.0.0', port=5000):
+-            logger.info(f"🌍 Accès réseau: http://{local_ip}:{port}")
++            if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin':
++                from rgsx_settings import web_access_log_lines
++                for level, msg in web_access_log_lines(host, local_ip, port):
++                    getattr(logger, level)(msg)
++            else:
++                logger.info(f"🌍 Accès réseau: http://{local_ip}:{port}")
 diff --git a/ports/RGSX/utils.py b/ports/RGSX/utils.py
-index 5be0246..872538f 100644
+index 5d68b8a..de99dfd 100644
 --- a/ports/RGSX/utils.py
 +++ b/ports/RGSX/utils.py
-@@ -14,0 +15 @@ from config import HEADLESS, Game
+@@ -16,0 +17 @@ from config import HEADLESS, Game
 +from esde_folders import map_rom_folder
-@@ -582 +583,3 @@ def _resolve_7z_command():
+@@ -698,0 +700,2 @@ def _resolve_7z_command():
++    if config.OPERATING_SYSTEM == "Darwin" and os.path.isfile(config.SEVEN_Z_DARWIN) and os.access(config.SEVEN_Z_DARWIN, os.X_OK):
++        return config.SEVEN_Z_DARWIN  # 7zz installed by macos/rgsx-macos
+@@ -700 +703,3 @@ def _resolve_7z_command():
 -    bundled = getattr(config, 'SEVEN_Z_LINUX', '')
 +    is_mac = config.OPERATING_SYSTEM == "Darwin"
 +    # macOS: the bundled 7zz is a Linux ELF binary, use Homebrew/PATH instead
 +    bundled = '' if is_mac else getattr(config, 'SEVEN_Z_LINUX', '')
-@@ -588,0 +592,5 @@ def _resolve_7z_command():
+@@ -706,0 +712,5 @@ def _resolve_7z_command():
 +    if is_mac:
 +        # Apps launched from Finder get a minimal PATH: try Homebrew locations explicitly
 +        for fallback in ("/opt/homebrew/bin/7zz", "/usr/local/bin/7zz", "/opt/homebrew/bin/7z", "/usr/local/bin/7z"):
 +            if fallback not in candidates:
 +                candidates.append(fallback)
-@@ -2303 +2311 @@ def is_extension_supported(filename, platform_key, extensions_data):
+@@ -2095,0 +2106,3 @@ def check_extension_before_download(url, platform, game_name):
++        if config.OPERATING_SYSTEM == "Darwin" and not system_known:
++            # macOS: extensions.json keys use the RGSX folder name, not the ES-DE-mapped one
++            system_known = any(s.get("folder") == _get_rgsx_folder_name(platform) for s in extensions_data)
+@@ -2157 +2170 @@ def is_extension_supported(filename, platform_key, extensions_data):
 -            dest_dir = os.path.join(config.ROMS_FOLDER, platform_dict.get("folder"))
 +            dest_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(platform_dict.get("folder")))
-@@ -2330 +2338 @@ def _get_dest_folder_name(platform_key: str) -> str:
+@@ -2172,0 +2186,6 @@ def is_extension_supported(filename, platform_key, extensions_data):
++    if config.OPERATING_SYSTEM == "Darwin":
++        # macOS: the folder may be ES-DE-mapped (gamecube -> gc) while extensions.json uses the RGSX name
++        _raw_folder = _get_rgsx_folder_name(platform_key)
++        for system in extensions_data:
++            if system["folder"] == _raw_folder:
++                return extension in system["extensions"]
+@@ -2184 +2203 @@ def _get_dest_folder_name(platform_key: str) -> str:
 -                dest_dir = os.path.join(config.ROMS_FOLDER, folder)
 +                dest_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
-@@ -2460 +2468 @@ def load_sources(allow_torrent_manifest_fetch: bool | None = None):
+@@ -2192,0 +2212,6 @@ def _get_dest_folder_name(platform_key: str) -> str:
++def _get_rgsx_folder_name(platform_key: str) -> str:
++    """Nom du dossier RGSX (non mappé ES-DE) pour une plateforme; utilisé sur macOS."""
++    for platform_dict in config.platform_dicts:
++        if platform_dict.get("platform_name") == platform_key:
++            return platform_dict.get("folder") or ""
++    return ""
+@@ -2300 +2325 @@ def load_sources(
 -                expected_dir = os.path.join(config.ROMS_FOLDER, folder)
 +                expected_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
-@@ -3088,0 +3097,4 @@ def extract_rar(rar_path, dest_dir, url):
+@@ -2927,0 +2953,4 @@ def extract_rar(rar_path, dest_dir, url):
 +
 +        # macOS: no unrar formula in Homebrew, 7-Zip reads RAR natively
 +        if config.OPERATING_SYSTEM == "Darwin" and shutil.which("unrar") is None:
 +            return extract_7z(rar_path, dest_dir, url)
-@@ -3212 +3224 @@ def extract_7z(archive_path, dest_dir, url):
+@@ -3051 +3080,3 @@ def extract_7z(archive_path, dest_dir, url):
 -            return False, "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs"
++            if config.OPERATING_SYSTEM == "Darwin":
++                return False, "7-Zip is missing: relaunch RGSX with internet to repair it (see bootstrap.log)"
 +            return False, ("7zz not found - run: brew install sevenzip" if config.OPERATING_SYSTEM == "Darwin" else "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs")
-@@ -3475,0 +3488,3 @@ def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archi
+@@ -3314,0 +3346,3 @@ def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archi
 +            if config.OPERATING_SYSTEM == "Darwin":
 +                return False, "PS3 Redump decryption is not supported on macOS (no native ps3dec)"
 +
-@@ -3563 +3578 @@ def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archi
+@@ -3402 +3436,3 @@ def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archi
 -                return False, "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs"
++                if config.OPERATING_SYSTEM == "Darwin":
++                    return False, "7-Zip is missing: relaunch RGSX with internet to repair it (see bootstrap.log)"
 +                return False, ("7zz not found - run: brew install sevenzip" if config.OPERATING_SYSTEM == "Darwin" else "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs")
-@@ -3914,0 +3930,8 @@ def handle_xbox(dest_dir, iso_files, url=None):
+@@ -3753,0 +3790,8 @@ def handle_xbox(dest_dir, iso_files, url=None):
 +    elif config.OPERATING_SYSTEM == "Darwin":
 +        # macOS : extract-xiso depuis le PATH (pas de binaire fourni)
 +        xiso_path = shutil.which("extract-xiso")
@@ -146,12 +543,12 @@ index 5be0246..872538f 100644
 +            return False, "extract-xiso not found (build it from github.com/XboxDev/extract-xiso and put it on PATH)"
 +        extract_xiso_cmd = [xiso_path, "-r"]
 +
-@@ -4459 +4482 @@ def resolve_platform_folder(platform):
+@@ -4298 +4342 @@ def resolve_platform_folder(platform):
 -                    return folder
 +                    return map_rom_folder(folder)
-@@ -4473 +4496 @@ def resolve_platform_folder(platform):
--                            return folder
-+                            return map_rom_folder(folder)
-@@ -4478 +4501 @@ def resolve_platform_folder(platform):
+@@ -4310,0 +4355,2 @@ def resolve_platform_folder(platform):
++    if cached_folder and config.OPERATING_SYSTEM == "Darwin":
++        return map_rom_folder(cached_folder)  # macOS: ES-DE folder mapping
+@@ -4316 +4362 @@ def resolve_platform_folder(platform):
 -    return normalize_platform_name(platform)
 +    return map_rom_folder(normalize_platform_name(platform))
