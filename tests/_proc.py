@@ -41,6 +41,20 @@ def spawn_tracked(cmd, **kw):
     return proc
 
 
+def run_tracked(cmd, timeout=None, capture_output=True, text=True, **kw):
+    """subprocess.run replacement: the child leads its own process group; on timeout/error the whole group is killed
+    (SIGTERM, wait, SIGKILL) instead of only the direct child, so no orphan survives a failed test."""
+    stdout = kw.pop("stdout", subprocess.PIPE if capture_output else None)
+    stderr = kw.pop("stderr", subprocess.PIPE if capture_output else None)
+    proc = spawn_tracked(cmd, stdout=stdout, stderr=stderr, text=text, **kw)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except BaseException:
+        kill_tracked(proc)
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 def kill_tracked(proc):
     """SIGTERM, wait, SIGKILL the process group of a spawn_tracked child."""
     _kill_group(proc.pid)

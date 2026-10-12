@@ -254,8 +254,8 @@ def _load_main_namespace():
         src = fh.read()
     tree = ast.parse(src)
     wanted_funcs = {"_web_script_path", "_stop_web_server_darwin", "_mark_web_shutting_down", "_shutdown_web_server_atexit",
-                    "_install_web_cleanup_hooks", "start_web_server", "stop_web_server", "restart_web_server", "_pick_web_port"}
-    wanted_assign = {"web_server_process", "_web_proc_lock", "_web_shutting_down", "_web_hooks_installed", "_web_restart_lock"}
+                    "_install_web_cleanup_hooks", "_force_exit", "_on_terminate_signal", "start_web_server", "stop_web_server", "restart_web_server", "_pick_web_port"}
+    wanted_assign = {"web_server_process", "_web_proc_lock", "_web_shutting_down", "_web_hooks_installed", "_web_restart_lock", "_web_signal_timer"}
     body = []
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in wanted_funcs:
@@ -415,6 +415,32 @@ class HandleTests(unittest.TestCase):
             ns["_install_web_cleanup_hooks"]()
             ns["_install_web_cleanup_hooks"]()
         self.assertEqual(reg.call_count, 1)
+
+    def test_signal_requests_quit_and_second_signal_forces_exit(self):
+        ns = self.ns
+        ns["shutdown_downloads"] = mock.MagicMock()
+        ns["start_web_server"]()
+        proc = ns["web_server_process"]
+        self.addCleanup(setattr, config, "quit_requested", False)
+        config.quit_requested = False
+        with mock.patch.object(threading, "Timer") as timer, mock.patch.object(os, "_exit") as exit_:
+            ns["_on_terminate_signal"](signal.SIGTERM, None)
+            self.assertTrue(config.quit_requested)
+            timer.assert_called_once()
+            self.assertEqual(timer.call_args.args[0], 10.0)
+            exit_.assert_not_called()
+            ns["_on_terminate_signal"](signal.SIGTERM, None)  # second signal: no more waiting
+            exit_.assert_called_once_with(128 + signal.SIGTERM)
+        self.assertTrue(proc.terminated)  # the force path stopped the web server first
+        self.assertIsNone(ns["web_server_process"])
+        ns["shutdown_downloads"].assert_called_once()
+
+    def test_signal_handlers_registered_for_term_hup_int(self):
+        ns = self.ns
+        with mock.patch("atexit.register"), mock.patch("signal.signal") as sig:
+            ns["_install_web_cleanup_hooks"]()
+        self.assertEqual({c.args[0] for c in sig.call_args_list}, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+        self.assertTrue(all(c.args[1] is ns["_on_terminate_signal"] for c in sig.call_args_list))
 
     def test_start_returns_true_without_second_spawn_when_already_running(self):
         ns = self.ns

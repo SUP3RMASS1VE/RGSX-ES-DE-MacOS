@@ -37,6 +37,8 @@ BASELINE = os.path.join(FIXTURES, "premacos_baseline")
 sys.path.insert(0, APP)
 
 import config  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _proc  # noqa: E402
 
 ON_MAC_ARM = platform.system() == "Darwin" and platform.machine() == "arm64"
 
@@ -269,7 +271,7 @@ class BootstrapBase(unittest.TestCase):
 
     def run_boot(self, shell="/bin/bash", args=(), **extra):
         os.makedirs(os.path.join(self.w, "tmp"), exist_ok=True)
-        return subprocess.run([shell, self.script, *args], env=self.env(**extra), capture_output=True, text=True, timeout=120)
+        return _proc.run_tracked([shell, self.script, *args], env=self.env(**extra), capture_output=True, text=True, timeout=120)
 
     def calls(self, name):
         path = os.path.join(self.stub, name)
@@ -803,7 +805,7 @@ class LauncherDispatchTests(unittest.TestCase):
 
     def run_sh(self, shell, script, cwd=None, args=("--x",)):
         env = {"HOME": self.t, "PATH": f"{self.bin}:/usr/bin:/bin:/usr/sbin:/sbin", "STUB_OUT": self.out, "STUB_OSA": self.osa}
-        return subprocess.run([shell, script, *args], env=env, cwd=cwd, capture_output=True, text=True, timeout=30)
+        return _proc.run_tracked([shell, script, *args], env=env, cwd=cwd, capture_output=True, text=True, timeout=30)
 
     @unittest.skipUnless(platform.system() == "Darwin", "launcher block is macOS only")
     def test_dispatch_under_each_shell(self):

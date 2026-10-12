@@ -527,6 +527,7 @@ web_server_process = None
 _web_proc_lock = threading.RLock()
 _web_shutting_down = False
 _web_hooks_installed = False
+_web_signal_timer = None
 def _web_script_path():
     return os.path.join(config.APP_FOLDER, "rgsx_web.py")
 def _stop_web_server_darwin():
@@ -585,14 +586,44 @@ def _shutdown_web_server_atexit():
             logger.error(f"Erreur lors de l'arrêt du serveur web (atexit): {e}")
         except Exception:
             pass
+def _force_exit(signum=15):
+    """macOS: last-resort exit after a signal when the main loop did not finish in time."""
+    _shutdown_web_server_atexit()
+    try:
+        shutdown_downloads()
+    except Exception:
+        pass
+    os._exit(128 + int(signum))
+def _on_terminate_signal(signum, frame):
+    """macOS SIGTERM/SIGHUP/SIGINT: ask the main loop to quit cleanly; a second signal or a 10 s timeout forces the exit."""
+    global _web_signal_timer
+    already = getattr(config, "quit_requested", False)
+    try:
+        logger.info(f"Signal {signum} received, shutting down")
+    except Exception:
+        pass
+    config.quit_requested = True
+    if already:
+        _force_exit(signum)
+    elif _web_signal_timer is None:
+        _web_signal_timer = threading.Timer(10.0, _force_exit, args=(signum,))
+        _web_signal_timer.daemon = True
+        _web_signal_timer.start()
 def _install_web_cleanup_hooks():
     """macOS: atexit cleanup + signal handlers (main thread only). Idempotent."""
     global _web_hooks_installed
     if _web_hooks_installed:
         return
     import atexit
+    import signal
     _web_hooks_installed = True
     atexit.register(_shutdown_web_server_atexit)
+    if threading.current_thread() is threading.main_thread():
+        for _sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            try:
+                signal.signal(_sig, _on_terminate_signal)
+            except (ValueError, OSError) as e:
+                logger.debug(f"Signal handler {_sig} not installed: {e}")
 def _pick_web_port(host="127.0.0.1", preferred=5000):
     """macOS: first bindable port in preferred..preferred+10 on the server's own host (AirPlay Receiver owns 5000)."""
     import socket as _socket
@@ -911,6 +942,9 @@ async def main():
         clock.tick(60)  # Limite à 60 FPS pour une meilleure réactivité
         if config.update_triggered:
             logger.debug("Mise à jour déclenchée, arrêt de la boucle principale")
+            break
+        if config.OPERATING_SYSTEM == "Darwin" and getattr(config, "quit_requested", False):
+            logger.info("Arrêt demandé par signal: sortie propre de la boucle principale")
             break
 
         current_time = pygame.time.get_ticks()

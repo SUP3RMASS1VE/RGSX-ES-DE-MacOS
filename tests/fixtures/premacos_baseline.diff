@@ -1,12 +1,13 @@
 diff --git a/ports/RGSX/__main__.py b/ports/RGSX/__main__.py
-index 3d72fc4..229c047 100644
+index 3d72fc4..cadce7a 100644
 --- a/ports/RGSX/__main__.py
 +++ b/ports/RGSX/__main__.py
-@@ -525,0 +526,116 @@ web_server_process = None
+@@ -525,0 +526,147 @@ web_server_process = None
 +# macOS: every read/write of web_server_process happens under this lock; _web_shutting_down stops new spawns once we quit
 +_web_proc_lock = threading.RLock()
 +_web_shutting_down = False
 +_web_hooks_installed = False
++_web_signal_timer = None
 +def _web_script_path():
 +    return os.path.join(config.APP_FOLDER, "rgsx_web.py")
 +def _stop_web_server_darwin():
@@ -65,14 +66,44 @@ index 3d72fc4..229c047 100644
 +            logger.error(f"Erreur lors de l'arrêt du serveur web (atexit): {e}")
 +        except Exception:
 +            pass
++def _force_exit(signum=15):
++    """macOS: last-resort exit after a signal when the main loop did not finish in time."""
++    _shutdown_web_server_atexit()
++    try:
++        shutdown_downloads()
++    except Exception:
++        pass
++    os._exit(128 + int(signum))
++def _on_terminate_signal(signum, frame):
++    """macOS SIGTERM/SIGHUP/SIGINT: ask the main loop to quit cleanly; a second signal or a 10 s timeout forces the exit."""
++    global _web_signal_timer
++    already = getattr(config, "quit_requested", False)
++    try:
++        logger.info(f"Signal {signum} received, shutting down")
++    except Exception:
++        pass
++    config.quit_requested = True
++    if already:
++        _force_exit(signum)
++    elif _web_signal_timer is None:
++        _web_signal_timer = threading.Timer(10.0, _force_exit, args=(signum,))
++        _web_signal_timer.daemon = True
++        _web_signal_timer.start()
 +def _install_web_cleanup_hooks():
 +    """macOS: atexit cleanup + signal handlers (main thread only). Idempotent."""
 +    global _web_hooks_installed
 +    if _web_hooks_installed:
 +        return
 +    import atexit
++    import signal
 +    _web_hooks_installed = True
 +    atexit.register(_shutdown_web_server_atexit)
++    if threading.current_thread() is threading.main_thread():
++        for _sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
++            try:
++                signal.signal(_sig, _on_terminate_signal)
++            except (ValueError, OSError) as e:
++                logger.debug(f"Signal handler {_sig} not installed: {e}")
 +def _pick_web_port(host="127.0.0.1", preferred=5000):
 +    """macOS: first bindable port in preferred..preferred+10 on the server's own host (AirPlay Receiver owns 5000)."""
 +    import socket as _socket
@@ -119,7 +150,7 @@ index 3d72fc4..229c047 100644
 +            fh.write(launcher)
 +    except Exception as exc:
 +        logger.debug(f"ROMs warning dialog skipped: {exc}")
-@@ -528,0 +645,11 @@ def start_web_server():
+@@ -528,0 +676,11 @@ def start_web_server():
 +    _darwin = config.OPERATING_SYSTEM == "Darwin"
 +    if _darwin:
 +        _web_proc_lock.acquire()
@@ -131,7 +162,7 @@ index 3d72fc4..229c047 100644
 +            _web_proc_lock.release()
 +            logger.warning("Un serveur web est déjà suivi et actif: pas de second serveur")
 +            return True
-@@ -560,0 +688,31 @@ def start_web_server():
+@@ -560,0 +719,31 @@ def start_web_server():
 +            web_server_cmd = [exe, web_server_script]
 +            if config.OPERATING_SYSTEM == "Darwin":
 +                # macOS: stop RGSX web servers left by a previous session/crash before choosing the port
@@ -163,27 +194,27 @@ index 3d72fc4..229c047 100644
 +                        _pf.write(str(_web_port))
 +                except OSError:
 +                    pass
-@@ -563 +721 @@ def start_web_server():
+@@ -563 +752 @@ def start_web_server():
 -                    [exe, web_server_script],
 +                    web_server_cmd,
-@@ -568,0 +727,2 @@ def start_web_server():
+@@ -568,0 +758,2 @@ def start_web_server():
 +        if config.OPERATING_SYSTEM == "Darwin":
 +            webproc.write_pidfile(web_server_process.pid, _web_port, _web_host, web_server_script)
-@@ -570,0 +731,2 @@ def start_web_server():
+@@ -570,0 +762,2 @@ def start_web_server():
 +        if config.OPERATING_SYSTEM == "Darwin":
 +            logger.info(f"🌐 Web UI port on macOS: http://localhost:{_web_port}")
-@@ -577,0 +740,3 @@ def start_web_server():
+@@ -577,0 +771,3 @@ def start_web_server():
 +            if config.OPERATING_SYSTEM == "Darwin":
 +                webproc.remove_pidfile()
 +                web_server_process = None
-@@ -584,0 +750,3 @@ def start_web_server():
+@@ -584,0 +781,3 @@ def start_web_server():
 +    finally:
 +        if _darwin:
 +            _web_proc_lock.release()
-@@ -588,0 +757,2 @@ def stop_web_server():
+@@ -588,0 +788,2 @@ def stop_web_server():
 +    if config.OPERATING_SYSTEM == "Darwin":
 +        return _stop_web_server_darwin()
-@@ -606,0 +777,29 @@ def stop_web_server():
+@@ -606,0 +808,29 @@ def stop_web_server():
 +_web_restart_lock = threading.Lock()
 +def restart_web_server():
 +    """macOS: restart the web server subprocess so new web_host/web_port settings apply. Returns True on success."""
@@ -213,31 +244,35 @@ index 3d72fc4..229c047 100644
 +            _web_proc_lock.release()
 +        except RuntimeError:
 +            pass
-@@ -657,0 +857,2 @@ async def main():
+@@ -657,0 +888,2 @@ async def main():
 +    if config.OPERATING_SYSTEM == "Darwin":
 +        _install_web_cleanup_hooks()
-@@ -658,0 +860,5 @@ async def main():
+@@ -658,0 +891,5 @@ async def main():
 +    if config.OPERATING_SYSTEM == "Darwin":
 +        config.web_restart_callback = restart_web_server
 +    if config.OPERATING_SYSTEM == "Darwin":
 +        _log_roms_source()
 +        _maybe_show_roms_warning()
-@@ -954,0 +1161,5 @@ async def main():
+@@ -708,0 +946,3 @@ async def main():
++        if config.OPERATING_SYSTEM == "Darwin" and getattr(config, "quit_requested", False):
++            logger.info("Arrêt demandé par signal: sortie propre de la boucle principale")
++            break
+@@ -954,0 +1195,5 @@ async def main():
 +                if config.menu_state == "web_access_confirm":
 +                    # Start cancels the network-access warning without changing anything
 +                    config.menu_state = "pause_settings_menu"
 +                    config.needs_redraw = True
 +                    continue
-@@ -986,0 +1198 @@ async def main():
+@@ -986,0 +1232 @@ async def main():
 +                "web_access_confirm",
-@@ -1453,0 +1666,3 @@ async def main():
+@@ -1453,0 +1700,3 @@ async def main():
 +            elif config.menu_state == "web_access_confirm":
 +                from display import draw_web_access_confirm_dialog
 +                draw_web_access_confirm_dialog(screen)
-@@ -1745,0 +1961,2 @@ async def main():
+@@ -1745,0 +1995,2 @@ async def main():
 +    if config.OPERATING_SYSTEM == "Darwin":
 +        _mark_web_shutting_down()
-@@ -1768,0 +1986,2 @@ async def main():
+@@ -1768,0 +2020,2 @@ async def main():
 +    elif config.OPERATING_SYSTEM == "Darwin":
 +        logger.debug("Mise à jour liste des jeux EmulationStation ignorée sur macOS")
 diff --git a/ports/RGSX/config.py b/ports/RGSX/config.py
