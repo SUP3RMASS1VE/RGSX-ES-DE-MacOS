@@ -1218,6 +1218,19 @@ def _expand_torrent_source(item, platform_id: str) -> list[tuple[str, None, str 
     return expanded
 
  
+def _stop_web_before_exec():
+    """macOS: os.execl keeps our pid but drops the web_server_process handle, so stop the web child first."""
+    try:
+        if os.path.basename(sys.argv[0] or "") == "rgsx_web.py":
+            return  # running inside the web server itself: nothing to stop
+        main_mod = sys.modules.get("__main__")
+        stop = getattr(main_mod, "stop_web_server", None)
+        if stop is not None:
+            stop()
+    except Exception as e:
+        logger.warning(f"Web server not stopped before restart: {e}")
+
+
 def restart_application(delay_ms: int = 2000):
     """Schedule a restart with a visible popup; actual restart happens in the main loop.
 
@@ -1251,6 +1264,8 @@ def restart_application(delay_ms: int = 2000):
                     pygame.quit()
                 except Exception:
                     pass
+                if config.OPERATING_SYSTEM == "Darwin":
+                    _stop_web_before_exec()
                 exe = sys.executable or "python"
                 os.execl(exe, exe, *sys.argv)
             except Exception as e:

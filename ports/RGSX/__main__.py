@@ -523,6 +523,76 @@ def _apply_joystick_controls(js, reason: str) -> None:
 # ===== GESTION DU SERVEUR WEB =====
 web_server_process = None
 
+# macOS: every read/write of web_server_process happens under this lock; _web_shutting_down stops new spawns once we quit
+_web_proc_lock = threading.RLock()
+_web_shutting_down = False
+_web_hooks_installed = False
+def _web_script_path():
+    return os.path.join(config.APP_FOLDER, "rgsx_web.py")
+def _stop_web_server_darwin():
+    """macOS: SIGTERM, wait ~3 s, SIGKILL, then verify the process and its port are really gone. Returns True when stopped."""
+    global web_server_process
+    from macos import webproc
+    with _web_proc_lock:
+        proc = web_server_process
+        if proc is None:
+            return True
+        rt = getattr(config, "web_runtime", None) or {}
+        port = rt.get("port")
+        try:
+            logger.info("Arrêt du serveur web...")
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    logger.warning("Serveur web ne répond pas, forçage de l'arrêt...")
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+            if proc.poll() is None:
+                webproc.terminate_pid(proc.pid, _web_script_path())
+        except Exception as e:
+            logger.error(f"Erreur lors de l'arrêt du serveur web: {e}")
+        gone = proc.poll() is not None and not webproc.pid_alive(proc.pid)
+        if gone and port:
+            if not webproc.port_released(rt.get("host"), port, timeout=2.0, pid=proc.pid):
+                logger.warning(f"Serveur web: port {port} still busy after stop")
+                gone = False
+        if gone:
+            logger.info("Serveur web arrêté proprement")
+            web_server_process = None
+            webproc.remove_pidfile()
+        else:
+            logger.warning(f"Serveur web (PID {proc.pid}) toujours actif, le handle est conservé pour un nouvel essai")
+        return gone
+def _mark_web_shutting_down():
+    """macOS: called on the quit path; no new web server may be spawned afterwards (e.g. by an in-flight restart)."""
+    global _web_shutting_down
+    _web_shutting_down = True
+def _shutdown_web_server_atexit():
+    """macOS: idempotent, never raises. Used by atexit, the signal fallback and the quit path."""
+    try:
+        _mark_web_shutting_down()
+        stop_web_server()
+        if web_server_process is not None:  # still alive after the normal stop: last resort by pid
+            from macos import webproc
+            webproc.terminate_pid(web_server_process.pid, _web_script_path())
+    except Exception as e:
+        try:
+            logger.error(f"Erreur lors de l'arrêt du serveur web (atexit): {e}")
+        except Exception:
+            pass
+def _install_web_cleanup_hooks():
+    """macOS: atexit cleanup + signal handlers (main thread only). Idempotent."""
+    global _web_hooks_installed
+    if _web_hooks_installed:
+        return
+    import atexit
+    _web_hooks_installed = True
+    atexit.register(_shutdown_web_server_atexit)
 def _pick_web_port(host="127.0.0.1", preferred=5000):
     """macOS: first bindable port in preferred..preferred+10 on the server's own host (AirPlay Receiver owns 5000)."""
     import socket as _socket
@@ -572,6 +642,17 @@ def _maybe_show_roms_warning():
 def start_web_server():
     """Démarre le serveur web en arrière-plan dans un processus séparé."""
     global web_server_process
+    _darwin = config.OPERATING_SYSTEM == "Darwin"
+    if _darwin:
+        _web_proc_lock.acquire()
+        if _web_shutting_down:
+            _web_proc_lock.release()
+            logger.info("Arrêt de RGSX en cours: le serveur web n'est pas démarré")
+            return False
+        if web_server_process is not None and web_server_process.poll() is None:
+            _web_proc_lock.release()
+            logger.warning("Un serveur web est déjà suivi et actif: pas de second serveur")
+            return True
     try:
         web_server_script = os.path.join(config.APP_FOLDER, "rgsx_web.py")
         
@@ -606,6 +687,9 @@ def start_web_server():
             logger.info(f"🚀 Lancement du serveur web (mode Linux/Unix)...")
             web_server_cmd = [exe, web_server_script]
             if config.OPERATING_SYSTEM == "Darwin":
+                # macOS: stop RGSX web servers left by a previous session/crash before choosing the port
+                from macos import webproc
+                webproc.cleanup_stale(web_server_script)
                 # macOS: local only by default (the web UI has no authentication); RGSX_WEB_HOST overrides
                 web_server_cmd += ["--host", os.environ.get("RGSX_WEB_HOST", "127.0.0.1")]
                 # precedence: env RGSX_WEB_HOST > settings web_host > 127.0.0.1 (invalid values skipped)
@@ -626,6 +710,7 @@ def start_web_server():
                     getattr(logger, _lvl)(_msg)
                 config.web_runtime = {"host": _web_host, "port": _web_port, "requested_port": _web_port_requested}
                 web_server_cmd += ["--port", str(_web_port)]
+                web_server_cmd += ["--parent-pid", str(os.getpid())]
                 try:
                     with open(os.path.join(config.CONFIG_FOLDER, "web_port.txt"), "w", encoding="utf-8") as _pf:
                         _pf.write(str(_web_port))
@@ -639,6 +724,8 @@ def start_web_server():
                     cwd=config.APP_FOLDER
                 )
         
+        if config.OPERATING_SYSTEM == "Darwin":
+            webproc.write_pidfile(web_server_process.pid, _web_port, _web_host, web_server_script)
         logger.info(f"✅ Serveur web démarré (PID: {web_server_process.pid})")
         logger.info(f"🌐 Serveur accessible sur http://localhost:5000")
         if config.OPERATING_SYSTEM == "Darwin":
@@ -650,6 +737,9 @@ def start_web_server():
         if web_server_process.poll() is not None:
             logger.error(f"❌ Le serveur web s'est arrêté immédiatement (code: {web_server_process.returncode})")
             logger.error(f"📝 Vérifiez les logs: {web_server_log}")
+            if config.OPERATING_SYSTEM == "Darwin":
+                webproc.remove_pidfile()
+                web_server_process = None
             return False
         
         return True
@@ -657,10 +747,15 @@ def start_web_server():
         logger.error(f"❌ Erreur lors du démarrage du serveur web: {e}")
         logger.exception("Détails de l'exception:")
         return False
+    finally:
+        if _darwin:
+            _web_proc_lock.release()
 
 def stop_web_server():
     """Arrête proprement le serveur web."""
     global web_server_process
+    if config.OPERATING_SYSTEM == "Darwin":
+        return _stop_web_server_darwin()
     if web_server_process is not None:
         try:
             logger.info("Arrêt du serveur web...")
@@ -688,8 +783,13 @@ def restart_web_server():
         logger.info("Redémarrage du serveur web déjà en cours")
         return False
     try:
+        _web_proc_lock.acquire()
         config.web_restart_status = "restarting"
         stop_web_server()
+        if web_server_process is not None:
+            # the old server could not be stopped: never run two
+            config.web_restart_status = "failed"
+            return False
         config.web_runtime = None
         ok = start_web_server()
         config.web_restart_status = "ok" if ok else "failed"
@@ -699,6 +799,10 @@ def restart_web_server():
         return ok
     finally:
         _web_restart_lock.release()
+        try:
+            _web_proc_lock.release()
+        except RuntimeError:
+            pass
 def _is_arm_machine() -> bool:
     machine = (platform.machine() or "").lower()
     return ("arm" in machine) or ("aarch64" in machine)
@@ -750,6 +854,8 @@ async def main():
         config.game_filter_obj = None
     
     # Démarrer le serveur web en arrière-plan
+    if config.OPERATING_SYSTEM == "Darwin":
+        _install_web_cleanup_hooks()
     start_web_server()
     if config.OPERATING_SYSTEM == "Darwin":
         config.web_restart_callback = restart_web_server
@@ -1852,6 +1958,8 @@ async def main():
         logger.debug(f"Erreur lors du shutdown des téléchargements: {e}")
     
     # Arrêter le serveur web
+    if config.OPERATING_SYSTEM == "Darwin":
+        _mark_web_shutting_down()
     stop_web_server()
     
    

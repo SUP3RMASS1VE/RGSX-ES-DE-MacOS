@@ -1,8 +1,78 @@
 diff --git a/ports/RGSX/__main__.py b/ports/RGSX/__main__.py
-index 3d72fc4..c4f14cd 100644
+index 3d72fc4..229c047 100644
 --- a/ports/RGSX/__main__.py
 +++ b/ports/RGSX/__main__.py
-@@ -525,0 +526,46 @@ web_server_process = None
+@@ -525,0 +526,116 @@ web_server_process = None
++# macOS: every read/write of web_server_process happens under this lock; _web_shutting_down stops new spawns once we quit
++_web_proc_lock = threading.RLock()
++_web_shutting_down = False
++_web_hooks_installed = False
++def _web_script_path():
++    return os.path.join(config.APP_FOLDER, "rgsx_web.py")
++def _stop_web_server_darwin():
++    """macOS: SIGTERM, wait ~3 s, SIGKILL, then verify the process and its port are really gone. Returns True when stopped."""
++    global web_server_process
++    from macos import webproc
++    with _web_proc_lock:
++        proc = web_server_process
++        if proc is None:
++            return True
++        rt = getattr(config, "web_runtime", None) or {}
++        port = rt.get("port")
++        try:
++            logger.info("Arrêt du serveur web...")
++            if proc.poll() is None:
++                proc.terminate()
++                try:
++                    proc.wait(timeout=3)
++                except subprocess.TimeoutExpired:
++                    logger.warning("Serveur web ne répond pas, forçage de l'arrêt...")
++                    proc.kill()
++                    try:
++                        proc.wait(timeout=2)
++                    except subprocess.TimeoutExpired:
++                        pass
++            if proc.poll() is None:
++                webproc.terminate_pid(proc.pid, _web_script_path())
++        except Exception as e:
++            logger.error(f"Erreur lors de l'arrêt du serveur web: {e}")
++        gone = proc.poll() is not None and not webproc.pid_alive(proc.pid)
++        if gone and port:
++            if not webproc.port_released(rt.get("host"), port, timeout=2.0, pid=proc.pid):
++                logger.warning(f"Serveur web: port {port} still busy after stop")
++                gone = False
++        if gone:
++            logger.info("Serveur web arrêté proprement")
++            web_server_process = None
++            webproc.remove_pidfile()
++        else:
++            logger.warning(f"Serveur web (PID {proc.pid}) toujours actif, le handle est conservé pour un nouvel essai")
++        return gone
++def _mark_web_shutting_down():
++    """macOS: called on the quit path; no new web server may be spawned afterwards (e.g. by an in-flight restart)."""
++    global _web_shutting_down
++    _web_shutting_down = True
++def _shutdown_web_server_atexit():
++    """macOS: idempotent, never raises. Used by atexit, the signal fallback and the quit path."""
++    try:
++        _mark_web_shutting_down()
++        stop_web_server()
++        if web_server_process is not None:  # still alive after the normal stop: last resort by pid
++            from macos import webproc
++            webproc.terminate_pid(web_server_process.pid, _web_script_path())
++    except Exception as e:
++        try:
++            logger.error(f"Erreur lors de l'arrêt du serveur web (atexit): {e}")
++        except Exception:
++            pass
++def _install_web_cleanup_hooks():
++    """macOS: atexit cleanup + signal handlers (main thread only). Idempotent."""
++    global _web_hooks_installed
++    if _web_hooks_installed:
++        return
++    import atexit
++    _web_hooks_installed = True
++    atexit.register(_shutdown_web_server_atexit)
 +def _pick_web_port(host="127.0.0.1", preferred=5000):
 +    """macOS: first bindable port in preferred..preferred+10 on the server's own host (AirPlay Receiver owns 5000)."""
 +    import socket as _socket
@@ -49,9 +119,24 @@ index 3d72fc4..c4f14cd 100644
 +            fh.write(launcher)
 +    except Exception as exc:
 +        logger.debug(f"ROMs warning dialog skipped: {exc}")
-@@ -560,0 +607,27 @@ def start_web_server():
+@@ -528,0 +645,11 @@ def start_web_server():
++    _darwin = config.OPERATING_SYSTEM == "Darwin"
++    if _darwin:
++        _web_proc_lock.acquire()
++        if _web_shutting_down:
++            _web_proc_lock.release()
++            logger.info("Arrêt de RGSX en cours: le serveur web n'est pas démarré")
++            return False
++        if web_server_process is not None and web_server_process.poll() is None:
++            _web_proc_lock.release()
++            logger.warning("Un serveur web est déjà suivi et actif: pas de second serveur")
++            return True
+@@ -560,0 +688,31 @@ def start_web_server():
 +            web_server_cmd = [exe, web_server_script]
 +            if config.OPERATING_SYSTEM == "Darwin":
++                # macOS: stop RGSX web servers left by a previous session/crash before choosing the port
++                from macos import webproc
++                webproc.cleanup_stale(web_server_script)
 +                # macOS: local only by default (the web UI has no authentication); RGSX_WEB_HOST overrides
 +                web_server_cmd += ["--host", os.environ.get("RGSX_WEB_HOST", "127.0.0.1")]
 +                # precedence: env RGSX_WEB_HOST > settings web_host > 127.0.0.1 (invalid values skipped)
@@ -72,18 +157,33 @@ index 3d72fc4..c4f14cd 100644
 +                    getattr(logger, _lvl)(_msg)
 +                config.web_runtime = {"host": _web_host, "port": _web_port, "requested_port": _web_port_requested}
 +                web_server_cmd += ["--port", str(_web_port)]
++                web_server_cmd += ["--parent-pid", str(os.getpid())]
 +                try:
 +                    with open(os.path.join(config.CONFIG_FOLDER, "web_port.txt"), "w", encoding="utf-8") as _pf:
 +                        _pf.write(str(_web_port))
 +                except OSError:
 +                    pass
-@@ -563 +636 @@ def start_web_server():
+@@ -563 +721 @@ def start_web_server():
 -                    [exe, web_server_script],
 +                    web_server_cmd,
-@@ -570,0 +644,2 @@ def start_web_server():
+@@ -568,0 +727,2 @@ def start_web_server():
++        if config.OPERATING_SYSTEM == "Darwin":
++            webproc.write_pidfile(web_server_process.pid, _web_port, _web_host, web_server_script)
+@@ -570,0 +731,2 @@ def start_web_server():
 +        if config.OPERATING_SYSTEM == "Darwin":
 +            logger.info(f"🌐 Web UI port on macOS: http://localhost:{_web_port}")
-@@ -606,0 +682,20 @@ def stop_web_server():
+@@ -577,0 +740,3 @@ def start_web_server():
++            if config.OPERATING_SYSTEM == "Darwin":
++                webproc.remove_pidfile()
++                web_server_process = None
+@@ -584,0 +750,3 @@ def start_web_server():
++    finally:
++        if _darwin:
++            _web_proc_lock.release()
+@@ -588,0 +757,2 @@ def stop_web_server():
++    if config.OPERATING_SYSTEM == "Darwin":
++        return _stop_web_server_darwin()
+@@ -606,0 +777,29 @@ def stop_web_server():
 +_web_restart_lock = threading.Lock()
 +def restart_web_server():
 +    """macOS: restart the web server subprocess so new web_host/web_port settings apply. Returns True on success."""
@@ -93,8 +193,13 @@ index 3d72fc4..c4f14cd 100644
 +        logger.info("Redémarrage du serveur web déjà en cours")
 +        return False
 +    try:
++        _web_proc_lock.acquire()
 +        config.web_restart_status = "restarting"
 +        stop_web_server()
++        if web_server_process is not None:
++            # the old server could not be stopped: never run two
++            config.web_restart_status = "failed"
++            return False
 +        config.web_runtime = None
 +        ok = start_web_server()
 +        config.web_restart_status = "ok" if ok else "failed"
@@ -104,25 +209,35 @@ index 3d72fc4..c4f14cd 100644
 +        return ok
 +    finally:
 +        _web_restart_lock.release()
-@@ -658,0 +754,5 @@ async def main():
++        try:
++            _web_proc_lock.release()
++        except RuntimeError:
++            pass
+@@ -657,0 +857,2 @@ async def main():
++    if config.OPERATING_SYSTEM == "Darwin":
++        _install_web_cleanup_hooks()
+@@ -658,0 +860,5 @@ async def main():
 +    if config.OPERATING_SYSTEM == "Darwin":
 +        config.web_restart_callback = restart_web_server
 +    if config.OPERATING_SYSTEM == "Darwin":
 +        _log_roms_source()
 +        _maybe_show_roms_warning()
-@@ -954,0 +1055,5 @@ async def main():
+@@ -954,0 +1161,5 @@ async def main():
 +                if config.menu_state == "web_access_confirm":
 +                    # Start cancels the network-access warning without changing anything
 +                    config.menu_state = "pause_settings_menu"
 +                    config.needs_redraw = True
 +                    continue
-@@ -986,0 +1092 @@ async def main():
+@@ -986,0 +1198 @@ async def main():
 +                "web_access_confirm",
-@@ -1453,0 +1560,3 @@ async def main():
+@@ -1453,0 +1666,3 @@ async def main():
 +            elif config.menu_state == "web_access_confirm":
 +                from display import draw_web_access_confirm_dialog
 +                draw_web_access_confirm_dialog(screen)
-@@ -1768,0 +1878,2 @@ async def main():
+@@ -1745,0 +1961,2 @@ async def main():
++    if config.OPERATING_SYSTEM == "Darwin":
++        _mark_web_shutting_down()
+@@ -1768,0 +1986,2 @@ async def main():
 +    elif config.OPERATING_SYSTEM == "Darwin":
 +        logger.debug("Mise à jour liste des jeux EmulationStation ignorée sur macOS")
 diff --git a/ports/RGSX/config.py b/ports/RGSX/config.py
@@ -474,7 +589,7 @@ index befd09b..2764376 100644
 +        import libtorrent_backend as _lt
 +        return _lt.shutdown()
 diff --git a/ports/RGSX/rgsx_web.py b/ports/RGSX/rgsx_web.py
-index 88fc0e2..2e48a87 100644
+index 88fc0e2..0debf79 100644
 --- a/ports/RGSX/rgsx_web.py
 +++ b/ports/RGSX/rgsx_web.py
 @@ -22,0 +23 @@ import config
@@ -488,10 +603,50 @@ index 88fc0e2..2e48a87 100644
 @@ -1989,0 +1991,2 @@ DO NOT share this file publicly as it may contain sensitive information.
 +        if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin':
 +            html = html.replace('</head>', '<style>[onclick="openQbittorrentWebUi()"]{display:none !important}</style></head>', 1)
-@@ -2033,0 +2037,2 @@ def run_server(host='0.0.0.0', port=5000):
+@@ -1995,0 +1999,39 @@ DO NOT share this file publicly as it may contain sensitive information.
++STANDALONE = False  # True only when started as `python rgsx_web.py` (never when imported, e.g. by tests)
++PARENT_PID = 0  # macOS: pid of the RGSX app that spawned this server (--parent-pid), 0 = no watchdog
++
++
++def _darwin_guard_server(httpd):
++    """macOS: stop on SIGTERM/SIGHUP and when the parent RGSX process disappears, so the port is never leaked."""
++    import signal
++
++    def _stop_soon(*_args):
++        # shutdown() must not run on the thread inside serve_forever (deadlock): hand it to a thread
++        threading.Thread(target=httpd.shutdown, daemon=True).start()
++        threading.Timer(2.0, os._exit, args=(0,)).start()
++
++    for _sig in (signal.SIGTERM, signal.SIGHUP):
++        try:
++            signal.signal(_sig, _stop_soon)
++        except (ValueError, OSError):
++            pass
++    parent = PARENT_PID
++    if parent and parent > 1:
++        def _watch():
++            while True:
++                time.sleep(1.0)
++                alive = True
++                try:
++                    os.kill(parent, 0)
++                except ProcessLookupError:
++                    alive = False
++                except PermissionError:
++                    pass
++                if os.getppid() != parent or not alive:
++                    logger.info("Parent gone, shutting down")
++                    for handler in logging.root.handlers:
++                        handler.flush()
++                    _stop_soon()
++                    return
++        threading.Thread(target=_watch, daemon=True).start()
++
++
+@@ -2033,0 +2076,2 @@ def run_server(host='0.0.0.0', port=5000):
 +        elif getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin':
 +            pass  # never kill whatever owns the port on macOS (AirPlay Receiver)
-@@ -2069 +2074,6 @@ def run_server(host='0.0.0.0', port=5000):
+@@ -2069 +2113,6 @@ def run_server(host='0.0.0.0', port=5000):
 -        logger.info(f"Accès réseau: http://{local_ip}:{port}")
 +        if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin':
 +            from rgsx_settings import web_access_log_lines
@@ -499,7 +654,7 @@ index 88fc0e2..2e48a87 100644
 +                getattr(logger, level)(msg)
 +        else:
 +            logger.info(f"Accès réseau: http://{local_ip}:{port}")
-@@ -2075 +2085,6 @@ def run_server(host='0.0.0.0', port=5000):
+@@ -2075 +2124,6 @@ def run_server(host='0.0.0.0', port=5000):
 -            logger.info(f"🌍 Accès réseau: http://{local_ip}:{port}")
 +            if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin':
 +                from rgsx_settings import web_access_log_lines
@@ -507,8 +662,24 @@ index 88fc0e2..2e48a87 100644
 +                    getattr(logger, level)(msg)
 +            else:
 +                logger.info(f"🌍 Accès réseau: http://{local_ip}:{port}")
+@@ -2086,0 +2141,2 @@ def run_server(host='0.0.0.0', port=5000):
++    if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin' and STANDALONE:
++        _darwin_guard_server(httpd)
+@@ -2096,0 +2153,7 @@ def run_server(host='0.0.0.0', port=5000):
++    if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin' and STANDALONE:
++        # macOS: serve_forever returned (signal or parent gone): make sure the process really exits
++        try:
++            httpd.server_close()
++        except Exception:
++            pass
++        os._exit(0)
+@@ -2108,0 +2172 @@ if __name__ == '__main__':
++    parser.add_argument('--parent-pid', type=int, default=0, help='macOS: stop when this pid disappears')
+@@ -2109,0 +2174,2 @@ if __name__ == '__main__':
++    PARENT_PID = args.parent_pid
++    STANDALONE = True
 diff --git a/ports/RGSX/utils.py b/ports/RGSX/utils.py
-index 5d68b8a..de99dfd 100644
+index 5d68b8a..12440ee 100644
 --- a/ports/RGSX/utils.py
 +++ b/ports/RGSX/utils.py
 @@ -16,0 +17 @@ from config import HEADLESS, Game
@@ -527,53 +698,70 @@ index 5d68b8a..de99dfd 100644
 +        for fallback in ("/opt/homebrew/bin/7zz", "/usr/local/bin/7zz", "/opt/homebrew/bin/7z", "/usr/local/bin/7z"):
 +            if fallback not in candidates:
 +                candidates.append(fallback)
-@@ -2095,0 +2106,3 @@ def check_extension_before_download(url, platform, game_name):
+@@ -1210,0 +1221,13 @@ def _expand_torrent_source(item, platform_id: str) -> list[tuple[str, None, str
++def _stop_web_before_exec():
++    """macOS: os.execl keeps our pid but drops the web_server_process handle, so stop the web child first."""
++    try:
++        if os.path.basename(sys.argv[0] or "") == "rgsx_web.py":
++            return  # running inside the web server itself: nothing to stop
++        main_mod = sys.modules.get("__main__")
++        stop = getattr(main_mod, "stop_web_server", None)
++        if stop is not None:
++            stop()
++    except Exception as e:
++        logger.warning(f"Web server not stopped before restart: {e}")
++
++
+@@ -1243,0 +1267,2 @@ def restart_application(delay_ms: int = 2000):
++                if config.OPERATING_SYSTEM == "Darwin":
++                    _stop_web_before_exec()
+@@ -2095,0 +2121,3 @@ def check_extension_before_download(url, platform, game_name):
 +        if config.OPERATING_SYSTEM == "Darwin" and not system_known:
 +            # macOS: extensions.json keys use the RGSX folder name, not the ES-DE-mapped one
 +            system_known = any(s.get("folder") == _get_rgsx_folder_name(platform) for s in extensions_data)
-@@ -2157 +2170 @@ def is_extension_supported(filename, platform_key, extensions_data):
+@@ -2157 +2185 @@ def is_extension_supported(filename, platform_key, extensions_data):
 -            dest_dir = os.path.join(config.ROMS_FOLDER, platform_dict.get("folder"))
 +            dest_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(platform_dict.get("folder")))
-@@ -2172,0 +2186,6 @@ def is_extension_supported(filename, platform_key, extensions_data):
+@@ -2172,0 +2201,6 @@ def is_extension_supported(filename, platform_key, extensions_data):
 +    if config.OPERATING_SYSTEM == "Darwin":
 +        # macOS: the folder may be ES-DE-mapped (gamecube -> gc) while extensions.json uses the RGSX name
 +        _raw_folder = _get_rgsx_folder_name(platform_key)
 +        for system in extensions_data:
 +            if system["folder"] == _raw_folder:
 +                return extension in system["extensions"]
-@@ -2184 +2203 @@ def _get_dest_folder_name(platform_key: str) -> str:
+@@ -2184 +2218 @@ def _get_dest_folder_name(platform_key: str) -> str:
 -                dest_dir = os.path.join(config.ROMS_FOLDER, folder)
 +                dest_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
-@@ -2192,0 +2212,6 @@ def _get_dest_folder_name(platform_key: str) -> str:
+@@ -2192,0 +2227,6 @@ def _get_dest_folder_name(platform_key: str) -> str:
 +def _get_rgsx_folder_name(platform_key: str) -> str:
 +    """Nom du dossier RGSX (non mappé ES-DE) pour une plateforme; utilisé sur macOS."""
 +    for platform_dict in config.platform_dicts:
 +        if platform_dict.get("platform_name") == platform_key:
 +            return platform_dict.get("folder") or ""
 +    return ""
-@@ -2300 +2325 @@ def load_sources(
+@@ -2300 +2340 @@ def load_sources(
 -                expected_dir = os.path.join(config.ROMS_FOLDER, folder)
 +                expected_dir = os.path.join(config.ROMS_FOLDER, map_rom_folder(folder))
-@@ -2927,0 +2953,4 @@ def extract_rar(rar_path, dest_dir, url):
+@@ -2927,0 +2968,4 @@ def extract_rar(rar_path, dest_dir, url):
 +
 +        # macOS: no unrar formula in Homebrew, 7-Zip reads RAR natively
 +        if config.OPERATING_SYSTEM == "Darwin" and shutil.which("unrar") is None:
 +            return extract_7z(rar_path, dest_dir, url)
-@@ -3051 +3080,3 @@ def extract_7z(archive_path, dest_dir, url):
+@@ -3051 +3095,3 @@ def extract_7z(archive_path, dest_dir, url):
 -            return False, "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs"
 +            if config.OPERATING_SYSTEM == "Darwin":
 +                return False, "7-Zip is missing: relaunch RGSX with internet to repair it (see bootstrap.log)"
 +            return False, ("7zz not found - run: brew install sevenzip" if config.OPERATING_SYSTEM == "Darwin" else "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs")
-@@ -3314,0 +3346,3 @@ def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archi
+@@ -3314,0 +3361,3 @@ def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archi
 +            if config.OPERATING_SYSTEM == "Darwin":
 +                return False, "PS3 Redump decryption is not supported on macOS (no native ps3dec)"
 +
-@@ -3402 +3436,3 @@ def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archi
+@@ -3402 +3451,3 @@ def handle_ps3(dest_dir, new_dirs=None, extracted_basename=None, url=None, archi
 -                return False, "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs"
 +                if config.OPERATING_SYSTEM == "Darwin":
 +                    return False, "7-Zip is missing: relaunch RGSX with internet to repair it (see bootstrap.log)"
 +                return False, ("7zz not found - run: brew install sevenzip" if config.OPERATING_SYSTEM == "Darwin" else "7z non trouvé - vérifiez que 7z.exe (Windows) ou 7zz (Linux) est présent dans assets/progs")
-@@ -3753,0 +3790,8 @@ def handle_xbox(dest_dir, iso_files, url=None):
+@@ -3753,0 +3805,8 @@ def handle_xbox(dest_dir, iso_files, url=None):
 +    elif config.OPERATING_SYSTEM == "Darwin":
 +        # macOS : extract-xiso depuis le PATH (pas de binaire fourni)
 +        xiso_path = shutil.which("extract-xiso")
@@ -582,12 +770,12 @@ index 5d68b8a..de99dfd 100644
 +            return False, "extract-xiso not found (build it from github.com/XboxDev/extract-xiso and put it on PATH)"
 +        extract_xiso_cmd = [xiso_path, "-r"]
 +
-@@ -4298 +4342 @@ def resolve_platform_folder(platform):
+@@ -4298 +4357 @@ def resolve_platform_folder(platform):
 -                    return folder
 +                    return map_rom_folder(folder)
-@@ -4310,0 +4355,2 @@ def resolve_platform_folder(platform):
+@@ -4310,0 +4370,2 @@ def resolve_platform_folder(platform):
 +    if cached_folder and config.OPERATING_SYSTEM == "Darwin":
 +        return map_rom_folder(cached_folder)  # macOS: ES-DE folder mapping
-@@ -4316 +4362 @@ def resolve_platform_folder(platform):
+@@ -4316 +4377 @@ def resolve_platform_folder(platform):
 -    return normalize_platform_name(platform)
 +    return map_rom_folder(normalize_platform_name(platform))

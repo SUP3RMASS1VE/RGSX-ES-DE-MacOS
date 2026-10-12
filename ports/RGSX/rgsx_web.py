@@ -1996,6 +1996,45 @@ DO NOT share this file publicly as it may contain sensitive information.
                 .replace('{version}', config.app_version))
 
 
+STANDALONE = False  # True only when started as `python rgsx_web.py` (never when imported, e.g. by tests)
+PARENT_PID = 0  # macOS: pid of the RGSX app that spawned this server (--parent-pid), 0 = no watchdog
+
+
+def _darwin_guard_server(httpd):
+    """macOS: stop on SIGTERM/SIGHUP and when the parent RGSX process disappears, so the port is never leaked."""
+    import signal
+
+    def _stop_soon(*_args):
+        # shutdown() must not run on the thread inside serve_forever (deadlock): hand it to a thread
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+        threading.Timer(2.0, os._exit, args=(0,)).start()
+
+    for _sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(_sig, _stop_soon)
+        except (ValueError, OSError):
+            pass
+    parent = PARENT_PID
+    if parent and parent > 1:
+        def _watch():
+            while True:
+                time.sleep(1.0)
+                alive = True
+                try:
+                    os.kill(parent, 0)
+                except ProcessLookupError:
+                    alive = False
+                except PermissionError:
+                    pass
+                if os.getppid() != parent or not alive:
+                    logger.info("Parent gone, shutting down")
+                    for handler in logging.root.handlers:
+                        handler.flush()
+                    _stop_soon()
+                    return
+        threading.Thread(target=_watch, daemon=True).start()
+
+
 def run_server(host='0.0.0.0', port=5000):
     """Démarre le serveur HTTP"""
     server_address = (host, port)
@@ -2099,6 +2138,8 @@ def run_server(host='0.0.0.0', port=5000):
     for handler in logging.root.handlers:
         handler.flush()
     
+    if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin' and STANDALONE:
+        _darwin_guard_server(httpd)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -2109,6 +2150,13 @@ def run_server(host='0.0.0.0', port=5000):
         logger.info("✅ Serveur arrêté proprement")
         for handler in logging.root.handlers:
             handler.flush()
+    if getattr(config, 'OPERATING_SYSTEM', '') == 'Darwin' and STANDALONE:
+        # macOS: serve_forever returned (signal or parent gone): make sure the process really exits
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+        os._exit(0)
 
 
 if __name__ == '__main__':
@@ -2121,7 +2169,10 @@ if __name__ == '__main__':
     parser.add_argument('--host', default='0.0.0.0', help='Adresse IP (défaut: 0.0.0.0)')
     parser.add_argument('--port', type=int, default=5000, help='Port (défaut: 5000)')
     
+    parser.add_argument('--parent-pid', type=int, default=0, help='macOS: stop when this pid disappears')
     args = parser.parse_args()
+    PARENT_PID = args.parent_pid
+    STANDALONE = True
     
     print(f"Lancement sur {args.host}:{args.port}...", flush=True)
     run_server(host=args.host, port=args.port)
