@@ -570,5 +570,6 @@
     "folder_created": "Folder created: {0}",
     "folder_create_error": "Error creating folder: {0}",
     "controls_action_select_char": "Add char",
-    "folder_browser_browse": "Browse"
+    "folder_browser_browse": "Browse",
+    "network_update_macos_manual": "Download RGSX_macos_arm64.zip from {url} and replace the ports folder. Settings are kept."
 }

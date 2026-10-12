@@ -316,6 +316,16 @@ GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
 OTA_UPDATE_ZIP = f"{GITHUB_RELEASES_URL}/latest/download/RGSX_update_latest.zip"
 OTA_UPDATE_WINDOWS_ZIP = f"{GITHUB_RELEASES_URL}/latest/download/RGSX_update_windows_latest.zip"
 OTA_VERSION_ENDPOINT = "https://raw.githubusercontent.com/RetroGameSets/RGSX/refs/heads/main/version.json"  # Endpoint pour vérifier la version disponible
+# --- macOS fork (SUP3RMASS1VE/RGSX-ES-DE-MacOS) ---
+# The fork keeps upstream's numeric version (no suffix: the update check compares numeric parts only).
+# The variant marker below + "variant" in version.json identify the fork. On Darwin the updater reads the
+# fork's version.json and only NOTIFIES (never installs upstream's non-mac package, never touches settings).
+# Fork-only releases use a 5th numeric component (e.g. 2.7.0.7.1), which sorts above 2.7.0.7.
+APP_VARIANT = "macos-fork"
+FORK_REPO = "SUP3RMASS1VE/RGSX-ES-DE-MacOS"
+FORK_RELEASES_URL = f"https://github.com/{FORK_REPO}/releases"
+FORK_VERSION_ENDPOINT = f"https://raw.githubusercontent.com/{FORK_REPO}/refs/heads/main/version.json"
+FORK_UPDATE_ZIP = f"{FORK_RELEASES_URL}/latest/download/RGSX_macos_arm64.zip"
 
 # Sites testés dans le menu pause_connection_status.
 # Pour personnaliser: modifier cette liste (ajouter/supprimer/changer URL, label, catégorie).

@@ -552,5 +552,6 @@
     "folder_created": "Klasör oluşturuldu: {0}",
     "folder_create_error": "Klasör oluşturulurken hata: {0}",
     "controls_action_select_char": "Karakter ekle",
-    "folder_browser_browse": "Gözat"
+    "folder_browser_browse": "Gözat",
+    "network_update_macos_manual": "Download RGSX_macos_arm64.zip from {url} and replace the ports folder. Settings are kept."
 }

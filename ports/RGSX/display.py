@@ -6272,7 +6272,8 @@ def draw_text_file_viewer(screen):
         screen.blit(position_surface, position_rect)
 
         if viewer_mode == 'ota_update':
-            hint_surface = config.small_font.render("Confirm: Update", True, THEME_COLORS["text_selected"])
+            hint_text = "Confirm: Continue" if config.OPERATING_SYSTEM == "Darwin" else "Confirm: Update"  # macOS: notify-only updater
+            hint_surface = config.small_font.render(hint_text, True, THEME_COLORS["text_selected"])
             hint_rect = hint_surface.get_rect(left=rect_x + 30, bottom=rect_y + rect_height - 10)
             screen.blit(hint_surface, hint_rect)
     else:

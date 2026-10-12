@@ -548,5 +548,6 @@
     "folder_created": "Cartella creata: {0}",
     "folder_create_error": "Errore nella creazione: {0}",
     "controls_action_select_char": "Aggiungi",
-    "folder_browser_browse": "Sfoglia"
+    "folder_browser_browse": "Sfoglia",
+    "network_update_macos_manual": "Download RGSX_macos_arm64.zip from {url} and replace the ports folder. Settings are kept."
 }

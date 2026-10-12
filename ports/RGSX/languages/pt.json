@@ -552,5 +552,6 @@
     "folder_created": "Pasta criada: {0}",
     "folder_create_error": "Erro ao criar: {0}",
     "controls_action_select_char": "Adicionar",
-    "folder_browser_browse": "Explorar"
+    "folder_browser_browse": "Explorar",
+    "network_update_macos_manual": "Download RGSX_macos_arm64.zip from {url} and replace the ports folder. Settings are kept."
 }

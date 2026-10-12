@@ -126,7 +126,7 @@ index 3d72fc4..c4f14cd 100644
 +    elif config.OPERATING_SYSTEM == "Darwin":
 +        logger.debug("Mise à jour liste des jeux EmulationStation ignorée sur macOS")
 diff --git a/ports/RGSX/config.py b/ports/RGSX/config.py
-index 0b9bfe4..fdc3911 100644
+index 0b9bfe4..8d3b053 100644
 --- a/ports/RGSX/config.py
 +++ b/ports/RGSX/config.py
 @@ -54,0 +55,31 @@ def get_application_root():
@@ -213,7 +213,18 @@ index 0b9bfe4..fdc3911 100644
 +        logging.getLogger(__name__).info(f"ROMS_FOLDER={ROMS_FOLDER} (source: {ROMS_FOLDER_SOURCE})")
 @@ -190,0 +264 @@ connection_status_progress = {"done": 0, "total": 0}
 +# macOS: ~/Library/Application Support/RGSX/logs
-@@ -301,0 +376,4 @@ SEVEN_Z_EXE = os.path.join(APP_FOLDER,"assets", "progs", "7z.exe")
+@@ -244,0 +319,10 @@ OTA_VERSION_ENDPOINT = "https://raw.githubusercontent.com/RetroGameSets/RGSX/ref
++# --- macOS fork (SUP3RMASS1VE/RGSX-ES-DE-MacOS) ---
++# The fork keeps upstream's numeric version (no suffix: the update check compares numeric parts only).
++# The variant marker below + "variant" in version.json identify the fork. On Darwin the updater reads the
++# fork's version.json and only NOTIFIES (never installs upstream's non-mac package, never touches settings).
++# Fork-only releases use a 5th numeric component (e.g. 2.7.0.7.1), which sorts above 2.7.0.7.
++APP_VARIANT = "macos-fork"
++FORK_REPO = "SUP3RMASS1VE/RGSX-ES-DE-MacOS"
++FORK_RELEASES_URL = f"https://github.com/{FORK_REPO}/releases"
++FORK_VERSION_ENDPOINT = f"https://raw.githubusercontent.com/{FORK_REPO}/refs/heads/main/version.json"
++FORK_UPDATE_ZIP = f"{FORK_RELEASES_URL}/latest/download/RGSX_macos_arm64.zip"
+@@ -301,0 +386,4 @@ SEVEN_Z_EXE = os.path.join(APP_FOLDER,"assets", "progs", "7z.exe")
 +# macOS: 7zz installed by macos/rgsx-macos into the runtime dir (RGSX_SEVENZIP overrides)
 +SEVEN_Z_DARWIN = os.environ.get("RGSX_SEVENZIP", "").strip() or os.path.join(
 +    os.environ.get("RGSX_RUNTIME_DIR", "").strip() or os.path.join(os.path.expanduser("~"), "Library", "Application Support", "RGSX", "runtime"),
@@ -356,7 +367,7 @@ index 7fb657b..0f939a2 100644
 +    else:
 +        _apply_web_settings_async()
 diff --git a/ports/RGSX/network.py b/ports/RGSX/network.py
-index d5a1427..cb68825 100644
+index d5a1427..3e251cb 100644
 --- a/ports/RGSX/network.py
 +++ b/ports/RGSX/network.py
 @@ -11,0 +12 @@ from config import HEADLESS
@@ -388,16 +399,44 @@ index d5a1427..cb68825 100644
 +        resolved = shutil.which('curl')
 +        return ('curl', resolved) if resolved else (None, None)
 +
-@@ -3120 +3144 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
+@@ -2218,0 +2243,4 @@ def _build_recent_changelog_text(latest_version, limit=5):
++    if config.OPERATING_SYSTEM == "Darwin":
++        # macOS fork: never fetch upstream's changelog (it describes upstream's non-mac packages)
++        title = _("network_update_available").format(latest_version) if _ else f"Update available: {latest_version}"
++        return f"{title}\n\nSee release notes: {config.FORK_RELEASES_URL}"
+@@ -2428,0 +2457,13 @@ async def apply_pending_update(latest_version):
++    if config.OPERATING_SYSTEM == "Darwin":
++        # macOS fork: notify only. No download, no extraction, nothing written under APP_FOLDER,
++        # UPDATE_FOLDER or SAVE_FOLDER (settings in ~/Library/Application Support/RGSX stay untouched).
++        message = _("network_update_macos_manual").format(url=config.FORK_RELEASES_URL)
++        logger.info(f"macOS: mise à jour manuelle requise (version {latest_version}): {message}")
++        config.update_result_message = message
++        config.update_result_error = False
++        config.popup_message = message
++        config.popup_timer = 10000
++        config.pending_update_version = ""
++        config.needs_redraw = True
++        # menu_state is left as-is (loading) so the startup sequence continues to the catalog step
++        return True, message
+@@ -2516,0 +2558,3 @@ async def check_for_updates():
++        if config.OPERATING_SYSTEM == "Darwin":
++            # macOS fork: only the fork's version.json (the fallback server reports upstream versions)
++            endpoints = [config.FORK_VERSION_ENDPOINT]
+@@ -2674,0 +2719,4 @@ def extract_update(zip_path, dest_dir, source_url):
++    if config.OPERATING_SYSTEM == "Darwin" and str(source_url).startswith(config.GITHUB_RELEASES_URL):
++        # macOS fork: never extract upstream's (non-mac) package over our files
++        logger.error(f"macOS: extraction refusée pour le paquet upstream {source_url}")
++        return False, _("network_update_macos_manual").format(url=config.FORK_RELEASES_URL)
+@@ -3120 +3168 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
 -                        platform_folder = platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform)
 +                        platform_folder = map_rom_folder(platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform))
-@@ -3125 +3149 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
+@@ -3125 +3173 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
 -                    platform_folder = resolve_platform_folder(platform)
 +                    platform_folder = map_rom_folder(resolve_platform_folder(platform))
-@@ -4323 +4347 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
+@@ -4323 +4371 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
 -                        platform_folder = platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform)
 +                        platform_folder = map_rom_folder(platform_dict.get("folder") or platform_dict.get("dossier") or resolve_platform_folder(platform))
-@@ -4328 +4352 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
+@@ -4328 +4376 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
 -                    platform_folder = resolve_platform_folder(platform)
 +                    platform_folder = map_rom_folder(resolve_platform_folder(platform))
 diff --git a/ports/RGSX/qbittorrent_backend.py b/ports/RGSX/qbittorrent_backend.py

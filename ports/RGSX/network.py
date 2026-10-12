@@ -2240,6 +2240,10 @@ def _fetch_recent_release_changelogs(limit=5):
 
 
 def _build_recent_changelog_text(latest_version, limit=5):
+    if config.OPERATING_SYSTEM == "Darwin":
+        # macOS fork: never fetch upstream's changelog (it describes upstream's non-mac packages)
+        title = _("network_update_available").format(latest_version) if _ else f"Update available: {latest_version}"
+        return f"{title}\n\nSee release notes: {config.FORK_RELEASES_URL}"
     changelogs = _fetch_recent_release_changelogs(limit=limit)
     title = _("network_update_available").format(latest_version) if _ else f"Update available: {latest_version}"
     intro = f"{title}\n\nLast {len(changelogs) if changelogs else limit} changelogs:\n"
@@ -2450,6 +2454,19 @@ async def _apply_pending_windows_update(latest_version: str) -> tuple[bool, str]
 
 
 async def apply_pending_update(latest_version):
+    if config.OPERATING_SYSTEM == "Darwin":
+        # macOS fork: notify only. No download, no extraction, nothing written under APP_FOLDER,
+        # UPDATE_FOLDER or SAVE_FOLDER (settings in ~/Library/Application Support/RGSX stay untouched).
+        message = _("network_update_macos_manual").format(url=config.FORK_RELEASES_URL)
+        logger.info(f"macOS: mise à jour manuelle requise (version {latest_version}): {message}")
+        config.update_result_message = message
+        config.update_result_error = False
+        config.popup_message = message
+        config.popup_timer = 10000
+        config.pending_update_version = ""
+        config.needs_redraw = True
+        # menu_state is left as-is (loading) so the startup sequence continues to the catalog step
+        return True, message
     UPDATE_ZIP = OTA_UPDATE_ZIP
     logger.debug(f"URL de mise à jour : {UPDATE_ZIP} (version {latest_version})")
 
@@ -2538,6 +2555,9 @@ async def check_for_updates():
             OTA_VERSION_ENDPOINT,
             "https://retrogamesets.fr/softs/version.json"
         ]
+        if config.OPERATING_SYSTEM == "Darwin":
+            # macOS fork: only the fork's version.json (the fallback server reports upstream versions)
+            endpoints = [config.FORK_VERSION_ENDPOINT]
         
         response = None
         last_error = None
@@ -2696,6 +2716,10 @@ async def check_for_updates():
         return False, _("network_check_update_error").format(str(e))
 
 def extract_update(zip_path, dest_dir, source_url):
+    if config.OPERATING_SYSTEM == "Darwin" and str(source_url).startswith(config.GITHUB_RELEASES_URL):
+        # macOS fork: never extract upstream's (non-mac) package over our files
+        logger.error(f"macOS: extraction refusée pour le paquet upstream {source_url}")
+        return False, _("network_update_macos_manual").format(url=config.FORK_RELEASES_URL)
     
     try:
         os.makedirs(dest_dir, exist_ok=True)
