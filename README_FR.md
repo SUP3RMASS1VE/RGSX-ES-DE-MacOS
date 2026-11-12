@@ -51,7 +51,7 @@ Remplacez le dossier `ports` par le nouveau (supprimez d'abord l'ancien `ports/R
 
 La mise à jour intégrée sur macOS **prévient seulement** : quand le fork publie une version plus récente, un message renvoie vers la [page des releases du fork](https://github.com/SUP3RMASS1VE/RGSX-ES-DE-MacOS/releases). Elle ne télécharge ni n'installe rien, et ne touche jamais `~/Library/Application Support/RGSX` (vos paramètres et le runtime). Téléchargez `RGSX_macos_arm64.zip` depuis la page des releases et remplacez le dossier `ports` comme ci-dessus. Le paquet de mise à jour d'upstream n'est pas prévu pour macOS et n'est jamais installé par ce fork.
 
-Ce fork est synchronisé avec RGSX upstream v2.7.0.7 (la version affichée dans l'app). Au premier lancement après la mise à jour, RGSX construit sa base locale du catalogue de jeux (`rgsx.sqlite3` dans `~/Library/Application Support/RGSX`), ce qui peut prendre un moment.
+La version 2.7.0.7.1 conserve le portage macOS v2.7.0.7 et intègre sélectivement les correctifs upstream de sécurité des archives, sauvegarde des paramètres, téléchargements/historique/interface web et Media Manager jusqu'au commit `722f5c7` (2026-11-05). Ce n'est pas une synchronisation complète. La base locale est mise à niveau pour les informations ScreenScraper en conservant paramètres, historique et jeux téléchargés. L'installation automatique de mises à jour reste désactivée sur macOS, même pour les paquets de ce fork.
 
 ### Noms de dossiers ES-DE
 
@@ -183,6 +183,14 @@ Les sources torrent passent par libtorrent, installé automatiquement sur macOS 
 - Au premier torrent, le pare-feu macOS peut demander d'autoriser les connexions entrantes. Refuser permet quand même de télécharger.
 - Pour ne jamais avoir cette demande, définissez `RGSX_TORRENT_LISTEN=off` : RGSX écoute alors uniquement en local et désactive DHT, LSD et UPnP.
 - Lors d'un partage entre volumes, une seconde copie du fichier est conservée jusqu'à la fermeture de RGSX.
+
+---
+
+## 🖼️ Media Manager
+
+Dans le menu pause, ouvrez **Scrap**, renseignez votre compte ScreenScraper.fr puis ouvrez **Media Manager**. Sélectionnez les plateformes : le profil par défaut télécharge les jaquettes ; le profil maximum ajoute captures d'écran et descriptions. Vous pouvez interrompre le travail puis reprendre la file sauvegardée. L'interface web propose les mêmes fonctions. Un appui d'une seconde sur Confirmer ouvre les détails d'un jeu.
+
+Les images, la file et le compte restent dans `~/Library/Application Support/RGSX` (`media/`, `rgsx_media_queue.json`, `screenscraper_account.json`). Ce cache sert à RGSX ; les listes de jeux et médias ES-DE ne sont pas modifiés. Les correspondances de dossiers ROMs macOS restent actives, y compris sur un disque externe. L'option de désactivation de ScreenScraper dans **Scrap** arrête ses requêtes.
 
 ---
 

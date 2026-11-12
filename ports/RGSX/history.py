@@ -21,6 +21,9 @@ _history_write_ok = True
 
 _HISTORY_WRITE_FAILURE_COOLDOWN_SEC = 1.5
 
+# Les threads de téléchargement partagent config.history et réécrivent toute la table
+history_lock = threading.RLock()
+
 
 def _set_history_write_status(ok, error_message=""):
     global _history_write_ok, _history_write_last_error
@@ -124,6 +127,19 @@ def load_history():
         return []
 
 
+def reload_history(live_task_ids=()):
+    """Recharge config.history depuis SQLite sans lâcher les lignes des téléchargements en cours.
+
+    Chaque thread relit sa ligne dans config.history : avec une liste neuve, celles qui ne
+    sont pas encore écrites disparaissent, et ce que le thread y change n'est jamais sauvegardé.
+    """
+    with history_lock:
+        live = {entry.get("url"): entry for entry in config.history if entry.get("task_id") in live_task_ids}
+        merged = [live.pop(entry.get("url"), entry) for entry in load_history()]
+        merged.extend(live.values())
+        config.history = merged
+
+
 def save_history(history, force=False):
     """Sauvegarde l'historique dans la SQLite locale."""
     now = time.time()
@@ -135,7 +151,8 @@ def save_history(history, force=False):
     ):
         return False
     try:
-        database.save_history(history, config.DB_PATH)
+        with history_lock:
+            database.save_history(history, config.DB_PATH)
         _register_history_write_success()
         return True
     except Exception as exc:
@@ -266,7 +283,7 @@ def scan_roms_for_downloaded_games():
     """Scanne les dossiers ROMs et ajoute les jeux trouvés à downloaded_games.json."""
     from utils import load_games
 
-    downloaded = _normalize_downloaded_games_dict(getattr(config, 'downloaded_games', {}))
+    downloaded = load_downloaded_games()
     platform_dicts = list(getattr(config, 'platform_dicts', []) or [])
 
     if not platform_dicts:
@@ -357,8 +374,11 @@ def mark_game_as_downloaded(platform_name, game_name, file_size=None):
     
     downloaded[platform_name][normalized_name] = {}
     
-    # Sauvegarder immédiatement
-    save_downloaded_games(downloaded)
+    # Une seule ligne : le web et l'app sont deux processus avec chacun leur copie en mémoire
+    try:
+        database.add_downloaded_game(platform_name, normalized_name, config.DB_PATH)
+    except Exception as exc:
+        logger.error(f"Erreur lors de l'écriture des jeux téléchargés SQLite: {exc}")
     logger.info(f"Jeu marqué comme téléchargé : {platform_name} / {normalized_name}")
 
 

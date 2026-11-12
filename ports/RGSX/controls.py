@@ -10,8 +10,8 @@ import logging
 import config
 import catalog_sync
 from config import REPEAT_DELAY, REPEAT_INTERVAL, REPEAT_ACTION_DEBOUNCE, CONTROLS_CONFIG_PATH, Game
-from display import draw_validation_transition, show_toast
-from network import download_rom, download_from_1fichier, is_1fichier_url, request_cancel, cleanup_torrent_temp, stop_active_seeder
+from display import draw_validation_transition, show_toast, SCREENSCRAPER_KEYBOARD_LAYOUT
+from network import download_rom, download_from_1fichier, is_1fichier_url, request_cancel, cleanup_torrent_temp, stop_active_seeder, progress_queues
 from utils import (
     load_games, clear_games_cache, check_extension_before_download, is_extension_supported,
     load_extensions_json, play_random_music, sanitize_filename,
@@ -27,18 +27,17 @@ from utils import (
     parse_game_size_to_bytes,
     sort_games_list,
 )
-from history import load_history, clear_history, add_to_history, save_history, scan_roms_for_downloaded_games
+from history import load_history, clear_history, add_to_history, save_history, scan_roms_for_downloaded_games, reload_history, history_lock
 from language import _, get_available_languages, set_language  
 from rgsx_settings import (
     DISPLAY_GRID_LAYOUTS, get_allow_unknown_extensions, set_display_grid, get_font_family, set_font_family,
     get_show_unsupported_platforms, set_show_unsupported_platforms,
     set_allow_unknown_extensions, set_symlink_option, get_symlink_option,
     get_global_sort_option, set_global_sort_option,
-    load_rgsx_settings, save_rgsx_settings
+    load_rgsx_settings, save_rgsx_settings,
+    is_screenscraper_disabled, set_screenscraper_disabled
 )
 from accessibility import save_accessibility_settings
-from scraper import get_game_metadata, download_image_to_surface
-
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -67,6 +66,11 @@ def _has_download_url(url, game_name: str | None = None) -> bool:
 
     config.needs_redraw = True
     return False
+
+
+def _set_platform_index(index: int, systems_per_page: int) -> None:
+    config.selected_platform = index
+    config.current_page = index // systems_per_page
 
 
 def _wrap_index(current_index: int, delta: int, item_count: int) -> int:
@@ -553,14 +557,16 @@ VALID_STATES = [
     "pause_display_layout_menu",# sous-menu Display > Layout (disposition avec visualisation)
     "pause_display_font_menu",  # sous-menu Display > Font (taille police + footer)
     "pause_games_menu",         # sous-menu Games (source mode, update/redownload cache)
-    "pause_settings_menu",      # sous-menu Settings (music on/off, symlink toggle, api keys status)
+    "pause_settings_menu",      # sous-menu Settings
+    "pause_scrap_menu",         # sous-menu Scrap (ScreenScraper account, Media Manager)
     "pause_api_keys_status",    # sous-menu API Keys (affichage statut des clés)
     "pause_connection_status",  # sous-menu Connection status (statut accès sites)
+    "media_manager",            # Settings > Media Manager (image download)
+    "screenscraper_input",      # Scrap > ScreenScraper username/password
     # Nouveaux menus historique
     "history_game_options",     # menu options pour un jeu de l'historique
     "history_show_folder",      # afficher le dossier de téléchargement
-    "history_scraper_info",     # info scraper non implémenté
-    "scraper",                  # écran du scraper avec métadonnées
+    "game_info",                # ScreenScraper game details
     "history_error_details",    # détails de l'erreur
     "history_confirm_delete",   # confirmation suppression jeu
     "history_extract_archive",  # extraction d'archive
@@ -595,6 +601,9 @@ def should_open_pause_menu(menu_state: str | None) -> bool:
         "confirm_clear_history",
         "reload_games_data",
         "reset_settings_confirm",
+        "screenscraper_input",
+        "media_manager",
+        "game_info",
     }
 
 
@@ -1060,12 +1069,39 @@ def _get_search_input_char(event) -> str | None:
     return None
 
 
-GLOBAL_SEARCH_KEYBOARD_LAYOUT = [
-    ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'],
-    ['A', 'Z', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'],
-    ['Q', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 'M'],
-    ['W', 'X', 'C', 'V', 'B', 'N', '.', '_', '-', ',']
-]
+def _save_screenscraper_account():
+    """Save both ScreenScraper credentials and check the account in the background."""
+    import screenscraper
+    username = str(getattr(config, "ss_input_username", "")).strip()
+    password = str(getattr(config, "ss_input_password", ""))
+    try:
+        screenscraper.save_account(username, password)
+    except Exception as exc:
+        logger.error(f"Could not save ScreenScraper account: {exc}")
+        config.popup_message = _("screenscraper_save_error")
+        config.popup_timer = 4000
+        return
+    if not (username and password):
+        return
+
+    def check_login():
+        try:
+            remaining, max_per_day = screenscraper.get_user_info() or ("?", "?")
+            config.popup_message = _("screenscraper_login_ok").format(remaining, max_per_day)
+        except screenscraper.ScreenScraperError as exc:
+            logger.warning(f"ScreenScraper login check failed: {exc.kind} ({exc})")
+            messages = {
+                "account_required": "screenscraper_account_required",
+                "auth": "screenscraper_login_failed",
+                "config": "screenscraper_dev_credentials_missing",
+                "quota": "media_quota_exhausted",
+                "rate_limited": "screenscraper_rate_limited",
+            }
+            config.popup_message = _(messages[exc.kind]) if exc.kind in messages else _("media_error").format(exc.kind)
+        config.popup_timer = 4000
+        config.needs_redraw = True
+
+    threading.Thread(target=check_login, daemon=True).start()
 
 
 def _get_platform_id(platform) -> str:
@@ -1491,6 +1527,13 @@ def handle_controls(event, sources, joystick, screen):
                                     event.button if event.type == pygame.JOYBUTTONDOWN else 
                                     (event.axis, event.value) if event.type == pygame.JOYAXISMOTION else 
                                     event.value)
+                else:
+                    # Bas de la liste : retour en haut de la même colonne
+                    _set_platform_index(min(col, platform_count - 1), systems_per_page)
+                    update_key_state("down", True, event.type, event.key if event.type == pygame.KEYDOWN else
+                                    event.button if event.type == pygame.JOYBUTTONDOWN else
+                                    (event.axis, event.value) if event.type == pygame.JOYAXISMOTION else
+                                    event.value)
             elif is_input_matched(event, "up"):
                 # Navigation vers le haut avec gestion des limites de page
                 if current_grid_index - config.GRID_COLS >= 0:
@@ -1511,6 +1554,14 @@ def handle_controls(event, sources, joystick, screen):
                                     event.button if event.type == pygame.JOYBUTTONDOWN else 
                                     (event.axis, event.value) if event.type == pygame.JOYAXISMOTION else 
                                     event.value)
+                else:
+                    # Haut de la liste : dernière plateforme de la même colonne
+                    last_index = platform_count - 1
+                    _set_platform_index(last_index - ((last_index - col) % config.GRID_COLS), systems_per_page)
+                    update_key_state("up", True, event.type, event.key if event.type == pygame.KEYDOWN else
+                                    event.button if event.type == pygame.JOYBUTTONDOWN else
+                                    (event.axis, event.value) if event.type == pygame.JOYAXISMOTION else
+                                    event.value)
             elif is_input_matched(event, "left"):
                 if col > 0:
                     # Déplacement normal vers la gauche
@@ -1529,6 +1580,13 @@ def handle_controls(event, sources, joystick, screen):
                                     event.button if event.type == pygame.JOYBUTTONDOWN else 
                                     (event.axis, event.value) if event.type == pygame.JOYAXISMOTION else 
                                     event.value)
+                elif config.selected_platform == 0:
+                    # Première plateforme : retour à la dernière de la liste
+                    _set_platform_index(platform_count - 1, systems_per_page)
+                    update_key_state("left", True, event.type, event.key if event.type == pygame.KEYDOWN else
+                                    event.button if event.type == pygame.JOYBUTTONDOWN else
+                                    (event.axis, event.value) if event.type == pygame.JOYAXISMOTION else
+                                    event.value)
             elif is_input_matched(event, "right"):
                 if col < config.GRID_COLS - 1 and current_grid_index < max_index:
                     # Déplacement normal vers la droite
@@ -1546,6 +1604,13 @@ def handle_controls(event, sources, joystick, screen):
                     update_key_state("right", True, event.type, event.key if event.type == pygame.KEYDOWN else 
                                     event.button if event.type == pygame.JOYBUTTONDOWN else 
                                     (event.axis, event.value) if event.type == pygame.JOYAXISMOTION else 
+                                    event.value)
+                elif current_grid_index == max_index:
+                    # Dernière plateforme : retour à la première
+                    _set_platform_index(0, systems_per_page)
+                    update_key_state("right", True, event.type, event.key if event.type == pygame.KEYDOWN else
+                                    event.button if event.type == pygame.JOYBUTTONDOWN else
+                                    (event.axis, event.value) if event.type == pygame.JOYAXISMOTION else
                                     event.value)
             elif is_input_matched(event, "page_down"):
                 # Navigation rapide vers la page suivante
@@ -1608,11 +1673,11 @@ def handle_controls(event, sources, joystick, screen):
                 config.needs_redraw = True
             elif getattr(config, 'joystick', False) and getattr(config, 'global_search_editing', False):
                 row, col = config.selected_key
-                max_row = len(GLOBAL_SEARCH_KEYBOARD_LAYOUT) - 1
-                max_col = len(GLOBAL_SEARCH_KEYBOARD_LAYOUT[row]) - 1
+                max_row = len(SCREENSCRAPER_KEYBOARD_LAYOUT) - 1
+                max_col = len(SCREENSCRAPER_KEYBOARD_LAYOUT[row]) - 1
                 if is_global_search_input_matched(event, "up"):
                     target_row = max_row if row == 0 else row - 1
-                    config.selected_key = (target_row, min(col, len(GLOBAL_SEARCH_KEYBOARD_LAYOUT[target_row]) - 1))
+                    config.selected_key = (target_row, min(col, len(SCREENSCRAPER_KEYBOARD_LAYOUT[target_row]) - 1))
                     config.repeat_action = "up"
                     config.repeat_start_time = current_time + REPEAT_DELAY
                     config.repeat_last_action = current_time
@@ -1620,8 +1685,7 @@ def handle_controls(event, sources, joystick, screen):
                     config.needs_redraw = True
                 elif is_global_search_input_matched(event, "down"):
                     target_row = 0 if row == max_row else row + 1
-                    config.selected_key = (target_row, min(col, len(GLOBAL_SEARCH_KEYBOARD_LAYOUT[target_row]) - 1))
-                    config.repeat_action = "down"
+                    config.selected_key = (target_row, min(col, len(SCREENSCRAPER_KEYBOARD_LAYOUT[target_row]) - 1))
                     config.repeat_start_time = current_time + REPEAT_DELAY
                     config.repeat_last_action = current_time
                     config.repeat_key = event.key if event.type == pygame.KEYDOWN else event.button if event.type == pygame.JOYBUTTONDOWN else (event.axis, 1 if event.value > 0 else -1) if event.type == pygame.JOYAXISMOTION else event.value
@@ -1647,7 +1711,7 @@ def handle_controls(event, sources, joystick, screen):
                         config.repeat_key = event.key if event.type == pygame.KEYDOWN else event.button if event.type == pygame.JOYBUTTONDOWN else (event.axis, 1 if event.value > 0 else -1) if event.type == pygame.JOYAXISMOTION else event.value
                         config.needs_redraw = True
                 elif is_global_search_input_matched(event, "confirm"):
-                    config.global_search_query += GLOBAL_SEARCH_KEYBOARD_LAYOUT[row][col]
+                    config.global_search_query += SCREENSCRAPER_KEYBOARD_LAYOUT[row][col]
                     refresh_global_search_results()
                     config.needs_redraw = True
                 elif is_global_search_input_matched(event, "delete"):
@@ -1726,7 +1790,7 @@ def handle_controls(event, sources, joystick, screen):
                     config.scroll_offset = 0
                     config.search_mode = True
                     config.needs_redraw = True
-                keyboard_layout = GLOBAL_SEARCH_KEYBOARD_LAYOUT
+                keyboard_layout = SCREENSCRAPER_KEYBOARD_LAYOUT
                 row, col = config.selected_key
                 max_row = len(keyboard_layout) - 1
                 max_col = len(keyboard_layout[row]) - 1
@@ -2204,8 +2268,10 @@ def handle_controls(event, sources, joystick, screen):
             if is_input_matched(event, "confirm"):
                 # 0 = Non, 1 = Oui
                 if config.confirm_clear_selection == 1:  # Oui
-                    clear_history()
-                    config.history = load_history()  # Recharger l'historique (conserve les téléchargements en cours)
+                    # Un téléchargement qui sauvegarde entre les deux ferait revenir les lignes effacées
+                    with history_lock:
+                        clear_history()
+                        reload_history(progress_queues)  # Recharger l'historique (conserve les téléchargements en cours)
                     config.current_history_item = 0
                     config.history_scroll_offset = 0
                     config.menu_state = "history"
@@ -2282,8 +2348,9 @@ def handle_controls(event, sources, joystick, screen):
                 # Déterminer les options disponibles selon le statut
                 options = []
                 
-                # Option commune: scraper (toujours disponible)
-                options.append("scraper")
+                # Option commune: ScreenScraper details
+                if not is_screenscraper_disabled():
+                    options.append("game_info")
                 
                 # Options selon statut
                 if status == "Queued":
@@ -2469,60 +2536,14 @@ def handle_controls(event, sources, joystick, screen):
                         config.needs_redraw = True
                         logger.debug(f"Extraction de l'archive {game_name}")
                         
-                    elif selected_option == "scraper":
-                        # Lancer le scraper
-                        config.previous_menu_state = "history_game_options"
-                        config.menu_state = "scraper"
-                        config.scraper_game_name = game_name
-                        config.scraper_platform_name = platform
-                        config.scraper_loading = True
-                        config.scraper_error_message = ""
-                        config.scraper_image_surface = None
-                        config.scraper_image_url = ""
-                        config.scraper_description = ""
-                        config.scraper_genre = ""
-                        config.scraper_release_date = ""
-                        config.scraper_game_page_url = ""
-                        config.needs_redraw = True
-                        logger.debug(f"Lancement du scraper pour {game_name}")
-                        
-                        # Lancer la recherche des métadonnées dans un thread séparé
-                        
-                        def scrape_async():
-                            logger.info(f"Scraping métadonnées pour {game_name} sur {platform}")
-                            metadata = get_game_metadata(game_name, platform)
-                            
-                            # Vérifier si on a une erreur
-                            if "error" in metadata:
-                                config.scraper_error_message = metadata["error"]
-                                config.scraper_loading = False
-                                config.needs_redraw = True
-                                logger.error(f"Erreur de scraping: {metadata['error']}")
-                                return
-                            
-                            # Mettre à jour les métadonnées textuelles
-                            config.scraper_description = metadata.get("description", "")
-                            config.scraper_genre = metadata.get("genre", "")
-                            config.scraper_release_date = metadata.get("release_date", "")
-                            config.scraper_game_page_url = metadata.get("game_page_url", "")
-                            
-                            # Télécharger l'image si disponible
-                            image_url = metadata.get("image_url")
-                            if image_url:
-                                logger.info(f"Téléchargement de l'image: {image_url}")
-                                image_surface = download_image_to_surface(image_url)
-                                if image_surface:
-                                    config.scraper_image_surface = image_surface
-                                    config.scraper_image_url = image_url
-                                else:
-                                    logger.warning("Échec du téléchargement de l'image")
-                            
-                            config.scraper_loading = False
-                            config.needs_redraw = True
-                            logger.info("Scraping terminé")
-                        
-                        thread = threading.Thread(target=scrape_async, daemon=True)
-                        thread.start()
+                    elif selected_option == "game_info":
+                        from game_info import open_game_info
+                        open_game_info(
+                            config.history_actual_filename or game_name,
+                            game_name,
+                            platform,
+                            "history_game_options",
+                        )
                         
                     elif selected_option == "delete_game":
                         # Demander confirmation avant suppression
@@ -2614,29 +2635,11 @@ def handle_controls(event, sources, joystick, screen):
                 config.menu_state = validate_menu_state(config.previous_menu_state)
                 config.needs_redraw = True
 
-        # Scraper
-        elif config.menu_state == "scraper":
-            if is_input_matched(event, "confirm") or is_input_matched(event, "cancel"):
-                logger.info(f"Scraper: fermeture demandée")
-                # Retour au menu précédent
-                config.menu_state = validate_menu_state(config.previous_menu_state)
-                # Nettoyer les variables du scraper
-                config.scraper_image_surface = None
-                config.scraper_image_url = ""
-                config.scraper_game_name = ""
-                config.scraper_platform_name = ""
-                config.scraper_loading = False
-                config.scraper_error_message = ""
-                config.scraper_description = ""
-                config.scraper_genre = ""
-                config.scraper_release_date = ""
-                config.scraper_game_page_url = ""
-                config.needs_redraw = True
-        
-        # Information scraper (ancien, gardé pour compatibilité)
-        elif config.menu_state == "history_scraper_info":
-            if is_input_matched(event, "confirm") or is_input_matched(event, "cancel"):
-                config.menu_state = validate_menu_state(config.previous_menu_state)
+        # ScreenScraper game details
+        elif config.menu_state == "game_info":
+            if is_input_matched(event, "cancel") or is_input_matched(event, "start"):
+                config.menu_state = validate_menu_state(config.game_info_return_state)
+                config.game_info_loading = False
                 config.needs_redraw = True
 
         # Affichage détails erreur
@@ -2702,6 +2705,11 @@ def handle_controls(event, sources, joystick, screen):
                     config.needs_redraw = True
                 elif viewer_mode == "ota_update" and is_input_matched(event, "confirm"):
                     config.startup_update_confirmed = True
+                    config.menu_state = "loading"
+                    config.needs_redraw = True
+                elif viewer_mode == "ota_update" and is_input_matched(event, "cancel"):
+                    # Skip the update for this session; the loading loop goes on without it.
+                    config.pending_update_version = ""
                     config.menu_state = "loading"
                     config.needs_redraw = True
                 elif viewer_mode != "ota_update" and (is_input_matched(event, "cancel") or is_input_matched(event, "confirm")):
@@ -2895,46 +2903,53 @@ def handle_controls(event, sources, joystick, screen):
                 logger.debug(f"Start: retour à {config.menu_state} depuis pause_menu")
             elif is_input_matched(event, "up"):
                 # Menu racine hiérarchique: nombre dynamique (langue + catégories)
-                total = getattr(config, 'pause_menu_total_options', 8)
+                total = getattr(config, 'pause_menu_total_options', 9)
                 config.selected_option = (config.selected_option - 1) % total
                 config.needs_redraw = True
             elif is_input_matched(event, "down"):
                 # Menu racine hiérarchique: nombre dynamique (langue + catégories)
-                total = getattr(config, 'pause_menu_total_options', 8)
+                total = getattr(config, 'pause_menu_total_options', 9)
                 config.selected_option = (config.selected_option + 1) % total
                 config.needs_redraw = True
             elif is_input_matched(event, "confirm"):
-                if config.selected_option == 0:  # Games submenu
+                choice = config.selected_option
+                if choice == 0:  # Games submenu
                     config.menu_state = "pause_games_menu"
                     if not hasattr(config, 'pause_games_selection'):
                         config.pause_games_selection = 0
                     config.last_state_change_time = pygame.time.get_ticks()
                     config.needs_redraw = True
-                elif config.selected_option == 1:  # Language selector direct
+                elif choice == 1:  # Language selector direct
                     config.menu_state = "language_select"
                     config.previous_menu_state = "pause_menu"
                     config.last_state_change_time = pygame.time.get_ticks()
                     config.needs_redraw = True
-                elif config.selected_option == 2:  # Controls submenu
+                elif choice == 2:  # Controls submenu
                     config.menu_state = "pause_controls_menu"
                     if not hasattr(config, 'pause_controls_selection'):
                         config.pause_controls_selection = 0
                     config.last_state_change_time = pygame.time.get_ticks()
                     config.needs_redraw = True
-                elif config.selected_option == 3:  # Display submenu
+                elif choice == 3:  # Display submenu
                     config.menu_state = "pause_display_menu"
                     if not hasattr(config, 'pause_display_selection'):
                         config.pause_display_selection = 0
                     config.last_state_change_time = pygame.time.get_ticks()
                     config.needs_redraw = True
-                elif config.selected_option == 4:  # Settings submenu
+                elif choice == 4:  # Scrap submenu
+                    config.menu_state = "pause_scrap_menu"
+                    if not hasattr(config, 'pause_scrap_selection'):
+                        config.pause_scrap_selection = 0
+                    config.last_state_change_time = pygame.time.get_ticks()
+                    config.needs_redraw = True
+                elif choice == 5:  # Settings submenu
                     config.menu_state = "pause_settings_menu"
                     config.web_port_staged = None  # macOS: discard any unconfirmed web port edit
                     if not hasattr(config, 'pause_settings_selection'):
                         config.pause_settings_selection = 0
                     config.last_state_change_time = pygame.time.get_ticks()
                     config.needs_redraw = True
-                elif config.selected_option == 5:  # Support
+                elif choice == 6:  # Support
                     success, message, zip_path = generate_support_zip()
                     if success:
                         config.support_zip_path = zip_path
@@ -2945,13 +2960,13 @@ def handle_controls(event, sources, joystick, screen):
                     config.menu_state = "support_dialog"
                     config.last_state_change_time = pygame.time.get_ticks()
                     config.needs_redraw = True
-                elif config.selected_option == 6:  # Reset default settings (delete file + restart)
+                elif choice == 7:  # Reset default settings (delete file + restart)
                     config.previous_menu_state = "pause_menu"
                     config.menu_state = "reset_settings_confirm"
                     config.reset_settings_confirm_selection = 0  # 0=No, 1=Yes
                     config.last_state_change_time = pygame.time.get_ticks()
                     config.needs_redraw = True
-                elif config.selected_option == 7:  # Quit submenu
+                elif choice == 8:  # Quit submenu
                     # Capturer l'origine pause_menu pour retour si annulation
                     config.confirm_exit_origin = "pause_menu"
                     config.previous_menu_state = validate_menu_state(config.previous_menu_state)
@@ -3032,7 +3047,7 @@ def handle_controls(event, sources, joystick, screen):
         # Sous-menu Display
         elif config.menu_state == "pause_display_menu":
             sel = getattr(config, 'pause_display_selection', 0)
-            # layout, font submenu, family, [monitor if multi], [display mode on Windows], light, unknown, back
+            # layout, font submenu, family, [monitor if multi], [display mode on Windows], background, light, cover preview, unknown, back
             from rgsx_settings import get_available_monitors
             monitors = get_available_monitors()
             show_monitor = len(monitors) > 1
@@ -3051,7 +3066,8 @@ def handle_controls(event, sources, joystick, screen):
 
             background_index = next_index
             light_index = background_index + 1
-            unknown_index = light_index + 1
+            cover_index = light_index + 1
+            unknown_index = cover_index + 1
             back_index = unknown_index + 1
             total = back_index + 1
             if is_input_matched(event, "up"):
@@ -3176,6 +3192,16 @@ def handle_controls(event, sources, joystick, screen):
                         config.needs_redraw = True
                     except Exception as e:
                         logger.error(f"Erreur toggle light mode: {e}")
+                # Cover preview toggle (small screens)
+                elif sel == cover_index and (is_input_matched(event, "left") or is_input_matched(event, "right") or is_input_matched(event, "confirm")):
+                    try:
+                        from rgsx_settings import get_cover_preview, set_cover_preview
+                        new_val = set_cover_preview(not get_cover_preview())
+                        config.popup_message = _("display_cover_preview_enabled") if new_val else _("display_cover_preview_disabled")
+                        config.popup_timer = 2000
+                        config.needs_redraw = True
+                    except Exception as e:
+                        logger.error(f"Error toggling cover preview: {e}")
                 # Allow unknown extensions
                 elif sel == unknown_index and (is_input_matched(event, "left") or is_input_matched(event, "right") or is_input_matched(event, "confirm")):
                     try:
@@ -3313,7 +3339,7 @@ def handle_controls(event, sources, joystick, screen):
                         config.popup_timer = 5000
                         config.needs_redraw = True
                 elif sel == 2 and is_input_matched(event, "confirm"):  # history
-                    config.history = load_history()
+                    reload_history(progress_queues)
                     config.current_history_item = 0
                     config.history_scroll_offset = 0
                     config.previous_menu_state = "pause_games_menu"
@@ -3346,11 +3372,54 @@ def handle_controls(event, sources, joystick, screen):
                 config.last_state_change_time = pygame.time.get_ticks()
                 config.needs_redraw = True
 
+        # Sous-menu Scrap
+        elif config.menu_state == "pause_scrap_menu":
+            options_count = 4
+            sel = getattr(config, "pause_scrap_selection", 0)
+            if is_input_matched(event, "up"):
+                config.pause_scrap_selection = (sel - 1) % options_count
+                config.needs_redraw = True
+            elif is_input_matched(event, "down"):
+                config.pause_scrap_selection = (sel + 1) % options_count
+                config.needs_redraw = True
+            elif is_input_matched(event, "confirm"):
+                if sel == 0:
+                    from screenscraper import load_account
+                    config.ss_input_username, config.ss_input_password = load_account()
+                    config.ss_input_field = "username"
+                    config.ss_input_selected_key = (0, 0)
+                    config.ss_input_shift = False
+                    config.ss_input_return_state = "pause_scrap_menu"
+                    config.menu_state = "screenscraper_input"
+                elif sel == 1:
+                    if is_screenscraper_disabled():
+                        show_toast(_("toast_screenscraper_disabled"))
+                    else:
+                        from media_manager import manager
+                        manager.open()
+                        config.media_manager_selection = 0
+                        config.media_manager_scroll_offset = 0
+                        config.menu_state = "media_manager"
+                elif sel == 2:
+                    disabled = set_screenscraper_disabled(not is_screenscraper_disabled())
+                    if disabled:
+                        from media_manager import manager
+                        manager.cancel()
+                    show_toast(_("toast_screenscraper_disabled") if disabled else _("toast_screenscraper_enabled"))
+                else:
+                    config.menu_state = "pause_menu"
+                config.last_state_change_time = pygame.time.get_ticks()
+                config.needs_redraw = True
+            elif is_input_matched(event, "cancel") or is_input_matched(event, "start"):
+                config.menu_state = "pause_menu"
+                config.last_state_change_time = pygame.time.get_ticks()
+                config.needs_redraw = True
+
         # Sous-menu Settings
         elif config.menu_state == "pause_settings_menu":
             sel = getattr(config, 'pause_settings_selection', 0)
-            # Liste des options : music, symlink, auto_extract, roms_folder, max_dl_slots, [web_service], [custom_dns], api keys, connection_status, back
-            total = 8  # music, symlink, auto_extract, roms_folder, max_dl_slots, api keys, connection_status, back (Windows)
+            # Les options API et statut suivent les réglages système.
+            total = 8  # Windows: 5 settings, API keys, connection status, back
             auto_extract_index = 2
             roms_folder_index = 3
             max_dl_index = 4
@@ -3361,7 +3430,7 @@ def handle_controls(event, sources, joystick, screen):
             back_index = 7
 
             if config.OPERATING_SYSTEM == "Linux":
-                total = 10  # music, symlink, auto_extract, roms_folder, max_dl_slots, web_service, custom_dns, api keys, connection_status, back
+                total = 10
                 web_service_index = 5
                 custom_dns_index = 6
                 api_keys_index = 7
@@ -3516,6 +3585,7 @@ def handle_controls(event, sources, joystick, screen):
                     start_connection_status_check(force=True)
                     config.menu_state = "pause_connection_status"
                     config.needs_redraw = True
+                # Options ScreenScraper account: edit with the virtual keyboard
                 # Option Back (dernière option)
                 elif sel == back_index and is_input_matched(event, "confirm"):
                     config.menu_state = "pause_menu"
@@ -3543,6 +3613,100 @@ def handle_controls(event, sources, joystick, screen):
                 config.menu_state = "pause_settings_menu"
                 config.last_state_change_time = pygame.time.get_ticks()
                 config.needs_redraw = True
+
+        elif config.menu_state == "screenscraper_input":
+            row, col = getattr(config, 'ss_input_selected_key', (0, 0))
+            rows, cols = len(SCREENSCRAPER_KEYBOARD_LAYOUT), len(SCREENSCRAPER_KEYBOARD_LAYOUT[0])
+            field_name = "ss_input_" + config.ss_input_field
+            value = str(getattr(config, field_name, ""))
+            keyboard_handled = False
+            if event.type == pygame.KEYDOWN and not getattr(config, "joystick", False):
+                if event.key == pygame.K_TAB:
+                    config.ss_input_field = "password" if config.ss_input_field == "username" else "username"
+                    keyboard_handled = True
+                elif event.key == pygame.K_BACKSPACE:
+                    setattr(config, field_name, value[:-1])
+                    keyboard_handled = True
+                else:
+                    typed_char = getattr(event, "unicode", "") or ""
+                    if not (event.mod & (pygame.KMOD_CTRL | pygame.KMOD_ALT)) and typed_char.isprintable():
+                        setattr(config, field_name, value + typed_char)
+                        keyboard_handled = True
+
+            if not keyboard_handled:
+                if getattr(config, "joystick", False) and is_input_matched(event, "up"):
+                    config.ss_input_selected_key = ((row - 1) % rows, col)
+                elif getattr(config, "joystick", False) and is_input_matched(event, "down"):
+                    config.ss_input_selected_key = ((row + 1) % rows, col)
+                elif getattr(config, "joystick", False) and is_input_matched(event, "left"):
+                    config.ss_input_selected_key = (row, (col - 1) % cols)
+                elif getattr(config, "joystick", False) and is_input_matched(event, "right"):
+                    config.ss_input_selected_key = (row, (col + 1) % cols)
+                elif is_input_matched(event, "confirm") and getattr(config, "joystick", False):
+                    char = SCREENSCRAPER_KEYBOARD_LAYOUT[row][col]
+                    setattr(config, field_name, value + (char.upper() if config.ss_input_shift else char))
+                elif event.type != pygame.KEYDOWN and is_input_matched(event, "page_up"):
+                    setattr(config, field_name, value[:-1])
+                elif event.type != pygame.KEYDOWN and is_input_matched(event, "page_down"):
+                    setattr(config, field_name, value + " ")
+                elif event.type != pygame.KEYDOWN and (is_input_matched(event, "delete") or is_input_matched(event, "space")):
+                    config.ss_input_field = "password" if config.ss_input_field == "username" else "username"
+                elif is_input_matched(event, "delete"):
+                    setattr(config, field_name, value[:-1])
+                elif is_input_matched(event, "space"):
+                    setattr(config, field_name, value + " ")
+                elif is_input_matched(event, "filter"):
+                    config.ss_input_shift = not config.ss_input_shift
+                elif is_input_matched(event, "page_up") or is_input_matched(event, "page_down"):
+                    config.ss_input_field = "password" if config.ss_input_field == "username" else "username"
+                elif is_input_matched(event, "history") or (
+                    not getattr(config, "joystick", False) and is_input_matched(event, "confirm")
+                ):
+                    _save_screenscraper_account()
+                    config.menu_state = validate_menu_state(getattr(config, "ss_input_return_state", "pause_scrap_menu"))
+                    config.last_state_change_time = pygame.time.get_ticks()
+                elif is_input_matched(event, "cancel") or is_input_matched(event, "start"):
+                    config.menu_state = validate_menu_state(getattr(config, "ss_input_return_state", "pause_scrap_menu"))
+                    config.last_state_change_time = pygame.time.get_ticks()
+            config.needs_redraw = True
+
+        elif config.menu_state == "media_manager":
+            from media_manager import manager
+            rows = manager.rows()
+            sel = min(getattr(config, 'media_manager_selection', 0), len(rows) - 1)
+            row_type, group = rows[sel]
+            if is_input_matched(event, "history"):
+                if manager.running:
+                    manager.cancel()
+                elif manager.pending:
+                    manager.start(resume=True)
+                    config.media_manager_selection = 0
+                elif manager.estimate()[0]:
+                    manager.start()
+            elif is_input_matched(event, "up"):
+                config.media_manager_selection = (sel - 1) % len(rows)
+            elif is_input_matched(event, "down"):
+                config.media_manager_selection = (sel + 1) % len(rows)
+            elif row_type == "profile" and not manager.running and (is_input_matched(event, "confirm") or is_input_matched(event, "left") or is_input_matched(event, "right")):
+                manager.profile = "max" if manager.profile == "default" else "default"
+            elif is_input_matched(event, "confirm"):
+                if row_type == "action":
+                    if manager.running:
+                        manager.cancel()
+                    elif manager.estimate()[0]:
+                        manager.start()
+                elif row_type == "resume":
+                    manager.start(resume=True)
+                    config.media_manager_selection = 0
+                elif row_type == "select_all" and not manager.running:
+                    manager.toggle_all()
+                elif row_type == "platform" and group["platform_id"] and not manager.running:
+                    manager.selected ^= {group["folder"]}
+            elif is_input_matched(event, "cancel") or is_input_matched(event, "start"):
+                # Download keeps running in the background.
+                config.menu_state = "pause_scrap_menu"
+                config.last_state_change_time = pygame.time.get_ticks()
+            config.needs_redraw = True
 
         # Aide contrôles
         elif config.menu_state == "controls_help":
@@ -4537,6 +4701,7 @@ def handle_controls(event, sources, joystick, screen):
                 elif target == 'pause_display_menu':
                     config.pause_display_selection = 4
                 else:
+                    # Index visible de Settings (4 quand l'entrée Scrap est masquée)
                     config.selected_option = 5
                 config.filter_return_to = None
 
@@ -4711,7 +4876,7 @@ def handle_controls(event, sources, joystick, screen):
                 (config.controls_config.get(action_name, {}).get("type") == "key" and \
                  config.controls_config.get(action_name, {}).get("key") == event.key)):
                     press_duration = current_time - config.confirm_press_start_time
-                    # Si appui court (< 2 secondes) et pas déjà traité par l'appui long
+                    # Si appui court (< seuil d'appui long) et pas déjà traité par l'appui long
                     if press_duration < config.confirm_long_press_threshold and not config.confirm_long_press_triggered:
                         # Déclencher le téléchargement normal
                         games = config.filtered_games if config.filter_active or config.search_mode else config.games
@@ -4797,7 +4962,7 @@ def handle_controls(event, sources, joystick, screen):
                 (config.controls_config.get(action_name, {}).get("type") == "key" and \
                  config.controls_config.get(action_name, {}).get("key") == event.key)):
                     press_duration = current_time - getattr(config, 'platform_confirm_press_start_time', 0)
-                    # Si appui court (< 2 secondes) et pas déjà traité par l'appui long
+                    # Si appui court (< seuil d'appui long) et pas déjà traité par l'appui long
                     if press_duration < config.confirm_long_press_threshold and not getattr(config, 'platform_confirm_long_press_triggered', False):
                         if _open_selected_platform(screen):
                             logger.debug(f"Appui court clavier sur confirm ({press_duration}ms), navigation vers les jeux de {config.platforms[config.current_platform]}")
@@ -4817,7 +4982,7 @@ def handle_controls(event, sources, joystick, screen):
                 # Gestion spéciale pour confirm dans le menu game (ne dépend pas du key_state)
                 if action_name == "confirm" and config.menu_state == "game":
                     press_duration = current_time - config.confirm_press_start_time
-                    # Si appui court (< 2 secondes) et pas déjà traité par l'appui long
+                    # Si appui court (< seuil d'appui long) et pas déjà traité par l'appui long
                     if press_duration < config.confirm_long_press_threshold and not config.confirm_long_press_triggered:
                         # Déclencher le téléchargement normal (même code que pour KEYUP)
                         games = config.filtered_games if config.filter_active or config.search_mode else config.games
@@ -4900,7 +5065,7 @@ def handle_controls(event, sources, joystick, screen):
                 # Gestion spéciale pour confirm dans le menu platform (appui court = aller aux jeux)
                 if action_name == "confirm" and config.menu_state == "platform":
                     press_duration = current_time - getattr(config, 'platform_confirm_press_start_time', 0)
-                    # Si appui court (< 2 secondes) et pas déjà traité par l'appui long
+                    # Si appui court (< seuil d'appui long) et pas déjà traité par l'appui long
                     if press_duration < config.confirm_long_press_threshold and not getattr(config, 'platform_confirm_long_press_triggered', False):
                         if _open_selected_platform(screen):
                             logger.debug(f"Appui court sur confirm ({press_duration}ms), navigation vers les jeux de {config.platforms[config.current_platform]}")

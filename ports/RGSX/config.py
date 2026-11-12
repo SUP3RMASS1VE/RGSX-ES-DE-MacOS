@@ -33,7 +33,7 @@ except Exception:
     pygame = None  # type: ignore
 
 # Version actuelle de l'application
-app_version = "2.7.0.7"
+app_version = "2.7.0.7.1"
 
 # Nombre de jours avant de proposer la mise à jour de la liste des jeux
 GAMELIST_UPDATE_DAYS = 1
@@ -177,6 +177,7 @@ else:
     SAVE_FOLDER = CONFIG_FOLDER
     DATA_FOLDER = USERDATA_FOLDER
 
+
 INSTALLATION_PATH_WARNING = not _is_docker_mode and not _has_expected_installation_layout(APP_FOLDER)
 if platform.system() == "Darwin":
     # macOS: ES-DE ROMs root may be any folder (<ROMs>/ports/RGSX); never show the Batocera-style path warning
@@ -300,16 +301,35 @@ GAMELISTXML_WINDOWS = os.path.join(ROMS_FOLDER, "windows","gamelist.xml")
 
 # Dans le Dossier de sauvegarde : /saves/ports/rgsx (traditional) or /config (Docker)
 IMAGES_FOLDER = os.path.join(SAVE_FOLDER, "images")
+# Game preview images (Media Manager): media/{platform_folder}/{game}.jpg
+MEDIA_FOLDER = os.path.join(SAVE_FOLDER, "media")
+MEDIA_QUEUE_PATH = os.path.join(SAVE_FOLDER, "rgsx_media_queue.json")
+
 
 # Local SQLite cache for the HTTPS catalog and user-specific state.
 DB_PATH = os.path.join(SAVE_FOLDER, "rgsx.sqlite3")
 
-# Public read-only catalog API. The database credentials stay on the PHP server.
+# Public read-only catalog API.
 CATALOG_SYNC_URL = os.environ.get(
     "RGSX_CATALOG_SYNC_URL",
     "https://retrogamesets.fr/rgsx/manager/rgsx_catalog_api.php",
 ).strip()
 CATALOG_SYNC_TIMEOUT_SEC = int(os.environ.get("RGSX_CATALOG_SYNC_TIMEOUT", "30"))
+
+
+
+
+# Delay before auto scrap on game list
+SCREENSCRAPER_PREVIEW_DELAY_SEC = float(os.environ.get("RGSX_SCREENSCRAPER_PREVIEW_DELAY", "1.0"))
+# ScreenScraper user account (Media Manager).
+SCREENSCRAPER_ACCOUNT_PATH = os.path.join(SAVE_FOLDER, "screenscraper_account.json")
+# Endpoint returning the developer credentials, kept in memory for the session only.
+SCREENSCRAPER_CREDENTIALS_API_URL = os.environ.get(
+    "RGSX_SCREENSCRAPER_CREDENTIALS_URL",
+    "https://retrogamesets.fr/rgsx/manager/rgsx_screenscraper_credentials_api.php",
+).strip()
+
+
 
 PRECONF_CONTROLS_PATH = os.path.join(APP_FOLDER, "assets", "controls")
 CONTROLS_CONFIG_PATH = os.path.join(SAVE_FOLDER, "controls.json")
@@ -323,7 +343,6 @@ API_KEY_DEBRIDLINK_PATH = os.path.join(SAVE_FOLDER, "DebridLinkAPI.txt")
 API_KEY_REALDEBRID_PATH = os.path.join(SAVE_FOLDER, "RealDebridAPI.txt")
 API_KEY_TORBOX_PATH = os.path.join(SAVE_FOLDER, "TorBoxAPI.txt")
 ARCHIVE_ORG_COOKIE_PATH = os.path.join(APP_FOLDER, "assets", "ArchiveOrgCookie.txt")
-THEGAMESDB_API_KEY_PATH = os.path.join(APP_FOLDER, "assets", "TheGamesDBAPI.txt")
 
 
 
@@ -673,17 +692,16 @@ confirm_cancel_selection = 0  # confirmation annulation téléchargement
 # Tracking des jeux téléchargés
 downloaded_games = {}  # Dict {platform_name: {game_name: {"timestamp": "...", "size": "..."}}}
 
-# Scraper de métadonnées
-scraper_image_surface = None  # Surface Pygame contenant l'image scrapée
-scraper_image_url = ""  # URL de l'image actuellement affichée
-scraper_game_name = ""  # Nom du jeu en cours de scraping
-scraper_platform_name = ""  # Nom de la plateforme en cours de scraping
-scraper_loading = False  # Indicateur de chargement en cours
-scraper_error_message = ""  # Message d'erreur du scraper
-scraper_description = ""  # Description du jeu
-scraper_genre = ""  # Genre(s) du jeu
-scraper_release_date = ""  # Date de sortie du jeu
-scraper_game_page_url = ""  # URL de la page du jeu sur TheGamesDB
+# ScreenScraper game details
+game_info_cover_surface = None
+game_info_screenshot_surface = None
+game_info_game_name = ""
+game_info_platform_name = ""
+game_info_summary = ""
+game_info_loading = False
+game_info_error_message = ""
+game_info_request_id = 0
+game_info_return_state = "game"
 
 # CLES API / PREMIUM HOSTS
 API_KEY_1FICHIER = ""
@@ -714,7 +732,7 @@ error_message = ""  # Message d'erreur à afficher
 
 # Détection d'appui long sur confirm (menu game)
 confirm_press_start_time = 0  # Timestamp du début de l'appui sur confirm
-confirm_long_press_threshold = 2000  # Durée en ms pour déclencher l'appui long (2 secondes)
+confirm_long_press_threshold = 1000  # Durée en ms pour déclencher l'appui long (1 seconde)
 confirm_long_press_triggered = False  # Flag pour éviter de déclencher plusieurs fois
 
 # Détection d'appui long sur confirm (menu platform - pour config dossier)
@@ -848,4 +866,4 @@ def validate_resolution():
         logger.warning(f"Résolution {SCREEN_WIDTH}x{SCREEN_HEIGHT} dépasse les limites de l'écran")
         return display_info.current_w, display_info.current_h
     return SCREEN_WIDTH, SCREEN_HEIGHT
-    
+

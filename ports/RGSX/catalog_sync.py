@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import sqlite3
 import tempfile
 import urllib.parse
 import urllib.request
@@ -13,6 +12,7 @@ from typing import Any
 
 import config
 import database
+import sqlite3
 
 
 _LOCAL_CATALOG_TRIGGERS = {
@@ -112,6 +112,15 @@ def _snapshot_pages(entity: str, page_size: int = 1000, platform_id: int | None 
         cursor = next_cursor
 
 
+def _optional_screenscraper_system_id(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    system_id = int(value)
+    if system_id <= 0:
+        raise ValueError("ScreenScraper system IDs must be positive integers")
+    return system_id
+
+
 def _insert_snapshot_page(connection: sqlite3.Connection, entity: str, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
@@ -119,12 +128,13 @@ def _insert_snapshot_page(connection: sqlite3.Connection, entity: str, rows: lis
         connection.executemany(
             """INSERT INTO platforms(
                 id, platform_name, source, file_name, folder, platform_image,
-                sort_order, created_at, updated_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                screenscraper_system_id, sort_order, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [(
                 int(row.get("id") or 0), str(row.get("platform_name") or ""),
                 str(row.get("source") or ""), str(row.get("file_name") or ""),
                 str(row.get("folder") or ""), str(row.get("platform_image") or ""),
+                _optional_screenscraper_system_id(row.get("screenscraper_system_id")),
                 int(row.get("sort_order") or 0), str(row.get("created_at") or ""),
                 str(row.get("updated_at") or ""),
             ) for row in rows],
@@ -180,10 +190,11 @@ def _replace_local_catalog_from_api(
     progress_ranges = {
         "platforms": (5.0, 12.0, max(1, int(manifest.get("platforms") or 0))),
         "games": (12.0, 92.0, max(1, int(manifest.get("games") or 0))),
-        "platform_assets": (92.0, 98.0, 1),
+        "platform_assets": (92.0, 98.0, None),
     }
-    target_directory = os.path.dirname(os.path.abspath(db_path))
-    with tempfile.TemporaryDirectory(prefix="rgsx-catalog-stage-", dir=target_directory) as staging_directory:
+    # Staging hors du dossier de la base : sur un symlink vers un partage réseau (NAS),
+    # SQLite ne peut pas y créer son fichier intermédiaire (WinError 59).
+    with tempfile.TemporaryDirectory(prefix="rgsx-catalog-stage-") as staging_directory:
         staging_path = os.path.join(staging_directory, "catalog.sqlite3")
         staging = sqlite3.connect(staging_path, timeout=30.0)
         staging.row_factory = sqlite3.Row
@@ -198,14 +209,14 @@ def _replace_local_catalog_from_api(
                 for page in _snapshot_pages(entity):
                     _insert_snapshot_page(staging, entity, page)
                     counts[entity] += len(page)
-                    entity_progress = min(1.0, counts[entity] / expected_count)
-                    current_progress = start_progress + (end_progress - start_progress) * entity_progress
-                    _notify_progress(
-                        progress_callback,
-                        "sync_snapshot",
-                        current_progress,
-                        f"{entity}:{counts[entity]}/{expected_count}",
-                    )
+                    if expected_count:
+                        entity_progress = min(1.0, counts[entity] / expected_count)
+                        current_progress = start_progress + (end_progress - start_progress) * entity_progress
+                        detail = f"{entity}:{counts[entity]}/{expected_count}"
+                    else:
+                        current_progress = start_progress
+                        detail = f"{entity}:{counts[entity]}"
+                    _notify_progress(progress_callback, "sync_snapshot", current_progress, detail)
             staging.commit()
         except Exception:
             staging.rollback()
@@ -221,7 +232,15 @@ def _replace_local_catalog_from_api(
                 connection.execute("DELETE FROM platform_assets")
                 connection.execute("DELETE FROM games")
                 connection.execute("DELETE FROM platforms")
-                connection.execute("INSERT INTO platforms SELECT * FROM catalog_stage.platforms")
+                connection.execute(
+                    """INSERT INTO platforms(
+                           id, platform_name, source, file_name, folder, platform_image,
+                           screenscraper_system_id, sort_order, created_at, updated_at
+                       )
+                       SELECT id, platform_name, source, file_name, folder, platform_image,
+                              screenscraper_system_id, sort_order, created_at, updated_at
+                         FROM catalog_stage.platforms"""
+                )
                 connection.execute("INSERT INTO games SELECT * FROM catalog_stage.games")
                 connection.execute("INSERT INTO platform_assets SELECT * FROM catalog_stage.platform_assets")
                 connection.execute("DELETE FROM catalog_changes")
@@ -252,8 +271,7 @@ def _sync_catalog_visibility(db_path: str, progress_callback=None) -> dict[str, 
         local_connection.close()
 
     counts = {"platforms": 0, "games": 0, "platform_assets": 0}
-    target_directory = os.path.dirname(os.path.abspath(db_path))
-    with tempfile.TemporaryDirectory(prefix="rgsx-catalog-visibility-", dir=target_directory) as staging_directory:
+    with tempfile.TemporaryDirectory(prefix="rgsx-catalog-visibility-") as staging_directory:
         staging_path = os.path.join(staging_directory, "catalog.sqlite3")
         staging = sqlite3.connect(staging_path, timeout=30.0)
         staging.row_factory = sqlite3.Row
@@ -270,7 +288,13 @@ def _sync_catalog_visibility(db_path: str, progress_callback=None) -> dict[str, 
             new_platform_ids = sorted(remote_platform_ids - local_platform_ids)
             counts["platforms"] = len(remote_platforms)
 
-            for platform_id in new_platform_ids:
+            for index, platform_id in enumerate(new_platform_ids, start=1):
+                _notify_progress(
+                    progress_callback,
+                    "sync_step",
+                    10 + 84 * (index - 1) / len(new_platform_ids),
+                    f"visibility_platform:{index}/{len(new_platform_ids)}",
+                )
                 for entity in ("games", "platform_assets"):
                     for page in _snapshot_pages(entity, platform_id=platform_id):
                         _insert_snapshot_page(staging, entity, page)
@@ -291,14 +315,20 @@ def _sync_catalog_visibility(db_path: str, progress_callback=None) -> dict[str, 
                     "DELETE FROM platforms WHERE id NOT IN (SELECT id FROM catalog_stage.platforms)"
                 )
                 connection.execute(
-                    """INSERT INTO platforms
-                       SELECT * FROM catalog_stage.platforms WHERE true
+                    """INSERT INTO platforms(
+                           id, platform_name, source, file_name, folder, platform_image,
+                           screenscraper_system_id, sort_order, created_at, updated_at
+                       )
+                       SELECT id, platform_name, source, file_name, folder, platform_image,
+                              screenscraper_system_id, sort_order, created_at, updated_at
+                         FROM catalog_stage.platforms WHERE true
                        ON CONFLICT(id) DO UPDATE SET
                            platform_name=excluded.platform_name,
                            source=excluded.source,
                            file_name=excluded.file_name,
                            folder=excluded.folder,
                            platform_image=excluded.platform_image,
+                           screenscraper_system_id=excluded.screenscraper_system_id,
                            sort_order=excluded.sort_order,
                            created_at=excluded.created_at,
                            updated_at=excluded.updated_at"""
@@ -313,7 +343,7 @@ def _sync_catalog_visibility(db_path: str, progress_callback=None) -> dict[str, 
                 _restore_local_catalog_triggers(connection)
                 connection.execute("DETACH DATABASE catalog_stage")
         connection.close()
-    _notify_progress(progress_callback, "sync_snapshot", 98, "platforms:1/1")
+    _notify_progress(progress_callback, "sync_step", 98, "visibility_write")
     return counts
 
 
@@ -343,14 +373,15 @@ def _apply_change(connection: sqlite3.Connection, change: dict[str, Any]) -> Non
         connection.execute(
             """INSERT INTO platforms(
                 id, platform_name, source, file_name, folder, platform_image,
-                sort_order, created_at, updated_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                screenscraper_system_id, sort_order, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 platform_name=excluded.platform_name,
                 source=excluded.source,
                 file_name=excluded.file_name,
                 folder=excluded.folder,
                 platform_image=excluded.platform_image,
+                screenscraper_system_id=excluded.screenscraper_system_id,
                 sort_order=excluded.sort_order,
                 updated_at=excluded.updated_at""",
             (
@@ -360,6 +391,7 @@ def _apply_change(connection: sqlite3.Connection, change: dict[str, Any]) -> Non
                 str(data.get("file_name") or ""),
                 str(data.get("folder") or ""),
                 str(data.get("platform_image") or ""),
+                _optional_screenscraper_system_id(data.get("screenscraper_system_id")),
                 int(data.get("sort_order") or 0),
                 str(data.get("created_at") or ""),
                 str(data.get("updated_at") or ""),
@@ -469,7 +501,9 @@ def _notify_progress(callback, stage: str, progress: float, detail: str = "") ->
 def sync_catalog(db_path: str | None = None, progress_callback=None) -> dict[str, Any]:
     """Synchronize only catalog tables from the HTTPS API; preserve local user state."""
     target = os.path.abspath(db_path or config.DB_PATH)
+    _notify_progress(progress_callback, "sync_step", 0, "db_open")
     database.initialize_database(target)
+    _notify_progress(progress_callback, "sync_step", 1, "manifest")
     manifest = _get_json("manifest")
     remote_sequence = int(manifest.get("sequence") or 0)
     remote_visibility_revision = int(manifest.get("visibility_revision") or 0)
@@ -492,7 +526,7 @@ def sync_catalog(db_path: str | None = None, progress_callback=None) -> dict[str
             or (local_games == 0 and int(manifest.get("games") or 0) > 0)
         )
     if full_snapshot:
-        _notify_progress(progress_callback, "sync_snapshot", 5, "platforms")
+        _notify_progress(progress_callback, "sync_step", 5, "full")
         snapshot_counts = _replace_local_catalog_from_api(
             target,
             remote_sequence,
@@ -501,7 +535,7 @@ def sync_catalog(db_path: str | None = None, progress_callback=None) -> dict[str
         )
         current = remote_sequence
         mode = "https-full"
-        _notify_progress(progress_callback, "sync_snapshot", 98, "changes")
+        _notify_progress(progress_callback, "sync_step", 98, "recheck")
         latest_manifest = _get_json("manifest")
         target_sequence = max(current, int(latest_manifest.get("sequence") or current))
         applied = 0
@@ -510,14 +544,22 @@ def sync_catalog(db_path: str | None = None, progress_callback=None) -> dict[str
         target_sequence = remote_sequence
         applied = 0
         if visibility_changed:
-            _notify_progress(progress_callback, "sync_snapshot", 5, "platforms:0/1")
+            _notify_progress(progress_callback, "sync_step", 5, "visibility")
             snapshot_counts = _sync_catalog_visibility(target, progress_callback)
             mode = "https-visibility"
         else:
             snapshot_counts = {}
             mode = "https-incremental"
 
+    changes_start = current
     while current < target_sequence:
+        span = max(1, target_sequence - changes_start)
+        _notify_progress(
+            progress_callback,
+            "sync_step",
+            10 + 84 * (current - changes_start) / span,
+            f"changes:{current}/{target_sequence}",
+        )
         payload = _get_json("changes", since=current, limit=500)
         target_sequence = max(target_sequence, int(payload.get("sequence") or current))
         raw_changes = payload.get("changes") if isinstance(payload.get("changes"), list) else []
@@ -541,6 +583,7 @@ def sync_catalog(db_path: str | None = None, progress_callback=None) -> dict[str
                 continue
         break
 
+    _notify_progress(progress_callback, "sync_step", 98, "cursor")
     if database.get_sync_cursor(target) != current:
         database.set_sync_cursor(current, target)
     database.set_catalog_visibility_revision(remote_visibility_revision, target)

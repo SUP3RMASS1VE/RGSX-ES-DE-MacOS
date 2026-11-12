@@ -18,8 +18,8 @@ try:
 except Exception:
     pygame = None  # type: ignore
 from config import OTA_VERSION_ENDPOINT,APP_FOLDER, UPDATE_FOLDER, OTA_UPDATE_ZIP, OTA_UPDATE_WINDOWS_ZIP
-from utils import sanitize_filename, extract_zip, extract_rar, extract_7z, handle_ps3, load_api_key_1fichier, load_api_key_alldebrid, normalize_platform_name, resolve_platform_folder, load_api_keys, load_archive_org_cookie, get_clean_display_name, parse_torrent_download_url, load_games, get_disk_usage
-from history import save_history, check_history_write_access, get_history_write_status
+from utils import sanitize_filename, extract_zip, extract_rar, extract_7z, handle_ps3, load_api_key_1fichier, load_api_key_alldebrid, normalize_platform_name, resolve_platform_folder, load_api_keys, load_archive_org_cookie, get_clean_display_name, parse_torrent_download_url, load_games, get_disk_usage, try_chmod
+from history import save_history, check_history_write_access, get_history_write_status, history_lock, reload_history
 from display import show_toast
 import qbittorrent_backend
 import logging
@@ -117,7 +117,9 @@ def _warn_history_write_issue(context=""):
 
 
 def _save_history_with_feedback(context=""):
-    saved = save_history(config.history)
+    # Lire la liste une fois le verrou pris : celle d'avant un rechargement n'est plus la bonne
+    with history_lock:
+        saved = save_history(config.history)
     if not saved:
         _warn_history_write_issue(context)
     return saved
@@ -1049,14 +1051,17 @@ def _is_lolroms_url(url: str | None) -> bool:
 
 def _normalize_lolroms_url(url: str) -> str:
     parsed = urllib.parse.urlsplit(url)
+    # The site now serves files as /?file=<path>, and "Nintendo - DS" became "Nintendo/DS".
+    if parsed.path not in ('', '/') and not parsed.query:
+        file_path = urllib.parse.unquote(parsed.path).lstrip('/')
+        if file_path.startswith('Nintendo - '):
+            file_path = 'Nintendo/' + file_path[len('Nintendo - '):]
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, '/', 'file=' + urllib.parse.quote_plus(file_path), ''))
     normalized_path = urllib.parse.quote(
         urllib.parse.unquote(parsed.path or '/'),
         safe="/@:$&'()*+,;=-._~",
     )
-    normalized_query = urllib.parse.quote_plus(
-        urllib.parse.unquote_plus(parsed.query),
-        safe="=&:$,;+-._~!*'()",
-    ) if parsed.query else ''
+    normalized_query = urllib.parse.quote(parsed.query, safe="=&%+:$,;-._~!*'()/") if parsed.query else ''
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, normalized_path, normalized_query, parsed.fragment))
 
 
@@ -1804,7 +1809,7 @@ def download_1fichier_free_mode(url, dest_dir, session, log_callback=None, progr
         
         # 1. GET page initiale
         if cancel_event and cancel_event.is_set():
-            return (False, None, "Annulé")
+            return (False, None, _("download_canceled"))
         
         r = session.get(url, allow_redirects=True, timeout=30)
         r.raise_for_status()
@@ -1818,13 +1823,13 @@ def download_1fichier_free_mode(url, dest_dir, session, log_callback=None, progr
             _log(f"{wait_s}s...")
             for remaining in range(wait_s, 0, -1):
                 if cancel_event and cancel_event.is_set():
-                    return (False, None, "Annulé")
+                    return (False, None, _("download_canceled"))
                 _wait(remaining, wait_s)
                 time.sleep(1)
         
         # 3. Chercher formulaire et soumettre
         if cancel_event and cancel_event.is_set():
-            return (False, None, "Annulé")
+            return (False, None, _("download_canceled"))
             
         form_match = re.search(r'<form[^>]*id=[\"\']f1[\"\'][^>]*>(.*?)</form>', html, re.DOTALL | re.IGNORECASE)
         
@@ -1881,7 +1886,7 @@ def download_1fichier_free_mode(url, dest_dir, session, log_callback=None, progr
                     # Attendre proprement en appelant le callback si fourni
                     for remaining in range(extra_wait, 0, -1):
                         if cancel_event and cancel_event.is_set():
-                            return (False, None, "Annulé")
+                            return (False, None, _("download_canceled"))
                         _wait(remaining, extra_wait)
                         time.sleep(1)
                     # essayer de soumettre à nouveau après la temporisation
@@ -1899,7 +1904,7 @@ def download_1fichier_free_mode(url, dest_dir, session, log_callback=None, progr
         
         # 4. Chercher lien de téléchargement
         if cancel_event and cancel_event.is_set():
-            return (False, None, "Annulé")
+            return (False, None, _("download_canceled"))
             
         patterns = [
             r'href=[\"\']([^\"\']+)[\"\'][^>]*>(?:cliquer|click|télécharger|download)',
@@ -1996,7 +2001,7 @@ def download_1fichier_free_mode(url, dest_dir, session, log_callback=None, progr
         
         # 5. HEAD pour infos fichier
         if cancel_event and cancel_event.is_set():
-            return (False, None, "Annulé")
+            return (False, None, _("download_canceled"))
             
         head = session.head(direct_link, allow_redirects=True, timeout=30)
         
@@ -2026,7 +2031,7 @@ def download_1fichier_free_mode(url, dest_dir, session, log_callback=None, progr
                 downloaded = 0
                 for chunk in resp.iter_content(chunk_size=128*1024):
                     if cancel_event and cancel_event.is_set():
-                        return (False, None, "Annulé")
+                        return (False, None, _("download_canceled"))
                     
                     f.write(chunk)
                     downloaded += len(chunk)
@@ -2051,7 +2056,36 @@ def download_1fichier_free_mode(url, dest_dir, session, log_callback=None, progr
 
 cache = {}
 CACHE_TTL = 3600  # 1 heure
-        
+
+
+def get_network_adapter_status(net_root="/sys/class/net", route_path="/proc/net/route"):
+    """Return "connected", "disconnected" or "no_adapter" from Linux sysfs.
+
+    The R36S has no built-in WiFi, so any physical adapter is a USB WiFi dongle on the
+    OTG port (or USB tethering). "connected" means that adapter carries the default route.
+    """
+    try:
+        # Physical interfaces only: virtual ones (lo, dummy, ...) have no device link.
+        adapters = {
+            name for name in os.listdir(net_root)
+            if os.path.exists(os.path.join(net_root, name, "device"))
+        }
+    except OSError:
+        adapters = set()
+    try:
+        with open(route_path, encoding="ascii") as routes:
+            next(routes, None)
+            default_route_ifaces = {
+                fields[0] for fields in (line.split() for line in routes)
+                if len(fields) > 1 and fields[1] == "00000000"
+            }
+    except OSError:
+        default_route_ifaces = set()
+    if adapters & default_route_ifaces:
+        return "connected"
+    return "disconnected" if adapters else "no_adapter"
+
+
 def test_internet():
     """Teste la connexion Internet de manière complète et portable pour Windows et Linux/Batocera."""
     logger.debug("=== Début test de connexion Internet complet ===")
@@ -2479,22 +2513,32 @@ async def apply_pending_update(latest_version):
     update_zip_path = os.path.join(UPDATE_FOLDER, f"RGSX_update_v{latest_version}.zip")
     logger.debug(f"Téléchargement de {UPDATE_ZIP} vers {update_zip_path}")
 
-    with requests.get(UPDATE_ZIP, stream=True, timeout=10) as r:
-        r.raise_for_status()
-        total_size = int(r.headers.get('content-length', 0))
-        downloaded = 0
-        start_time = time.time()
-        with open(update_zip_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    config.loading_progress = 10.0 + (40.0 * downloaded / total_size) if total_size > 0 else 10.0
-                    elapsed = max(time.time() - start_time, 0.001)
-                    speed = downloaded / elapsed
-                    progress_line = f"Download: {_format_size(downloaded)} / {_format_size(total_size)}" if total_size > 0 else f"Download: {_format_size(downloaded)}"
-                    _set_loading_details(progress_line, f"Speed: {_format_size(speed)}/s")
-                    await asyncio.sleep(0)
+    # Téléchargement dans un thread : la boucle de rendu ne fait pas le travail réseau
+    # et l'écran de progression n'est pas redessiné à chaque bloc.
+    progress = {"downloaded": 0, "total": 0}
+
+    def _download_update_zip():
+        with requests.get(UPDATE_ZIP, stream=True, timeout=10) as r:
+            r.raise_for_status()
+            progress["total"] = int(r.headers.get('content-length', 0))
+            with open(update_zip_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+                        progress["downloaded"] += len(chunk)
+
+    download_task = asyncio.create_task(asyncio.to_thread(_download_update_zip))
+    start_time = time.time()
+    while not download_task.done():
+        await asyncio.sleep(0.25)
+        downloaded = progress["downloaded"]
+        total_size = progress["total"]
+        config.loading_progress = 10.0 + (40.0 * downloaded / total_size) if total_size > 0 else 10.0
+        elapsed = max(time.time() - start_time, 0.001)
+        speed = downloaded / elapsed
+        progress_line = f"Download: {_format_size(downloaded)} / {_format_size(total_size)}" if total_size > 0 else f"Download: {_format_size(downloaded)}"
+        _set_loading_details(progress_line, f"Speed: {_format_size(speed)}/s")
+    await download_task
     logger.debug(f"ZIP téléchargé : {update_zip_path}")
 
     config.current_loading_system = _("network_extracting_update")
@@ -2716,9 +2760,9 @@ async def check_for_updates():
         return False, _("network_check_update_error").format(str(e))
 
 def extract_update(zip_path, dest_dir, source_url):
-    if config.OPERATING_SYSTEM == "Darwin" and str(source_url).startswith(config.GITHUB_RELEASES_URL):
-        # macOS fork: never extract upstream's (non-mac) package over our files
-        logger.error(f"macOS: extraction refusée pour le paquet upstream {source_url}")
+    if config.OPERATING_SYSTEM == "Darwin":
+        # macOS application updates are manual, regardless of where a package comes from.
+        logger.error(f"macOS: installation automatique désactivée pour {source_url}")
         return False, _("network_update_macos_manual").format(url=config.FORK_RELEASES_URL)
     
     try:
@@ -3108,50 +3152,56 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
             # IMPORTANT: Créer l'entrée dans config.history dès le début avec status "Downloading"
             # pour que l'interface web puisse afficher le téléchargement en cours
             
-            # TOUJOURS charger l'historique existant depuis le fichier pour éviter d'écraser les anciennes entrées
-            config.history = load_history()
+            with history_lock:
+                # TOUJOURS charger l'historique existant depuis le fichier pour éviter d'écraser les anciennes entrées
+                reload_history(progress_queues)
             
-            # Vérifier si l'entrée existe déjà
-            entry_exists = False
-            for entry in config.history:
-                if entry.get("url") == original_history_url:
-                    entry_exists = True
-                    # Réinitialiser le status à "Downloading"
-                    entry["status"] = "Downloading"
-                    entry["progress"] = 0
-                    entry["downloaded_size"] = 0
-                    entry["platform"] = platform
-                    entry["game_name"] = game_name
-                    entry["display_name"] = get_clean_display_name(game_name, platform)
-                    entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    entry["task_id"] = task_id
-                    if int(entry.get("total_size", 0) or 0) <= 0 and known_total_size > 0:
-                        entry["total_size"] = known_total_size
-                    break
+                # La file d'attente et l'app ajoutent leur ligne sans regarder : sans ceci, l'ancienne
+                # ligne du jeu serait mise à jour et la nouvelle resterait "Downloading"
+                for old_entry in [e for e in config.history if e.get("url") == original_history_url][:-1]:
+                    config.history.remove(old_entry)
             
-            # Si l'entrée n'existe pas, la créer
-            if not entry_exists:
-                config.history.append({
-                    "platform": platform,
-                    "game_name": game_name,
-                    "display_name": get_clean_display_name(game_name, platform),
-                    "url": original_history_url,
-                    "status": "Downloading",
-                    "progress": 0,
-                    "downloaded_size": 0,
-                    "total_size": known_total_size,
-                    "speed": 0,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "message": f"Téléchargement de {game_name}",
-                    "task_id": task_id
-                })
+                # Vérifier si l'entrée existe déjà
+                entry_exists = False
+                for entry in config.history:
+                    if entry.get("url") == original_history_url:
+                        entry_exists = True
+                        # Réinitialiser le status à "Downloading"
+                        entry["status"] = "Downloading"
+                        entry["progress"] = 0
+                        entry["downloaded_size"] = 0
+                        entry["platform"] = platform
+                        entry["game_name"] = game_name
+                        entry["display_name"] = get_clean_display_name(game_name, platform)
+                        entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        entry["task_id"] = task_id
+                        if int(entry.get("total_size", 0) or 0) <= 0 and known_total_size > 0:
+                            entry["total_size"] = known_total_size
+                        break
             
-            # Sauvegarder history.json immédiatement
-            _save_history_with_feedback("download_rom:init")
+                # Si l'entrée n'existe pas, la créer
+                if not entry_exists:
+                    config.history.append({
+                        "platform": platform,
+                        "game_name": game_name,
+                        "display_name": get_clean_display_name(game_name, platform),
+                        "url": original_history_url,
+                        "status": "Downloading",
+                        "progress": 0,
+                        "downloaded_size": 0,
+                        "total_size": known_total_size,
+                        "speed": 0,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "message": f"{_('web_status_downloading')}: {game_name}",
+                        "task_id": task_id
+                    })
+
+                # Sauvegarder history.json immédiatement
+                _save_history_with_feedback("download_rom:init")
             
             cancel_ev = cancel_events.get(task_id)
             # Use symlink path if enabled
-            from rgsx_settings import apply_symlink_path, get_platform_custom_path
+            from rgsx_settings import apply_symlink_path, get_platform_custom_path, get_auto_extract
             
             # Vérifier si un dossier personnalisé est configuré pour cette plateforme
             custom_path = get_platform_custom_path(platform)
@@ -3210,7 +3260,11 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
                 if os.path.exists(dest_path):
                     local_size = os.path.getsize(dest_path)
                     expected_size = int(torrent_meta.get("size_bytes") or 0)
-                    if expected_size <= 0 or local_size == expected_size:
+                    # Archive ou ISO PS3 encore là : extraction ou conversion interrompue, le téléchargement doit la relancer
+                    from rgsx_settings import get_auto_extract
+                    extension = os.path.splitext(dest_path)[1].lower()
+                    unprocessed = (is_zip_non_supported and get_auto_extract() and extension in ('.zip', '.7z', '.rar')) or (extension == '.iso' and _is_ps3_redump_target(platform_folder, platform))
+                    if (expected_size <= 0 or local_size == expected_size) and not unprocessed:
                         logger.info(f"Le fichier torrent {dest_path} existe déjà, téléchargement ignoré")
                         result[0] = True
                         result[1] = _("network_download_ok").format(game_name) + _("download_already_present")
@@ -3256,7 +3310,7 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
                 result[1] = message
 
                 if success and os.path.exists(dest_path):
-                    os.chmod(dest_path, 0o644)
+                    try_chmod(dest_path, 0o644)
                 logger.debug(f"Téléchargement torrent terminé: {dest_path}")
             else:
             
@@ -3398,6 +3452,12 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
                             with urls_lock:
                                 urls_in_progress.discard(original_history_url)
                             return
+                    elif is_zip_non_supported and get_auto_extract() and os.path.splitext(dest_path)[1].lower() in ('.zip', '.7z', '.rar'):
+                        # Archive qui aurait dû être extraite puis supprimée : reste d'une extraction ratée, on télécharge à nouveau
+                        logger.info(f"Le fichier {dest_path} existe mais n'a pas été extrait, nouveau téléchargement")
+                    elif os.path.splitext(dest_path)[1].lower() == '.iso' and _is_ps3_redump_target(platform_folder, platform):
+                        # L'ISO PS3 est supprimé après conversion : s'il est là, la conversion n'a pas abouti
+                        logger.info(f"L'ISO {dest_path} existe mais n'a pas été converti, nouveau téléchargement")
                     else:
                         # Les tailles correspondent ou on ne peut pas vérifier, considérer comme déjà téléchargé
                         logger.info(f"Le fichier {dest_path} existe déjà et la taille est correcte, téléchargement ignoré")
@@ -3682,9 +3742,15 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
 
                             logger.debug(f"Tentative téléchargement {attempt}/{total_max_attempts} avec headers: {_redact_headers(hv)}")
                             timeout_val = (60, 90) if 'archive.org' in url else 30
-                            r = session.get(url, stream=True, timeout=timeout_val, allow_redirects=True, headers=hv)
+                            request_url = _normalize_lolroms_url(url) if _is_lolroms_url(url) else url
+                            r = session.get(request_url, stream=True, timeout=timeout_val, allow_redirects=True, headers=hv)
                             last_status = r.status_code
                             logger.debug(f"Status code tentative {attempt}: {r.status_code}")
+                            # archive.org répond souvent 5xx puis sert le même fichier à la tentative suivante
+                            if 'archive.org' in url and r.status_code in (500, 502, 503, 504) and attempt < total_max_attempts:
+                                r.close()
+                                time.sleep(min(3 * attempt, 15))
+                                continue
                             if _is_browser_challenge_response(r):
                                 browser_challenge_detected = True
                                 try:
@@ -3783,7 +3849,8 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
                                     if not meta_json.get('files'):
                                         raise requests.HTTPError(f"Item archive.org sans fichiers listés: {identifier}")
                                     available = [f.get('name') for f in meta_json.get('files', [])][:10]
-                                    raise requests.HTTPError(f"Accès refusé (HTTP {last_status}). Fichiers disponibles exemples: {available}")
+                                    logger.debug(f"Fichiers disponibles exemples: {available}")
+                                    raise requests.HTTPError(_("network_access_denied").format(last_status))
                                 raise requests.HTTPError(f"HTTP {last_status} & metadata indisponible pour {identifier}")
                             except requests.HTTPError:
                                 raise
@@ -3834,7 +3901,15 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
                     if not has_space:
                         raise InsufficientDiskSpaceError(low_space_message)
 
-                    transfer = _stream_response_to_path(response, dest_path, task_id, cancel_ev, progress_queues.get(task_id), fallback_total_size=vimm_file_size or known_total_size)
+                    try:
+                        transfer = _stream_response_to_path(response, dest_path, task_id, cancel_ev, progress_queues.get(task_id), fallback_total_size=vimm_file_size or known_total_size)
+                    except PermissionError:
+                        # Ouverture refusée : le fichier existant n'a pas été touché, il doit rester
+                        raise
+                    except Exception:
+                        # Coupure, source muette ou disque plein : ne pas laisser un fichier incomplet à la place du jeu
+                        _safe_remove_file(dest_path)
+                        raise
                     total_size = int(transfer['total_size'])
                     downloaded = int(transfer['downloaded'])
                     last_downloaded = int(transfer['last_downloaded'])
@@ -3893,7 +3968,7 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
                     # Garde-fous anti faux-positifs: certains hôtes peuvent
                     # renvoyer une page HTML/challenge avec un status 200.
                     archive_ext = os.path.splitext(dest_path)[1].lower()
-                    if archive_ext in {'.7z', '.zip', '.rar'}:
+                    if archive_ext in {'.7z', '.zip', '.rar'} or _is_lolroms_url(url):
                         if _looks_like_html_or_challenge(dest_path):
                             _safe_remove_file(dest_path)
                             raise requests.HTTPError(
@@ -3928,7 +4003,7 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
                             pass
                         return
             
-            os.chmod(dest_path, 0o644)
+            try_chmod(dest_path, 0o644)
             logger.info(f"Téléchargement terminé: {dest_path}")
             
             # Vérifier si l'extraction automatique est activée dans les paramètres
@@ -3964,7 +4039,7 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
                         if "url" in entry and entry["url"] == original_history_url and entry["status"] in ["Downloading", "Téléchargement"]:
                             entry["status"] = "Extracting"
                             entry["progress"] = 0
-                            entry["message"] = "Préparation de l'extraction..."
+                            entry["message"] = _("network_preparing_extraction")
                             _save_history_with_feedback("download_rom:extracting")
                             config.needs_redraw = True
                             break
@@ -3973,7 +4048,7 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
                 except Exception as e:
                     logger.error(f"Exception lors du post-traitement: {str(e)}")
                     result[0] = False
-                    result[1] = f"Erreur téléchargement {game_name}: {str(e)}"
+                    result[1] = _("network_download_error").format(game_name, str(e))
             else:
                 result[0] = True
                 result[1] = _("network_download_ok").format(game_name)
@@ -4081,7 +4156,7 @@ async def download_rom(url, platform, game_name, is_zip_non_supported=False, tas
                             # Mettre à jour l'historique
                         if isinstance(config.history, list):
                             for entry in config.history:
-                                if "url" in entry and entry["url"] == original_history_url:
+                                if "url" in entry and entry["url"] == original_history_url and entry["status"] != "Canceled":
                                     entry["progress"] = progress_percent
                                     entry["downloaded_size"] = downloaded
                                     entry["total_size"] = total_size
@@ -4314,45 +4389,49 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
             # IMPORTANT: Créer l'entrée dans config.history dès le début avec status "Downloading"
             # pour que l'interface web puisse afficher le téléchargement en cours
 
-            # Charger l'historique existant depuis le fichier
-            if not isinstance(config.history, list):
-                config.history = load_history()
+            with history_lock:
+                # Charger l'historique existant depuis le fichier
+                if not isinstance(config.history, list):
+                    config.history = load_history()
             
-            # Vérifier si l'entrée existe déjà
-            entry_exists = False
-            for entry in config.history:
-                if entry.get("url") == url:
-                    entry_exists = True
-                    # Réinitialiser le status à "Downloading"
-                    entry["status"] = "Downloading"
-                    entry["progress"] = 0
-                    entry["downloaded_size"] = 0
-                    entry["platform"] = platform
-                    entry["game_name"] = game_name
-                    entry["display_name"] = get_clean_display_name(game_name, platform)
-                    entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    entry["task_id"] = task_id
-                    break
+                for old_entry in [e for e in config.history if e.get("url") == url][:-1]:
+                    config.history.remove(old_entry)
             
-            # Si l'entrée n'existe pas, la créer
-            if not entry_exists:
-                config.history.append({
-                    "platform": platform,
-                    "game_name": game_name,
-                    "display_name": get_clean_display_name(game_name, platform),
-                    "url": url,
-                    "status": "Downloading",
-                    "progress": 0,
-                    "downloaded_size": 0,
-                    "total_size": 0,
-                    "speed": 0,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "message": f"Téléchargement 1fichier de {game_name}",
-                    "task_id": task_id
-                })
+                # Vérifier si l'entrée existe déjà
+                entry_exists = False
+                for entry in config.history:
+                    if entry.get("url") == url:
+                        entry_exists = True
+                        # Réinitialiser le status à "Downloading"
+                        entry["status"] = "Downloading"
+                        entry["progress"] = 0
+                        entry["downloaded_size"] = 0
+                        entry["platform"] = platform
+                        entry["game_name"] = game_name
+                        entry["display_name"] = get_clean_display_name(game_name, platform)
+                        entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        entry["task_id"] = task_id
+                        break
             
-            # Sauvegarder history.json immédiatement
-            _save_history_with_feedback("download_1fichier:init")
+                # Si l'entrée n'existe pas, la créer
+                if not entry_exists:
+                    config.history.append({
+                        "platform": platform,
+                        "game_name": game_name,
+                        "display_name": get_clean_display_name(game_name, platform),
+                        "url": url,
+                        "status": "Downloading",
+                        "progress": 0,
+                        "downloaded_size": 0,
+                        "total_size": 0,
+                        "speed": 0,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "message": f"{_('web_status_downloading')}: {game_name}",
+                        "task_id": task_id
+                    })
+
+                # Sauvegarder history.json immédiatement
+                _save_history_with_feedback("download_1fichier:init")
             
             # Use symlink path if enabled
             from rgsx_settings import apply_symlink_path, get_platform_custom_path
@@ -4432,7 +4511,7 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
                             friendly = f"1F: {raw_err}"
                     if not friendly:
                         if response.status_code == 403:
-                            friendly = "1F: Accès refusé (403)"
+                            friendly = "1F: " + _("network_access_denied").format(403)
                         elif response.status_code == 401:
                             friendly = "1F: Non autorisé (401)"
                         else:
@@ -4575,7 +4654,7 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
                                         friendly_1f = ONEFICHIER_ERROR_MAP.get(raw_error_1f)
                                 if not friendly_1f:
                                     if status_1f == 403:
-                                        friendly_1f = "1F: Accès refusé (403)"
+                                        friendly_1f = "1F: " + _("network_access_denied").format(403)
                                     elif status_1f == 401:
                                         friendly_1f = "1F: Non autorisé (401)"
                                     elif status_1f >= 500:
@@ -5387,7 +5466,7 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
                                     if "url" in entry and entry["url"] == url and entry["status"] in ["Téléchargement", "Downloading"]:
                                         entry["progress"] = 0
                                         entry["status"] = "Extracting"
-                                        entry["message"] = "Préparation de l'extraction..."
+                                        entry["message"] = _("network_preparing_extraction")
                                         _save_history_with_feedback("download_1fichier:extracting")
                                         config.needs_redraw = True
                                         break
@@ -5397,10 +5476,10 @@ async def download_from_1fichier(url, platform, game_name, is_zip_non_supported=
                         except Exception as e:
                             logger.error(f"Exception lors du post-traitement: {str(e)}")
                             result[0] = False
-                            result[1] = f"Erreur téléchargement {game_name}: {str(e)}"
+                            result[1] = _("network_download_error").format(game_name, str(e))
                     else:
                         logger.debug(f"Application des permissions sur {dest_path}")
-                        os.chmod(dest_path, 0o644)
+                        try_chmod(dest_path, 0o644)
                         logger.info(f"Téléchargement terminé: {dest_path}")
                         result[0] = True
                         result[1] = _("network_download_ok").format(game_name)

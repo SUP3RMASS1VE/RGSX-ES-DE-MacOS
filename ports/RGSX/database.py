@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 3
+import sqlite3
+
+SCHEMA_VERSION = 6
 
 PLATFORM_SOURCE_ALIASES = {
     "archive": "Archive",
@@ -31,6 +32,24 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS screenscraper_systems (
+    system_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    short_name TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS screenscraper_game_summaries (
+    system_id INTEGER NOT NULL,
+    rom_name TEXT NOT NULL,
+    found INTEGER NOT NULL DEFAULT 0,
+    summary TEXT NOT NULL DEFAULT '',
+    cover_checked INTEGER NOT NULL DEFAULT 0,
+    screenshot_checked INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (system_id, rom_name)
+);
+
 CREATE TABLE IF NOT EXISTS platforms (
     id INTEGER PRIMARY KEY,
     platform_name TEXT NOT NULL UNIQUE,
@@ -38,6 +57,7 @@ CREATE TABLE IF NOT EXISTS platforms (
     file_name TEXT NOT NULL DEFAULT '',
     folder TEXT NOT NULL DEFAULT '',
     platform_image TEXT NOT NULL DEFAULT '',
+    screenscraper_system_id INTEGER,
     sort_order INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -233,6 +253,13 @@ def initialize_database(db_path: str | os.PathLike[str] | None = None) -> str:
         columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(platforms)").fetchall()}
         if "source" not in columns:
             connection.execute("ALTER TABLE platforms ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+        if "screenscraper_system_id" not in columns:
+            connection.execute("ALTER TABLE platforms ADD COLUMN screenscraper_system_id INTEGER")
+        summary_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(screenscraper_game_summaries)").fetchall()}
+        if "cover_checked" not in summary_columns:
+            connection.execute("ALTER TABLE screenscraper_game_summaries ADD COLUMN cover_checked INTEGER NOT NULL DEFAULT 0")
+        if "screenshot_checked" not in summary_columns:
+            connection.execute("ALTER TABLE screenscraper_game_summaries ADD COLUMN screenshot_checked INTEGER NOT NULL DEFAULT 0")
         legacy_rows = connection.execute(
             "SELECT id, platform_name, source FROM platforms WHERE TRIM(source) = ''"
         ).fetchall()
@@ -416,10 +443,157 @@ def list_platforms(db_path: str | os.PathLike[str] | None = None) -> list[dict[s
     initialize_database(db_path)
     with connect(db_path) as connection:
         rows = connection.execute(
-            "SELECT id, platform_name, source, file_name, folder, platform_image, sort_order, created_at, updated_at "
+            "SELECT id, platform_name, source, file_name, folder, platform_image, screenscraper_system_id, sort_order, created_at, updated_at "
             "FROM platforms ORDER BY sort_order, id"
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def list_screenscraper_systems(db_path: str | os.PathLike[str] | None = None) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with connect(db_path) as connection:
+        rows = connection.execute(
+            "SELECT system_id, name, short_name FROM screenscraper_systems ORDER BY system_id"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def screenscraper_systems_cache_is_stale(
+    max_age_seconds: float,
+    db_path: str | os.PathLike[str] | None = None,
+) -> bool:
+    initialize_database(db_path)
+    with connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'screenscraper_systems_updated_at'"
+        ).fetchone()
+    if not row:
+        return True
+    try:
+        updated_at = datetime.fromisoformat(str(row["value"]).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return True
+    return (datetime.now(timezone.utc) - updated_at).total_seconds() >= max_age_seconds
+
+
+def replace_screenscraper_systems(
+    systems: Iterable[dict[str, Any]],
+    db_path: str | os.PathLike[str] | None = None,
+) -> int:
+    system_rows = {}
+    for system in systems:
+        try:
+            system_id = int(system.get("system_id") or system.get("id") or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        name = str(system.get("name") or "").strip()
+        short_name = str(system.get("short_name") or "").strip()
+        if system_id < 1 or (not name and not short_name):
+            continue
+        system_rows[system_id] = (name, short_name)
+    if not system_rows:
+        raise ValueError("ScreenScraper system catalog contains no valid systems")
+
+    initialize_database(db_path)
+    now = utc_now()
+    with connect(db_path) as connection:
+        connection.execute("DELETE FROM screenscraper_systems")
+        connection.executemany(
+            "INSERT INTO screenscraper_systems(system_id, name, short_name, updated_at) VALUES(?, ?, ?, ?)",
+            [(system_id, name, short_name, now) for system_id, (name, short_name) in system_rows.items()],
+        )
+        connection.execute(
+            "INSERT INTO schema_meta(key, value) VALUES('screenscraper_systems_updated_at', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (now,),
+        )
+    return len(system_rows)
+
+
+def load_game_summary(
+    system_id: int,
+    rom_name: str,
+    db_path: str | os.PathLike[str] | None = None,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT found, summary, cover_checked, screenshot_checked FROM screenscraper_game_summaries WHERE system_id = ? AND rom_name = ?",
+            (int(system_id), str(rom_name)),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "found": bool(row["found"]),
+        "summary": str(row["summary"]),
+        "cover_checked": bool(row["cover_checked"]),
+        "screenshot_checked": bool(row["screenshot_checked"]),
+    }
+
+
+def load_game_summaries(
+    system_id: int,
+    rom_names: list[str],
+    db_path: str | os.PathLike[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    names = list(dict.fromkeys(os.path.basename(str(name)) for name in rom_names if name))
+    if not names:
+        return {}
+
+    initialize_database(db_path)
+    summaries: dict[str, dict[str, Any]] = {}
+    with connect(db_path) as connection:
+        for offset in range(0, len(names), 900):
+            batch = names[offset:offset + 900]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                f"SELECT rom_name, found, summary, cover_checked, screenshot_checked "
+                f"FROM screenscraper_game_summaries WHERE system_id = ? AND rom_name IN ({placeholders})",
+                (int(system_id), *batch),
+            ).fetchall()
+            for row in rows:
+                summaries[str(row["rom_name"])] = {
+                    "found": bool(row["found"]),
+                    "summary": str(row["summary"]),
+                    "cover_checked": bool(row["cover_checked"]),
+                    "screenshot_checked": bool(row["screenshot_checked"]),
+                }
+    return summaries
+
+
+def save_game_summary(
+    system_id: int,
+    rom_name: str,
+    summary: str,
+    found: bool,
+    cover_checked: bool | None = None,
+    screenshot_checked: bool | None = None,
+    db_path: str | os.PathLike[str] | None = None,
+) -> None:
+    """Store a ScreenScraper answer. A checked flag left as None keeps its stored value."""
+    initialize_database(db_path)
+    with connect(db_path) as connection:
+        connection.execute(
+            """INSERT INTO screenscraper_game_summaries(system_id, rom_name, found, summary, cover_checked, screenshot_checked, updated_at)
+               VALUES(?, ?, ?, ?, COALESCE(?, 0), COALESCE(?, 0), ?)
+               ON CONFLICT(system_id, rom_name) DO UPDATE SET
+                   found=excluded.found,
+                   summary=excluded.summary,
+                   cover_checked=COALESCE(?, cover_checked),
+                   screenshot_checked=COALESCE(?, screenshot_checked),
+                   updated_at=excluded.updated_at""",
+            (
+                int(system_id),
+                str(rom_name),
+                1 if found else 0,
+                str(summary or ""),
+                None if cover_checked is None else (1 if cover_checked else 0),
+                None if screenshot_checked is None else (1 if screenshot_checked else 0),
+                utc_now(),
+                None if cover_checked is None else (1 if cover_checked else 0),
+                None if screenshot_checked is None else (1 if screenshot_checked else 0),
+            ),
+        )
 
 
 def list_platforms_with_game_counts(db_path: str | os.PathLike[str] | None = None) -> list[dict[str, Any]]:
@@ -428,10 +602,12 @@ def list_platforms_with_game_counts(db_path: str | os.PathLike[str] | None = Non
     with connect(db_path) as connection:
         rows = connection.execute(
             """SELECT p.id, p.platform_name, p.source, p.file_name, p.folder, p.platform_image,
+                      p.screenscraper_system_id,
                       p.sort_order, p.created_at, p.updated_at, COUNT(g.id) AS game_count
                  FROM platforms p
             LEFT JOIN games g ON g.platform_id = p.id
              GROUP BY p.id, p.platform_name, p.source, p.file_name, p.folder, p.platform_image,
+                      p.screenscraper_system_id,
                       p.sort_order, p.created_at, p.updated_at
              ORDER BY p.sort_order, p.id"""
         ).fetchall()
@@ -632,6 +808,18 @@ def save_downloaded_games(downloaded: dict[str, dict[str, Any]], db_path: str | 
                        VALUES(?, ?, ?, ?, ?)""",
                     (str(platform), str(game_name), _json_metadata(metadata), now, now),
                 )
+
+
+def add_downloaded_game(platform: str, game_name: str, db_path: str | os.PathLike[str] | None = None) -> None:
+    initialize_database(db_path)
+    now = utc_now()
+    with connect(db_path) as connection:
+        connection.execute(
+            """INSERT INTO downloaded_games(platform, game_name, metadata_json, created_at, updated_at)
+               VALUES(?, ?, '{}', ?, ?)
+               ON CONFLICT(platform, game_name) DO NOTHING""",
+            (str(platform), str(game_name), now, now),
+        )
 
 
 def load_local_state(key: str, default: Any = None, db_path: str | os.PathLike[str] | None = None) -> Any:

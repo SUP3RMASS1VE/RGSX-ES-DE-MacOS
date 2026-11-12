@@ -49,7 +49,7 @@ Replace the `ports` folder with the new one (delete the old `ports/RGSX` first r
 
 The in-app updater on macOS only **notifies**: when the fork publishes a newer version it shows a message pointing to the [fork's releases page](https://github.com/SUP3RMASS1VE/RGSX-ES-DE-MacOS/releases). It never downloads or installs anything, and it never touches `~/Library/Application Support/RGSX` (your settings and runtime). Download `RGSX_macos_arm64.zip` from the releases page and replace the `ports` folder as above. Upstream's own update package is not for macOS and is never installed by this fork.
 
-This fork is synced with upstream RGSX v2.7.0.7 (the version shown in the app). On first launch after the upgrade RGSX builds its local game catalog database (`rgsx.sqlite3` in `~/Library/Application Support/RGSX`), which can take a moment.
+Version 2.7.0.7.1 keeps the v2.7.0.7 macOS port and selectively brings in upstream archive safety, settings-save, download/history/web fixes and Media Manager through commit `722f5c7` (2026-11-05). It is not a full upstream sync. The local catalog database is upgraded in place to cache ScreenScraper details; existing settings, history and downloaded-game records are kept. Automatic application installation remains disabled on macOS, including packages from this fork.
 
 ### ES-DE folder names
 
@@ -109,6 +109,7 @@ Controllers are auto-mapped when recognized, and you can remap them from the pau
 
 **Root categories**
 - Games (downloads, scans, platform visibility)
+- Scrap (ScreenScraper account, Media Manager, enable/disable scraping)
 - Language (switch UI language)
 - Controls (help and remap)
 - Display (layout, fonts, monitor/mode, visual options)
@@ -181,6 +182,16 @@ Torrent sources run through libtorrent, installed automatically on macOS 14 or n
 - On the first torrent the macOS firewall may ask about incoming connections. Choosing Deny still allows downloading.
 - To never get that prompt, set `RGSX_TORRENT_LISTEN=off`: RGSX then listens on loopback only and disables DHT, LSD and UPnP.
 - When seeding across volumes, a second copy of the file is kept until RGSX exits.
+
+---
+
+## 🖼️ Media Manager
+
+Open **Pause > Scrap > ScreenScraper credentials** and enter your ScreenScraper.fr username and password. Then open **Media Manager**, select platforms and start the job. The Box art profile downloads covers; Maximum also downloads screenshots and caches game descriptions. You can pause the job and resume the saved queue later. The web interface has the same Media Manager and account settings.
+
+Game lists show locally cached covers. Hold Confirm for one second on a game to open its details. ScreenScraper requests run in the background; **Scrap > Disable ScreenScraper** turns them off.
+
+Artwork, the resumable queue and account settings stay under `~/Library/Application Support/RGSX` (`media/`, `rgsx_media_queue.json`, `screenscraper_account.json`). This is RGSX's browsing cache; it does not change ES-DE's gamelists or downloaded media. Existing ROM folder mappings still apply to game downloads, including installations on external drives.
 
 ---
 

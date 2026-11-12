@@ -81,16 +81,16 @@ from display import (
 )
 from language import _
 from network import is_1fichier_url, check_for_updates, apply_pending_update, cancel_all_downloads, shutdown_downloads
-from controls import handle_controls, validate_menu_state, process_key_repeats, get_emergency_controls, clear_joystick_repeat_states, start_or_queue_download, should_open_pause_menu
+from controls import handle_controls, validate_menu_state, process_key_repeats, get_emergency_controls, clear_joystick_repeat_states, start_or_queue_download, should_open_pause_menu, _launch_next_queued_download
 from controls_mapper import map_controls, draw_controls_mapping, get_actions
 from controls import load_controls_config
 from utils import (
     load_sources, check_extension_before_download,
     play_random_music, load_music_config, load_api_keys, _refresh_loading_feedback, get_disk_usage,
-    parse_torrent_download_url
+    parse_torrent_download_url, queue_interrupted_downloads
 )
 from history import load_history, save_history, load_downloaded_games, check_history_write_access, get_history_write_status
-from rgsx_settings import get_display_fullscreen
+from rgsx_settings import get_display_fullscreen, is_screenscraper_disabled
 from accessibility import  load_accessibility_settings
 
 # Configuration du logging
@@ -686,7 +686,7 @@ def start_web_server():
             return True
     try:
         web_server_script = os.path.join(config.APP_FOLDER, "rgsx_web.py")
-        
+
         if not os.path.exists(web_server_script):
             logger.warning(f"Script serveur web introuvable: {web_server_script}")
             return False
@@ -910,19 +910,11 @@ async def main():
                 f"[RESUME] {len(interrupted_torrents)} reprise(s) torrent détectée(s): qBittorrent préchauffé au démarrage"
             )
 
-        if interrupted:
-            logger.info(f"[RESUME] {len(interrupted)} téléchargement(s) interrompu(s) détecté(s), reprise...")
-        for entry in interrupted:
-            _url = entry["url"]
-            _platform = entry.get("platform", "")
-            _game_name = entry.get("game_name", "")
-            _is_zip = entry.get("is_zip_non_supported", False)
-            _state, _task_id = start_or_queue_download(_url, _platform, _game_name, _is_zip)
-            logger.info(f"[RESUME] Reprise: {_game_name} ({_platform}) task_id={_task_id} state={_state}")
-            if _state == "queued":
-                entry["status"] = "Queued"
-                entry["message"] = _("download_queued") if _ else "Queued"
-                save_history(config.history)
+        resumed = queue_interrupted_downloads()
+        if resumed:
+            logger.info(f"[RESUME] {resumed} téléchargement(s) interrompu(s) détecté(s), reprise...")
+            for _slot in range(resumed):
+                _launch_next_queued_download()
     except Exception as _e:
         logger.error(f"[RESUME] Erreur lors de la reprise des téléchargements: {_e}")
 
@@ -997,71 +989,22 @@ async def main():
         # Gestion de la répétition automatique des actions
         process_key_repeats(sources, joystick, screen)
         
-        # Gestion de l'appui long sur confirm dans le menu game pour ouvrir le scraper
+        # A long confirm press opens ScreenScraper game details.
         if (config.menu_state == "game" and 
             config.confirm_press_start_time > 0 and 
-            not config.confirm_long_press_triggered):
+            not config.confirm_long_press_triggered and
+            not is_screenscraper_disabled()):
             press_duration = current_time - config.confirm_press_start_time
             if press_duration >= config.confirm_long_press_threshold:
-                # Appui long détecté, ouvrir le scraper
                 games = config.filtered_games if config.filter_active or config.search_mode else config.games
                 if games:
-                    game_name = games[config.current_game].name
+                    game = games[config.current_game]
+                    game_name = game.name
                     platform = config.platforms[config.current_platform]["name"] if isinstance(config.platforms[config.current_platform], dict) else config.platforms[config.current_platform]
-                    
-                    config.previous_menu_state = "game"
-                    config.menu_state = "scraper"
-                    config.scraper_game_name = game_name
-                    config.scraper_platform_name = platform
-                    config.scraper_loading = True
-                    config.scraper_error_message = ""
-                    config.scraper_image_surface = None
-                    config.scraper_image_url = ""
-                    config.scraper_description = ""
-                    config.scraper_genre = ""
-                    config.scraper_release_date = ""
-                    config.scraper_game_page_url = ""
-                    config.needs_redraw = True
-                    config.confirm_long_press_triggered = True  # Éviter de déclencher plusieurs fois
-                    logger.debug(f"Appui long détecté ({press_duration}ms), ouverture du scraper pour {game_name}")
-                    
-                    # Lancer la recherche des métadonnées dans un thread séparé
-                    def scrape_async():
-                        from scraper import get_game_metadata, download_image_to_surface
-                        logger.info(f"Scraping métadonnées pour {game_name} sur {platform}")
-                        metadata = get_game_metadata(game_name, platform)
-                        
-                        # Vérifier si on a une erreur
-                        if "error" in metadata:
-                            config.scraper_error_message = metadata["error"]
-                            config.scraper_loading = False
-                            config.needs_redraw = True
-                            logger.error(f"Erreur de scraping: {metadata['error']}")
-                            return
-                        
-                        # Mettre à jour les métadonnées textuelles
-                        config.scraper_description = metadata.get("description", "")
-                        config.scraper_genre = metadata.get("genre", "")
-                        config.scraper_release_date = metadata.get("release_date", "")
-                        config.scraper_game_page_url = metadata.get("game_page_url", "")
-                        
-                        # Télécharger l'image si disponible
-                        image_url = metadata.get("image_url")
-                        if image_url:
-                            logger.info(f"Téléchargement de l'image: {image_url}")
-                            image_surface = download_image_to_surface(image_url)
-                            if image_surface:
-                                config.scraper_image_surface = image_surface
-                                config.scraper_image_url = image_url
-                            else:
-                                logger.warning("Échec du téléchargement de l'image")
-                        
-                        config.scraper_loading = False
-                        config.needs_redraw = True
-                        logger.info("Scraping terminé")
-                    
-                    thread = threading.Thread(target=scrape_async, daemon=True)
-                    thread.start()
+                    from game_info import open_game_info
+                    open_game_info(game.name, game.display_name, platform, "game")
+                    config.confirm_long_press_triggered = True
+                    logger.debug("Long confirm press opened ScreenScraper details for %s", game_name)
         
         # Gestion de l'appui long sur confirm dans le menu platform pour configurer le dossier de destination
         if (config.menu_state == "platform" and 
@@ -1219,9 +1162,13 @@ async def main():
                 "pause_display_layout_menu",
                 "pause_display_font_menu",
                 "pause_games_menu",
+                "pause_scrap_menu",
                 "pause_settings_menu",
                 "pause_api_keys_status",
                 "pause_connection_status",
+                "media_manager",
+                "screenscraper_input",
+                "game_info",
                 "filter_platforms",
                 "display_menu",
                 "language_select",
@@ -1233,8 +1180,6 @@ async def main():
                 # Menus historique
                 "history_game_options",
                 "history_show_folder",
-                "history_scraper_info",
-                "scraper",
                 "history_error_details",
                 "history_confirm_delete",
                 "history_extract_archive",
@@ -1636,6 +1581,9 @@ async def main():
             elif config.menu_state == "pause_games_menu":
                 from display import draw_pause_games_menu
                 draw_pause_games_menu(screen, getattr(config, 'pause_games_selection', 0))
+            elif config.menu_state == "pause_scrap_menu":
+                from display import draw_pause_scrap_menu
+                draw_pause_scrap_menu(screen, getattr(config, 'pause_scrap_selection', 0))
             elif config.menu_state == "pause_settings_menu":
                 from display import draw_pause_settings_menu
                 draw_pause_settings_menu(screen, getattr(config, 'pause_settings_selection', 0))
@@ -1645,6 +1593,12 @@ async def main():
             elif config.menu_state == "pause_connection_status":
                 from display import draw_pause_connection_status
                 draw_pause_connection_status(screen)
+            elif config.menu_state == "media_manager":
+                from display import draw_media_manager
+                draw_media_manager(screen)
+            elif config.menu_state == "screenscraper_input":
+                from display import draw_screenscraper_input
+                draw_screenscraper_input(screen)
             elif config.menu_state == "filter_platforms":
                 from display import draw_filter_platforms_menu
                 draw_filter_platforms_menu(screen)
@@ -1667,12 +1621,9 @@ async def main():
             elif config.menu_state == "history_show_folder":
                 from display import draw_history_show_folder
                 draw_history_show_folder(screen)
-            elif config.menu_state == "scraper":
-                from display import draw_scraper_screen
-                draw_scraper_screen(screen)
-            elif config.menu_state == "history_scraper_info":
-                from display import draw_history_scraper_info
-                draw_history_scraper_info(screen)
+            elif config.menu_state == "game_info":
+                from display import draw_game_info_screen
+                draw_game_info_screen(screen)
             elif config.menu_state == "history_error_details":
                 from display import draw_history_error_details
                 draw_history_error_details(screen)
@@ -1834,6 +1785,14 @@ async def main():
                     logger.debug(f"Étape chargement : {loading_step}, progress={config.loading_progress}")
                     continue  # Passer immédiatement à check_data
             elif loading_step == "await_ota_confirmation":
+                if not getattr(config, "pending_update_version", ""):
+                    # Update skipped with Cancel in the OTA viewer
+                    logger.info("OTA update skipped by the user")
+                    loading_step = "check_data"
+                    config.current_loading_system = _("loading_connect_catalog")
+                    config.loading_progress = 35.0
+                    config.needs_redraw = True
+                    continue
                 if not getattr(config, "startup_update_confirmed", False):
                     await asyncio.sleep(0.01)
                     continue
@@ -1872,28 +1831,71 @@ async def main():
                 config.needs_redraw = True
                 catalog_sync_error = None
                 catalog_sync_result = None
+                catalog_sync_state = {"title": None, "progress": 40.0, "detail_lines": [], "changed_at": time.time()}
                 try:
-                    def _report_catalog_sync_progress(_stage, progress, detail):
+                    def _report_catalog_sync_progress(stage, progress, detail):
+                        step_title = None
                         detail_lines = []
-                        if detail:
-                            entity, separator, counts = str(detail).partition(":")
-                            if separator and "/" in counts:
-                                loaded, total = counts.split("/", 1)
-                                if entity == "games":
+                        name, separator, value = str(detail or "").partition(":")
+                        if stage == "sync_step":
+                            if name == "changes" and "/" in value:
+                                current_seq, total_seq = value.split("/", 1)
+                                step_title = _("loading_sync_step_changes").format(current_seq, total_seq)
+                            elif name == "visibility_platform" and "/" in value:
+                                done, total = value.split("/", 1)
+                                step_title = _("loading_sync_step_visibility_platform").format(done, total)
+                            else:
+                                step_keys = {
+                                    "db_open": "loading_sync_step_db_open",
+                                    "manifest": "loading_sync_step_manifest",
+                                    "full": "loading_sync_step_full",
+                                    "visibility": "loading_sync_step_visibility",
+                                    "visibility_write": "loading_sync_step_visibility_write",
+                                    "recheck": "loading_sync_step_recheck",
+                                    "cursor": "loading_sync_step_cursor",
+                                }
+                                if name in step_keys:
+                                    step_title = _(step_keys[name])
+                        elif stage == "sync_snapshot":
+                            if name == "platforms" or name == "games":
+                                step_title = _("loading_sync_snapshot_platforms" if name == "platforms" else "loading_sync_snapshot_games")
+                                loaded, _sep, total = value.partition("/")
+                                if name == "games" and total:
                                     detail_lines.append(_("loading_catalog_games_progress").format(loaded, total))
-                                elif entity == "platforms":
+                                elif name == "platforms" and total:
                                     detail_lines.append(_("loading_platform_counter").format(loaded, total))
+                            elif name == "platform_assets":
+                                step_title = _("loading_sync_snapshot_assets")
+                                detail_lines.append(_("loading_catalog_assets_progress").format(value.partition("/")[0]))
+                        if step_title is None:
+                            step_title = _("loading_sync_catalog")
+                        catalog_sync_state.update(
+                            title=step_title,
+                            progress=40.0 + (max(0.0, min(100.0, float(progress))) * 0.18),
+                            detail_lines=detail_lines,
+                            changed_at=time.time(),
+                        )
+
+                    # La synchro tourne dans un thread pour que l'écran de chargement continue
+                    # d'être redessiné pendant les appels réseau.
+                    sync_task = asyncio.create_task(asyncio.to_thread(
+                        catalog_sync.sync_catalog,
+                        config.DB_PATH,
+                        progress_callback=_report_catalog_sync_progress,
+                    ))
+                    while not sync_task.done():
+                        await asyncio.sleep(0.1)
+                        detail_lines = list(catalog_sync_state["detail_lines"])
+                        waiting = time.time() - catalog_sync_state["changed_at"]
+                        if waiting >= 2.0:
+                            detail_lines.append(_("loading_sync_waiting_server").format(int(waiting)))
                         _refresh_loading_feedback(
-                            current_system=_("loading_sync_catalog"),
-                            progress=progress,
+                            current_system=catalog_sync_state["title"] or _("loading_sync_catalog"),
+                            progress=catalog_sync_state["progress"],
                             detail_lines=detail_lines,
                             force=True,
                         )
-
-                    catalog_sync_result = catalog_sync.sync_catalog(
-                        config.DB_PATH,
-                        progress_callback=_report_catalog_sync_progress,
-                    )
+                    catalog_sync_result = await sync_task
                     logger.info("Synchronisation du catalogue: %s", catalog_sync_result)
                 except Exception as sync_error:
                     catalog_sync_error = sync_error
@@ -1925,7 +1927,16 @@ async def main():
                 if catalog_sync_error is not None or sync_mode == "local":
                     config.loading_detail_lines = [_ ("loading_catalog_offline_cache")]
                 else:
-                    config.loading_detail_lines = [_ ("loading_catalog_source_api")]
+                    applied_changes = int((catalog_sync_result or {}).get("applied") or 0)
+                    if sync_mode == "https-full":
+                        mode_line = _("loading_catalog_mode_full")
+                    elif sync_mode == "https-visibility":
+                        mode_line = _("loading_catalog_mode_visibility")
+                    elif applied_changes > 0:
+                        mode_line = _("loading_catalog_mode_incremental").format(applied_changes)
+                    else:
+                        mode_line = _("loading_catalog_mode_up_to_date")
+                    config.loading_detail_lines = [_ ("loading_catalog_source_api"), mode_line]
                 config.needs_redraw = True
                 loading_step = "load_sources"
                 continue

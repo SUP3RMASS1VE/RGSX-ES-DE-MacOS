@@ -17,13 +17,15 @@ import argparse
 import copy
 import hashlib
 import mimetypes
+import queue
 from datetime import datetime, timezone
 from email.utils import formatdate, parsedate_to_datetime
 import config
 from esde_folders import map_rom_folder
-from history import load_history, save_history
-from utils import load_sources, load_games, get_clean_display_name, format_game_size, parse_torrent_download_url, request_torrent_manifest_refresh, _resolve_platform_image_path, get_platform_image_payload
-from network import download_rom, download_from_1fichier
+from history import load_history, save_history, clear_history, history_lock, reload_history
+from language import load_language
+from network import download_rom, download_from_1fichier, progress_queues
+from utils import queue_interrupted_downloads, load_sources, load_games, get_clean_display_name, format_game_size, parse_torrent_download_url, request_torrent_manifest_refresh, _resolve_platform_image_path, get_platform_image_payload
 from pathlib import Path
 from rgsx_settings import get_language
 from config import Game
@@ -61,6 +63,7 @@ def load_translations():
 
 # Charger les traductions globalement
 TRANSLATIONS = load_translations()
+load_language(get_language())
 
 # Cache configuration
 CACHE_TTL_SECONDS = 60  # seconds
@@ -178,6 +181,7 @@ def get_cached_games(platform: str) -> tuple[list[Game], str, datetime]:
     with cache_lock:
         games_cache[platform] = {
             'data': copy.deepcopy(games),
+            'names': frozenset(game.name for game in games),
             'timestamp': now,
             'etag': etag,
             'last_modified': last_modified,
@@ -366,6 +370,336 @@ except Exception as watcher_error:  # pragma: no cover - watcher errors shouldn'
     watchdog_started = False
 
 
+_web_media_manager = None
+_web_media_manager_lock = threading.Lock()
+_web_game_media_queue = queue.Queue(maxsize=100)
+_web_game_media_jobs = {}
+_web_game_media_jobs_lock = threading.Lock()
+_web_game_media_worker_thread = None
+
+
+def _get_web_media_manager():
+    global _web_media_manager
+    with _web_media_manager_lock:
+        if _web_media_manager is None:
+            from media_manager import MediaManager
+            _web_media_manager = MediaManager()
+            _web_media_manager.open()
+        return _web_media_manager
+
+
+def _media_manager_payload(manager):
+    import media_manager as media
+    from rgsx_settings import is_screenscraper_disabled
+
+    queue = media.load_queue()
+    with manager._platforms_lock:
+        platforms = [dict(group) for group in manager.platforms]
+    status = None
+    if manager.status:
+        status = {"key": manager.status[0], "args": list(manager.status[1])}
+    games, requests, capacity = manager.estimate()
+    busy_elsewhere = not manager.running and media.media_job_running_elsewhere()
+    return {
+        "success": True,
+        "running": manager.running,
+        "busy_elsewhere": busy_elsewhere,
+        "account_configured": manager.account_configured,
+        "screenscraper_enabled": not is_screenscraper_disabled(),
+        "thread_limit_ready": manager.thread_limit_ready.is_set(),
+        "max_threads": manager.max_threads,
+        "allowance": list(manager.allowance) if manager.allowance else None,
+        "profile": manager.profile,
+        "selected": sorted(manager.selected),
+        "progress": dict(manager.progress),
+        "pending": len(queue.get("items", [])),
+        "not_found": len(queue.get("not_found", [])),
+        "estimate": {"games": games, "requests": requests, "capacity": capacity},
+        "media_counts_ready": manager.media_counts_ready,
+        "platforms": [
+            {
+                "folder": group["folder"],
+                "label": group["label"],
+                "count": group["count"],
+                "supported": bool(group.get("platform_id")),
+                "scraped_count": group.get("scraped_count", 0),
+                "missing_count": group.get("missing_count", group["count"]),
+                "not_found_count": group.get("not_found_count", 0),
+            }
+            for group in platforms
+        ],
+        "status": status,
+    }
+
+
+def _resolve_game_media_target(platform_name, rom_filename):
+    if not isinstance(platform_name, str) or not isinstance(rom_filename, str):
+        return None
+    platform_info = (getattr(config, 'platform_dict_by_name', {}) or {}).get(platform_name)
+    if not isinstance(platform_info, dict):
+        return None
+    folder = str(platform_info.get('folder') or '')
+    if not folder:
+        return None
+
+    now = time.time()
+    with cache_lock:
+        entry = games_cache.get(platform_name)
+        if entry and now - entry['timestamp'] <= CACHE_TTL_SECONDS:
+            names = entry.get('names')
+            if names is None:
+                names = frozenset(game.name for game in entry['data'])
+                entry['names'] = names
+            return (folder, rom_filename) if rom_filename in names else None
+
+    games, _, _ = get_cached_games(platform_name)
+    if not any(game.name == rom_filename for game in games):
+        return None
+    return folder, rom_filename
+
+
+def _game_media_job_key(platform_name, folder, rom_filename, kind):
+    return platform_name, folder, rom_filename, kind
+
+
+def _update_game_media_job(key, status, error=None):
+    with _web_game_media_jobs_lock:
+        job = dict(_web_game_media_jobs.get(key, {}))
+        job['status'] = status
+        job['updated_at'] = time.time()
+        if error:
+            job['error'] = str(error)
+        else:
+            job.pop('error', None)
+        _web_game_media_jobs[key] = job
+        return dict(job)
+
+
+def _game_media_payload(platform_name, rom_filename):
+    target = _resolve_game_media_target(platform_name, rom_filename)
+    if target is None:
+        return None
+
+    import screenscraper
+    from media_manager import find_media
+    from rgsx_settings import is_screenscraper_disabled
+
+    folder, rom_filename = target
+    system_id = screenscraper.get_system_id(platform_name)
+    record = screenscraper.cached_game_info(rom_filename, system_id) if system_id else None
+    box_path = find_media(folder, rom_filename, 'box')
+    account_username, account_password = screenscraper.load_account()
+    account_configured = bool(account_username and account_password)
+    screenscraper_enabled = not is_screenscraper_disabled()
+    game_not_found = bool(record and not record['found'])
+    supported = system_id is not None
+
+    if box_path:
+        box_status = 'available'
+    elif game_not_found:
+        box_status = 'not_found'
+    elif not supported:
+        box_status = 'unsupported'
+    elif record and record['cover_checked']:
+        box_status = 'unavailable'
+    else:
+        box_status = 'missing'
+
+    summary = str(record['summary'] or '') if record and record['found'] else ''
+    if summary:
+        summary_status = 'available'
+    elif game_not_found:
+        summary_status = 'not_found'
+    elif not supported:
+        summary_status = 'unsupported'
+    elif record:
+        summary_status = 'unavailable'
+    else:
+        summary_status = 'missing'
+
+    box_key = _game_media_job_key(platform_name, folder, rom_filename, 'box')
+    summary_key = _game_media_job_key(platform_name, folder, rom_filename, 'summary')
+    with _web_game_media_jobs_lock:
+        box_job = dict(_web_game_media_jobs[box_key]) if box_key in _web_game_media_jobs else None
+        summary_job = dict(_web_game_media_jobs[summary_key]) if summary_key in _web_game_media_jobs else None
+
+    image_query = urllib.parse.urlencode({
+        'platform': platform_name,
+        'game': rom_filename,
+        'kind': 'box',
+    })
+    return {
+        'success': True,
+        'platform': platform_name,
+        'game': rom_filename,
+        'account_configured': account_configured,
+        'screenscraper_enabled': screenscraper_enabled,
+        'supported': supported,
+        'box': {
+            'status': box_status,
+            'available': bool(box_path),
+            'url': f'/api/game-media/image?{image_query}' if box_path else None,
+            'can_download': box_status in ('missing', 'unsupported') and account_configured and screenscraper_enabled,
+            'can_search': account_configured and screenscraper_enabled,
+            'checked': bool(record and record['cover_checked']),
+            'job': box_job,
+        },
+        'summary': {
+            'status': summary_status,
+            'available': bool(summary),
+            'text': summary,
+            'can_download': summary_status in ('missing', 'unsupported') and account_configured and screenscraper_enabled,
+            'can_search': account_configured and screenscraper_enabled,
+            'checked': record is not None,
+            'job': summary_job,
+        },
+    }
+
+
+def _game_media_catalog_payload(platform_name):
+    platform_info = (getattr(config, 'platform_dict_by_name', {}) or {}).get(platform_name)
+    if not isinstance(platform_info, dict) or not platform_info.get('folder'):
+        return None
+
+    games, _, _ = get_cached_games(platform_name)
+    names = [game.name for game in games]
+    folder = str(platform_info['folder'])
+
+    import database
+    import screenscraper
+    from media_manager import local_media_names
+
+    boxes = local_media_names(folder, names, 'box')
+    system_id = screenscraper.get_system_id(platform_name)
+    summaries = database.load_game_summaries(system_id, names, config.DB_PATH) if system_id else {}
+    entries = {}
+    for name in names:
+        record = summaries.get(os.path.basename(name))
+        has_box = name in boxes
+        if not has_box and record is None:
+            continue
+        entries[name] = {
+            'box2d': has_box,
+            'summary': str(record['summary'] or '')[:240] if record and record['found'] else '',
+            'summary_checked': record is not None,
+            'summary_found': bool(record and record['found']),
+        }
+    return {'success': True, 'platform': platform_name, 'entries': entries}
+
+
+def _enqueue_game_media_download(platform_name, folder, rom_filename, kind, force_search=False):
+    global _web_game_media_worker_thread
+    key = _game_media_job_key(platform_name, folder, rom_filename, kind)
+    with _web_game_media_jobs_lock:
+        existing = _web_game_media_jobs.get(key)
+        if existing and existing.get('status') in ('queued', 'running'):
+            return dict(existing)
+        if _web_game_media_queue.full():
+            raise queue.Full
+        job = {'status': 'queued', 'updated_at': time.time()}
+        _web_game_media_jobs[key] = job
+        _web_game_media_queue.put_nowait((key, platform_name, folder, rom_filename, kind, force_search))
+        if _web_game_media_worker_thread is None or not _web_game_media_worker_thread.is_alive():
+            _web_game_media_worker_thread = threading.Thread(
+                target=_run_game_media_downloads,
+                daemon=True,
+                name='RGSX-Web-Game-Media',
+            )
+            _web_game_media_worker_thread.start()
+        return dict(job)
+
+
+def _download_game_media_job(job):
+    key, platform_name, folder, rom_filename, kind, force_search = job
+    lock_handle = None
+    import screenscraper
+    import media_manager as media
+    from rgsx_settings import is_screenscraper_disabled
+
+    try:
+        if is_screenscraper_disabled():
+            raise screenscraper.ScreenScraperError('disabled', 'ScreenScraper is disabled')
+        username, password = screenscraper.load_account()
+        if not (username and password):
+            raise screenscraper.ScreenScraperError('account_required', 'ScreenScraper account required')
+
+        payload = _game_media_payload(platform_name, rom_filename)
+        if payload is None:
+            raise screenscraper.ScreenScraperError('game_not_found', 'Game is not in the local catalog')
+        current = payload['box' if kind == 'box' else 'summary']
+        if current['available']:
+            _update_game_media_job(key, 'completed')
+            return
+        if not force_search and current['status'] in ('unavailable', 'not_found'):
+            _update_game_media_job(key, current['status'])
+            return
+
+        while lock_handle is None:
+            if is_screenscraper_disabled():
+                raise screenscraper.ScreenScraperError('disabled', 'ScreenScraper is disabled')
+            lock_handle = media.acquire_media_job_lock()
+            if lock_handle is None:
+                time.sleep(1)
+
+        _update_game_media_job(key, 'running')
+        payload = _game_media_payload(platform_name, rom_filename)
+        if payload is None:
+            raise screenscraper.ScreenScraperError('game_not_found', 'Game is not in the local catalog')
+        current = payload['box' if kind == 'box' else 'summary']
+        if current['available']:
+            _update_game_media_job(key, 'completed')
+            return
+        if not force_search and current['status'] in ('unavailable', 'not_found'):
+            _update_game_media_job(key, current['status'])
+            return
+
+        configured_id = screenscraper.get_configured_system_id(platform_name)
+        system_id = screenscraper.resolve_system_id(platform_name, configured_id)
+        kinds = ('box',) if kind == 'box' else ()
+        result = screenscraper.fetch_game_info(
+            rom_filename,
+            system_id,
+            origin='web game media',
+            kinds=kinds,
+        )
+        if result is None:
+            _update_game_media_job(key, 'not_found')
+            return
+
+        if kind == 'box':
+            media_payload = result['media'].get('box')
+            if media_payload and not media.find_media(folder, rom_filename, 'box'):
+                media.save_media(folder, rom_filename, 'box', media_payload)
+            status = 'completed' if media.find_media(folder, rom_filename, 'box') else 'unavailable'
+        else:
+            status = 'completed' if result['summary'] else 'unavailable'
+        _update_game_media_job(key, status)
+    except screenscraper.ScreenScraperError as exc:
+        logger.warning("Web game media download failed for %s (%s): %s", rom_filename, kind, exc.kind)
+        _update_game_media_job(key, 'failed', exc.kind)
+    except OSError as exc:
+        logger.exception("Could not save Web game media for %s (%s)", rom_filename, kind)
+        _update_game_media_job(key, 'failed', 'storage')
+    except Exception:
+        logger.exception("Unexpected Web game media failure for %s (%s)", rom_filename, kind)
+        _update_game_media_job(key, 'failed', 'media_fetch_failed')
+    finally:
+        if lock_handle is not None:
+            lock_handle.close()
+
+
+def _run_game_media_downloads():
+    while True:
+        job = _web_game_media_queue.get()
+        try:
+            _download_game_media_job(job)
+        except Exception:
+            logger.exception("Unexpected failure in Web game media worker")
+            _update_game_media_job(job[0], 'failed', 'media_fetch_failed')
+        finally:
+            _web_game_media_queue.task_done()
+
+
 class RGSXHandler(BaseHTTPRequestHandler):
     """Handler HTTP pour les requêtes RGSX"""
     
@@ -509,6 +843,49 @@ class RGSXHandler(BaseHTTPRequestHandler):
         }
         self._set_headers(mime_type, status=200, etag=etag, last_modified=last_modified, extra_headers=payload_headers)
         self.wfile.write(data)
+
+    def _serve_game_media_image(self, platform_name, rom_filename):
+        target = _resolve_game_media_target(platform_name, rom_filename)
+        if target is None:
+            self._send_not_found()
+            return
+
+        from media_manager import find_media
+
+        folder, rom_filename = target
+        image_path = find_media(folder, rom_filename, 'box')
+        if image_path is None:
+            self._send_not_found()
+            return
+
+        asset_path = Path(image_path)
+        try:
+            stat_result = asset_path.stat()
+            data = asset_path.read_bytes()
+        except FileNotFoundError:
+            self._send_not_found()
+            return
+
+        mime_type, _ = mimetypes.guess_type(str(asset_path))
+        if not mime_type:
+            mime_type = 'application/octet-stream'
+        last_modified = datetime.fromtimestamp(stat_result.st_mtime, timezone.utc)
+        etag = f'W/"{stat_result.st_mtime_ns}-{stat_result.st_size}"'
+        cache_headers = {
+            'Cache-Control': 'private, max-age=3600',
+            'Content-Length': str(len(data)),
+        }
+        if self.headers.get('If-None-Match') == etag:
+            self._set_headers(
+                mime_type,
+                status=304,
+                etag=etag,
+                last_modified=last_modified,
+                extra_headers={'Cache-Control': 'private, max-age=3600'},
+            )
+            return
+        self._set_headers(mime_type, status=200, etag=etag, last_modified=last_modified, extra_headers=cache_headers)
+        self.wfile.write(data)
     
     def do_GET(self):
         """Traite les requêtes GET"""
@@ -526,7 +903,7 @@ class RGSXHandler(BaseHTTPRequestHandler):
                 return
 
             # Route: Page d'accueil (avec ou sans paramètres pour navigation)
-            if path == '/' or path == '/index.html' or path.startswith('/platform/') or path in ['/downloads', '/history', '/settings']:
+            if path == '/' or path == '/index.html' or path.startswith('/platform/') or path in ['/downloads', '/history', '/settings', '/scrap']:
                 self._send_html(self._get_index_html())
             
             # Route: API - Liste des plateformes
@@ -721,6 +1098,35 @@ class RGSXHandler(BaseHTTPRequestHandler):
                 response_etag = generate_etag(response_payload)
 
                 self._send_json(response_payload, etag=response_etag, last_modified=games_last_modified)
+
+            elif path == '/api/game-media/catalog':
+                query = urllib.parse.parse_qs(parsed_path.query)
+                platform_name = query.get('platform', [''])[0]
+                payload = _game_media_catalog_payload(platform_name)
+                if payload is None:
+                    self._send_json({'success': False, 'error': 'platform_not_found'}, status=404)
+                else:
+                    self._send_json(payload)
+
+            elif path == '/api/game-media':
+                query = urllib.parse.parse_qs(parsed_path.query)
+                platform_name = query.get('platform', [''])[0]
+                rom_filename = query.get('game', [''])[0]
+                payload = _game_media_payload(platform_name, rom_filename)
+                if payload is None:
+                    self._send_json({'success': False, 'error': 'game_not_found'}, status=404)
+                else:
+                    self._send_json(payload)
+
+            elif path == '/api/game-media/image':
+                query = urllib.parse.parse_qs(parsed_path.query)
+                if query.get('kind', ['box'])[0] != 'box':
+                    self._send_not_found()
+                else:
+                    self._serve_game_media_image(
+                        query.get('platform', [''])[0],
+                        query.get('game', [''])[0],
+                    )
             
             # Route: API - Progression des téléchargements (en cours seulement)
             elif path == '/api/progress':
@@ -766,6 +1172,9 @@ class RGSXHandler(BaseHTTPRequestHandler):
                     'success': True,
                     'downloads': downloads
                 })
+
+            elif path == '/api/media/status':
+                self._send_json(_media_manager_payload(_get_web_media_manager()))
             
             # Route: API - Historique (téléchargements terminés ET en queue/cours)
             elif path == '/api/history':
@@ -776,8 +1185,8 @@ class RGSXHandler(BaseHTTPRequestHandler):
                 
                 # Inclure: statuts terminés + en queue + en cours
                 included_statuses = [
-                    "Download_OK", "Erreur", "error", "Canceled", "Already_Present",  # Terminés
-                    "Queued", "Downloading", "Téléchargement", "Downloading", "Connecting", "Extracting",  # En cours
+                    "Download_OK", "Completed", "Erreur", "Error", "error", "Canceled", "Already_Present",  # Terminés
+                    "Queued", "Downloading", "Téléchargement", "Downloading", "Connecting", "Extracting", "Converting", "Seeding",  # En cours
                 ]
                 # Inclure aussi les statuts "Try X/Y" (tentatives)
                 visible_history = [
@@ -843,6 +1252,11 @@ class RGSXHandler(BaseHTTPRequestHandler):
                         'realdebrid': api_keys_data.get('realdebrid', ''),
                         'torbox': api_keys_data.get('torbox', '')
                     }
+
+                    # ScreenScraper account: the password is never sent to the browser, only whether it is set
+                    from screenscraper import load_account
+                    ss_username, ss_password = load_account()
+                    settings['screenscraper'] = {'username': ss_username, 'has_password': bool(ss_password)}
                     
                     self._send_json({
                         'success': True,
@@ -962,15 +1376,15 @@ class RGSXHandler(BaseHTTPRequestHandler):
         config.download_active = True
         
         # Mettre à jour l'historique: queued -> Downloading
-        from history import load_history, save_history
-        config.history = load_history()
-        for entry in config.history:
-            if entry.get('task_id') == task_id and entry.get('status') == 'Queued':
-                entry['status'] = 'Downloading'
-                entry['message'] = get_translation('download_in_progress')
-                save_history(config.history)
-                logger.info(f"📋 Statut mis à jour de 'queued' à 'Downloading' pour {game_name} (task_id={task_id})")
-                break
+        with history_lock:
+            reload_history(progress_queues)
+            for entry in config.history:
+                if entry.get('task_id') == task_id and entry.get('status') == 'Queued':
+                    entry['status'] = 'Downloading'
+                    entry['message'] = get_translation('download_in_progress')
+                    save_history(config.history)
+                    logger.info(f"📋 Statut mis à jour de 'queued' à 'Downloading' pour {game_name} (task_id={task_id})")
+                    break
         
         if is_1fichier:
             download_func = download_from_1fichier
@@ -1014,6 +1428,135 @@ class RGSXHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get('Content-Length', 0))
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data.decode('utf-8')) if content_length > 0 else {}
+
+            if path == '/api/game-media/download':
+                if not isinstance(data, dict):
+                    self._send_json({'success': False, 'error': 'invalid_game'}, status=400)
+                    return
+                platform_name = data.get('platform')
+                rom_filename = data.get('game')
+                kind = data.get('kind')
+                force_search = data.get('force_search', False)
+                if not all(isinstance(value, str) and value for value in (platform_name, rom_filename)):
+                    self._send_json({'success': False, 'error': 'invalid_game'}, status=400)
+                    return
+                if kind not in ('box', 'summary'):
+                    self._send_json({'success': False, 'error': 'invalid_media_kind'}, status=400)
+                    return
+                if not isinstance(force_search, bool):
+                    self._send_json({'success': False, 'error': 'invalid_force_search'}, status=400)
+                    return
+                target = _resolve_game_media_target(platform_name, rom_filename)
+                if target is None:
+                    self._send_json({'success': False, 'error': 'game_not_found'}, status=404)
+                    return
+
+                payload = _game_media_payload(platform_name, rom_filename)
+                media_state = payload[kind]
+                if media_state['available']:
+                    self._send_json({'success': True, 'status': 'completed'})
+                    return
+                if not payload['screenscraper_enabled']:
+                    self._send_json({'success': False, 'error': 'media_scraper_disabled'}, status=403)
+                    return
+                if not payload['account_configured']:
+                    self._send_json({'success': False, 'error': 'media_account_required'}, status=400)
+                    return
+                if not force_search and media_state['status'] not in ('missing', 'unsupported'):
+                    self._send_json({'success': False, 'error': 'media_unavailable'}, status=409)
+                    return
+
+                try:
+                    job = _enqueue_game_media_download(
+                        platform_name,
+                        target[0],
+                        rom_filename,
+                        kind,
+                        force_search=force_search,
+                    )
+                except queue.Full:
+                    self._send_json({'success': False, 'error': 'media_queue_full'}, status=429)
+                    return
+                self._send_json({'success': True, 'job': job}, status=202)
+                return
+
+            if path == '/api/media/toggle':
+                import media_manager as media
+                from rgsx_settings import set_screenscraper_disabled
+                manager = _get_web_media_manager()
+                enabled = data.get('enabled')
+                if not isinstance(enabled, bool):
+                    self._send_json({'success': False, 'error': 'invalid_enabled_option'}, status=400)
+                    return
+                if not enabled and (manager.running or media.media_job_running_elsewhere()):
+                    self._send_json({'success': False, 'error': 'media_job_busy'}, status=409)
+                    return
+                disabled = set_screenscraper_disabled(not enabled)
+                self._send_json({'success': True, 'screenscraper_enabled': not disabled})
+                return
+
+            if path == '/api/media/start':
+                import media_manager as media
+                from rgsx_settings import is_screenscraper_disabled
+                manager = _get_web_media_manager()
+                profile = data.get('profile', 'default')
+                folders = data.get('folders', [])
+                resume = data.get('resume', False)
+                if not isinstance(profile, str) or profile not in media.PROFILES:
+                    self._send_json({'success': False, 'error': 'invalid_profile'}, status=400)
+                    return
+                if not isinstance(folders, list) or any(not isinstance(folder, str) for folder in folders):
+                    self._send_json({'success': False, 'error': 'invalid_platform_selection'}, status=400)
+                    return
+                if not isinstance(resume, bool):
+                    self._send_json({'success': False, 'error': 'invalid_resume_option'}, status=400)
+                    return
+                if manager.running:
+                    self._send_json({'success': False, 'error': 'media_job_busy'}, status=409)
+                    return
+                if is_screenscraper_disabled():
+                    self._send_json({'success': False, 'error': 'media_scraper_disabled'}, status=403)
+                    return
+                if media.media_job_running_elsewhere():
+                    self._send_json({'success': False, 'error': 'media_job_busy'}, status=409)
+                    return
+                if manager.thread_limit_ready.is_set():
+                    manager.open()
+                if not manager.account_configured:
+                    self._send_json({'success': False, 'error': 'media_account_required'}, status=400)
+                    return
+                if resume:
+                    if not manager.pending:
+                        self._send_json({'success': False, 'error': 'media_queue_empty'}, status=400)
+                        return
+                else:
+                    supported = {
+                        group['folder']
+                        for group in manager.platforms
+                        if group.get('platform_id')
+                    }
+                    selected = set(folders)
+                    if not selected or not selected <= supported:
+                        self._send_json({'success': False, 'error': 'invalid_platform_selection'}, status=400)
+                        return
+                    manager.selected = selected
+                    manager.profile = profile
+                manager.start(resume=resume)
+                self._send_json(_media_manager_payload(manager), status=202)
+                return
+
+            if path == '/api/media/cancel':
+                import media_manager as media
+                manager = _get_web_media_manager()
+                if not manager.running and media.media_job_running_elsewhere():
+                    self._send_json({'success': False, 'error': 'media_job_busy'}, status=409)
+                    return
+                if not manager.running:
+                    self._send_json({'success': False, 'error': 'media_job_not_running'}, status=409)
+                    return
+                manager.cancel()
+                self._send_json(_media_manager_payload(manager), status=202)
+                return
             
             # Route: Lancer un téléchargement
             if path == '/api/download':
@@ -1033,11 +1576,12 @@ class RGSXHandler(BaseHTTPRequestHandler):
                 games, _, _ = get_cached_games(platform)
                 
                 # Si game_name est fourni, chercher l'index correspondant
-                if game_name_param and game_index is None:
+                # La liste peut avoir changé d'ordre depuis l'affichage de la page, et deux lignes peuvent porter le même nom
+                if game_name_param:
                     game_index = None
                     for idx, game in enumerate(games):
                         current_game_name = game.name
-                        if current_game_name == game_name_param:
+                        if current_game_name == game_name_param and data.get('game_url', game.url) == game.url:
                             game_index = idx
                             break
                     
@@ -1089,6 +1633,10 @@ class RGSXHandler(BaseHTTPRequestHandler):
                 
                 task_id = f"web_{int(time.time() * 1000)}"
                 
+                # save_history réécrit toute la table depuis cette liste : ce processus ne l'a jamais chargée
+                # au démarrage, et l'app peut y avoir ajouté des lignes depuis.
+                reload_history(progress_queues)
+
                 # Déterminer si on doit ajouter à la queue selon le mode et les slots disponibles.
                 max_dl = getattr(config, 'max_simultaneous_downloads', 5)
                 active_count = getattr(config, 'active_download_count', 0)
@@ -1122,9 +1670,9 @@ class RGSXHandler(BaseHTTPRequestHandler):
                             'total_size': 0,
                             'task_id': task_id
                         }
-                        config.history.append(queue_history_entry)
-                        from history import save_history
-                        save_history(config.history)
+                        with history_lock:
+                            config.history.append(queue_history_entry)
+                            save_history(config.history)
                         self._send_json({
                             'success': True,
                             'message': f"{game_name} ajouté à la file d'attente",
@@ -1204,11 +1752,10 @@ class RGSXHandler(BaseHTTPRequestHandler):
                         'total_size': 0,
                         'task_id': task_id
                     }
-                    config.history.append(queue_history_entry)
-                    
                     # Sauvegarder l'historique
-                    from history import save_history
-                    save_history(config.history)
+                    with history_lock:
+                        config.history.append(queue_history_entry)
+                        save_history(config.history)
                     
                     logger.info(f"📋 {game_name} ajouté à la file d'attente (mode=queue, active={active_count}/{max_dl})")
                     
@@ -1243,9 +1790,9 @@ class RGSXHandler(BaseHTTPRequestHandler):
                         'total_size': 0,
                         'task_id': task_id
                     }
-                    config.history.append(download_history_entry)
-                    from history import save_history
-                    save_history(config.history)
+                    with history_lock:
+                        config.history.append(download_history_entry)
+                        save_history(config.history)
                     
                     if is_1fichier:
                         download_func = download_from_1fichier
@@ -1298,11 +1845,11 @@ class RGSXHandler(BaseHTTPRequestHandler):
                 
                 try:
                     from network import request_cancel
-                    from history import load_history, save_history
                     
                     # Trouver le task_id correspondant à l'URL dans l'historique
                     history = load_history() or []
                     task_id = None
+                    cancel_success = False
                     
                     for entry in history:
                         if entry.get('url') == url and entry.get('status') in ['Downloading', 'Téléchargement', 'Downloading', 'Connecting']:
@@ -1316,6 +1863,11 @@ class RGSXHandler(BaseHTTPRequestHandler):
                             break
                     
                     if task_id:
+                        # Le thread écrit son statut final depuis config.history : sans ceci, "Canceled" devient "Erreur"
+                        for live_entry in config.history:
+                            if live_entry.get('task_id') == task_id:
+                                live_entry.update(status='Canceled', progress=0, message=get_translation('web_download_canceled'))
+
                         # Tenter d'annuler le téléchargement
                         cancel_success = request_cancel(task_id)
                         logger.info(f"Annulation demandée pour task_id={task_id}, success={cancel_success}")
@@ -1326,8 +1878,9 @@ class RGSXHandler(BaseHTTPRequestHandler):
                     save_history(history)
                     
                     # Réinitialiser le flag de téléchargement actif et lancer le prochain
-                    config.download_active = False
-                    if config.download_queue:
+                    config.download_active = getattr(config, 'active_download_count', 0) > 0
+                    # Le thread annulé ou un autre encore en cours lance lui-même le suivant en se terminant
+                    if config.download_queue and not cancel_success and not config.download_active:
                         next_item = config.download_queue.pop(0)
                         logger.info(f"📋 Traitement du prochain élément de la queue après annulation: {next_item['game_name']}")
                         # Relancer de manière asynchrone
@@ -1373,13 +1926,16 @@ class RGSXHandler(BaseHTTPRequestHandler):
                     config.download_queue.clear()
                     
                     # Mettre à jour l'historique pour annuler les téléchargements en statut "Queued"
-                    history = load_history()
-                    for entry in history:
-                        if entry.get("status") == "Queued":
-                            entry["status"] = "Canceled"
-                            entry["message"] = get_translation('download_canceled')
-                            logger.info(f"Téléchargement en attente annulé : {entry.get('game_name', '?')}")
-                    save_history(history)
+                    # Le téléchargement en cours réécrit config.history en se terminant
+                    with history_lock:
+                        reload_history(progress_queues)
+                        history = config.history
+                        for entry in history:
+                            if entry.get("status") == "Queued":
+                                entry["status"] = "Canceled"
+                                entry["message"] = get_translation('download_canceled')
+                                logger.info(f"Téléchargement en attente annulé : {entry.get('game_name', '?')}")
+                        save_history(history)
                     
                     logger.info(f"📋 Queue vidée ({cleared_count} éléments supprimés)")
                     self._send_json({
@@ -1414,14 +1970,17 @@ class RGSXHandler(BaseHTTPRequestHandler):
                             found = True
                             
                             # Mettre à jour l'historique pour cet élément
-                            history = load_history()
-                            for entry in history:
-                                if entry.get('task_id') == task_id and entry.get('status') == 'Queued':
-                                    entry['status'] = 'Canceled'
-                                    entry['message'] = get_translation('download_canceled')
-                                    logger.info(f"Téléchargement en attente annulé dans l'historique : {entry.get('game_name', '?')}")
-                                    break
-                            save_history(history)
+                            # Le téléchargement en cours réécrit config.history en se terminant
+                            with history_lock:
+                                reload_history(progress_queues)
+                                history = config.history
+                                for entry in history:
+                                    if entry.get('task_id') == task_id and entry.get('status') == 'Queued':
+                                        entry['status'] = 'Canceled'
+                                        entry['message'] = get_translation('download_canceled')
+                                        logger.info(f"Téléchargement en attente annulé dans l'historique : {entry.get('game_name', '?')}")
+                                        break
+                                save_history(history)
                             break
                     
                     if found:
@@ -1445,7 +2004,7 @@ class RGSXHandler(BaseHTTPRequestHandler):
             # Route: Sauvegarder les settings
             elif path == '/api/settings':
                 try:
-                    from rgsx_settings import save_rgsx_settings, set_auto_extract
+                    from rgsx_settings import load_rgsx_settings, save_rgsx_settings, set_auto_extract
                     from utils import toggle_web_service_at_boot, toggle_custom_dns_at_boot, save_api_keys
                     
                     settings = data.get('settings')
@@ -1480,18 +2039,67 @@ class RGSXHandler(BaseHTTPRequestHandler):
                         del settings['custom_dns_at_boot']
                     
                     # Gérer API keys séparément
+                    failed_api_keys = []
                     if 'api_keys' in settings:
                         try:
-                            save_api_keys(settings['api_keys'])
+                            failed_api_keys = save_api_keys(settings['api_keys'])
                         except Exception as e:
                             logger.error(f"Erreur sauvegarde API keys: {e}")
+                            failed_api_keys = list(settings['api_keys'])
                         del settings['api_keys']
+
+                    # ScreenScraper account: stored in its own file; an empty password keeps the saved one,
+                    # an empty username removes the account. A changed account is checked against the API.
+                    ss_check = None
+                    if 'screenscraper' in settings:
+                        try:
+                            import screenscraper
+                            previous = screenscraper.load_account()
+                            ss_data = settings['screenscraper'] or {}
+                            ss_username = str(ss_data.get('username') or '').strip()
+                            ss_password = (str(ss_data.get('password') or '').strip() or previous[1]) if ss_username else ''
+                            if (ss_username, ss_password) != previous:
+                                screenscraper.save_account(ss_username, ss_password)
+                                if _web_media_manager is not None and not _web_media_manager.running:
+                                    _web_media_manager.open()
+                                if ss_username and ss_password:
+                                    try:
+                                        remaining, max_per_day = screenscraper.get_user_info() or ('?', '?')
+                                        ss_check = {'status': 'ok', 'remaining': remaining, 'max_per_day': max_per_day}
+                                    except screenscraper.ScreenScraperError as e:
+                                        logger.warning(f"ScreenScraper login check failed: {e.kind} ({e})")
+                                        ss_check = {'status': e.kind}
+                        except Exception as e:
+                            logger.error(f"Erreur sauvegarde compte ScreenScraper: {e}")
+                            ss_check = {'status': 'save_error'}
+                        del settings['screenscraper']
+
+                    # La page n'envoie que ses champs : le reste du fichier (plateformes masquées, dossiers
+                    # personnalisés, limite de téléchargements...) doit survivre à la sauvegarde.
+                    current_settings = load_rgsx_settings()
+                    for key, value in settings.items():
+                        if isinstance(value, dict) and isinstance(current_settings.get(key), dict):
+                            current_settings[key].update(value)
+                        else:
+                            current_settings[key] = value
+                    if not save_rgsx_settings(current_settings):
+                        self._send_json({
+                            'success': False,
+                            'error': get_translation('web_settings_not_saved')
+                        }, status=500)
+                        return
                     
-                    save_rgsx_settings(settings)
+                    if failed_api_keys:
+                        self._send_json({
+                            'success': False,
+                            'error': get_translation('web_api_keys_not_saved').format(', '.join(failed_api_keys))
+                        }, status=500)
+                        return
                     
                     self._send_json({
                         'success': True,
-                        'message': 'Paramètres sauvegardés avec succès'
+                        'message': 'Paramètres sauvegardés avec succès',
+                        'screenscraper': ss_check
                     })
                     
                 except Exception as e:
@@ -1520,10 +2128,15 @@ class RGSXHandler(BaseHTTPRequestHandler):
                     current_settings['game_filters']['region_priority'] = data.get('region_priority', ['USA', 'Canada', 'World', 'Europe', 'Japan', 'Other'])
                     
                     # Sauvegarder
-                    save_rgsx_settings(current_settings)
+                    if not save_rgsx_settings(current_settings):
+                        self._send_json({
+                            'success': False,
+                            'error': get_translation('web_settings_not_saved')
+                        }, status=500)
+                        return
                     
                     # Mettre à jour config.game_filter_obj
-                    if hasattr(config, 'game_filter_obj'):
+                    if getattr(config, 'game_filter_obj', None) is not None:
                         config.game_filter_obj.region_filters = data.get('region_filters', {})
                         config.game_filter_obj.hide_non_release = data.get('hide_non_release', False)
                         config.game_filter_obj.one_rom_per_game = data.get('one_rom_per_game', False)
@@ -1545,10 +2158,9 @@ class RGSXHandler(BaseHTTPRequestHandler):
             # Route: Vider l'historique
             elif path == '/api/clear-history':
                 try:
-                    from history import clear_history
-                    
-                    clear_history()
-                    config.history = []  # Vider aussi la liste en mémoire
+                    with history_lock:
+                        clear_history()
+                        reload_history(progress_queues)  # Garder les téléchargements en cours en mémoire
                     
                     self._send_json({
                         'success': True,
@@ -1727,9 +2339,7 @@ DO NOT share this file publicly as it may contain sensitive information.
             if image_data:
                 self.send_response(200)
                 self.send_header('Content-type', content_type or 'image/png')
-                self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
-                self.send_header('Pragma', 'no-cache')
-                self.send_header('Expires', '0')
+                self.send_header('Cache-Control', 'private, max-age=3600')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 self.wfile.write(image_data)
@@ -1753,9 +2363,7 @@ DO NOT share this file publicly as it may contain sensitive information.
                 # Ajouter les headers de cache (1 heure)
                 self.send_response(200)
                 self.send_header('Content-type', content_type)
-                self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
-                self.send_header('Pragma', 'no-cache')
-                self.send_header('Expires', '0')
+                self.send_header('Cache-Control', 'private, max-age=3600')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 self.wfile.write(image_data)
@@ -1930,10 +2538,10 @@ DO NOT share this file publicly as it may contain sensitive information.
             <p style="font-size: 0.85em; opacity: 0.8; margin-top: 5px;">v{version}</p>
             <label class="theme-switcher" for="web-theme-select">
                 <span aria-hidden="true">🎨</span>
-                <span>Thème</span>
-                <select id="web-theme-select" aria-label="Choisir le thème de l'interface">
-                    <option value="modern">Moderne</option>
-                    <option value="legacy">Legacy</option>
+                <span data-translate="display_theme">Theme</span>
+                <select id="web-theme-select">
+                    <option value="modern" data-translate="web_theme_modern">Modern</option>
+                    <option value="legacy" data-translate="web_theme_legacy">Legacy</option>
                 </select>
             </label>
             
@@ -1943,10 +2551,10 @@ DO NOT share this file publicly as it may contain sensitive information.
                 <button class="mobile-tab active" data-tab="platforms" onclick="showTab('platforms')" data-translate-title="web_tooltip_platforms" title="Platforms list" aria-current="page">🎮</button>
                 <button class="mobile-tab" data-tab="downloads" onclick="showTab('downloads')" data-translate-title="web_tooltip_downloads" title="Downloads">⬇️</button>
                 <button class="mobile-tab" data-tab="queue" onclick="showTab('queue')" data-translate-title="web_tooltip_queue" title="Queue">📋</button>
+                <button class="mobile-tab" data-tab="scrap" onclick="showTab('scrap')" data-translate-title="web_tooltip_scrap" title="Scrap">🖼️</button>
                 <button class="mobile-tab" data-tab="history" onclick="showTab('history')" data-translate-title="web_tooltip_history" title="History">📜</button>
                 <button class="mobile-tab" data-tab="settings" onclick="showTab('settings')" data-translate-title="web_tooltip_settings" title="Settings">⚙️</button>
                 <button class="mobile-tab" onclick="openQbittorrentWebUi()" title="Open qBittorrent WebUI">🌐</button>
-                <button class="mobile-tab" onclick="updateGamesList()" data-translate-title="web_tooltip_update" title="Update games list">🔄</button>
                 <button class="mobile-tab" onclick="generateSupportZip()" data-translate-title="web_support" title="Support">🆘</button>
             </nav>
         </header>
@@ -1955,10 +2563,10 @@ DO NOT share this file publicly as it may contain sensitive information.
             <button class="tab active" data-tab="platforms" onclick="showTab('platforms')" aria-current="page">🎮 <span data-translate="web_tab_platforms">Platforms List</span></button>
             <button class="tab" data-tab="downloads" onclick="showTab('downloads')">⬇️ <span data-translate="web_tab_downloads">Downloads</span></button>
             <button class="tab" data-tab="queue" onclick="showTab('queue')">📋 <span data-translate="web_tab_queue">Queue</span></button>
+            <button class="tab" data-tab="scrap" onclick="showTab('scrap')">🖼️ <span data-translate="web_tab_scrap">Scrap</span></button>
             <button class="tab" data-tab="history" onclick="showTab('history')">📜 <span data-translate="web_tab_history">History</span></button>
             <button class="tab" data-tab="settings" onclick="showTab('settings')">⚙️ <span data-translate="web_tab_settings">Settings</span></button>
             <button class="tab" onclick="openQbittorrentWebUi()">🌐 <span>qBittorrent</span></button>
-            <button class="tab" onclick="updateGamesList()">🔄 <span data-translate="web_tab_update">Update games list</span></button>
             <button class="tab" onclick="generateSupportZip()">🆘 <span data-translate="web_support">Support</span></button>
         </nav>
         
@@ -1966,6 +2574,7 @@ DO NOT share this file publicly as it may contain sensitive information.
             <div id="platforms-content" role="region" aria-label="Platforms section"></div>
             <div id="downloads-content" style="display:none;" role="region" aria-label="Downloads section"></div>
             <div id="queue-content" style="display:none;" role="region" aria-label="Queue section"></div>
+            <div id="scrap-content" style="display:none;" role="region" aria-label="Media scraping section"></div>
             <div id="history-content" style="display:none;" role="region" aria-label="History section"></div>
             <div id="settings-content" style="display:none;" role="region" aria-label="Settings section"></div>
         </main>
@@ -2173,6 +2782,11 @@ if __name__ == '__main__':
     args = parser.parse_args()
     PARENT_PID = args.parent_pid
     STANDALONE = True
+
+    # Lancé à côté de l'application, ce serveur ne possède pas ses téléchargements : seul le mode Docker les reprend
+    if config.HEADLESS and config.OPERATING_SYSTEM != "Darwin" and queue_interrupted_downloads():
+        while config.download_queue and getattr(config, 'active_download_count', 0) < getattr(config, 'max_simultaneous_downloads', 5):
+            RGSXHandler.__new__(RGSXHandler)._process_queued_download(config.download_queue.pop(0))
     
     print(f"Lancement sur {args.host}:{args.port}...", flush=True)
     run_server(host=args.host, port=args.port)

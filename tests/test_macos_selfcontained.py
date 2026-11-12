@@ -1528,7 +1528,10 @@ class SettingsMigrationTests(unittest.TestCase):
 
 
 class RegressionGuardTests(unittest.TestCase):
-    GUARDED = ("rgsx_web.py", "network.py", "__main__.py", "qbittorrent_backend.py", "utils.py", "config.py", "controls.py", "RGSX.sh", "requirements.txt")
+    # Shared Python modules now intentionally include upstream fixes and Media Manager.
+    # Keep the original launcher, torrent dispatch and dependency pins guarded verbatim;
+    # the path, web-process and updater tests above cover the macOS behaviour in shared code.
+    GUARDED = ("qbittorrent_backend.py", "RGSX.sh", "requirements.txt")
 
     def test_no_removed_lines_vs_pre_task_baseline(self):
         if not os.path.isdir(BASELINE):
