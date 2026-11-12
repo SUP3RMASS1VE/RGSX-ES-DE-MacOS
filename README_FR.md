@@ -53,6 +53,8 @@ La mise à jour intégrée sur macOS **prévient seulement** : quand le fork pub
 
 La version 2.7.0.7.1 conserve le portage macOS v2.7.0.7 et intègre sélectivement les correctifs upstream de sécurité des archives, sauvegarde des paramètres, téléchargements/historique/interface web et Media Manager jusqu'au commit `722f5c7` (2026-11-05). Ce n'est pas une synchronisation complète. La base locale est mise à niveau pour les informations ScreenScraper en conservant paramètres, historique et jeux téléchargés. L'installation automatique de mises à jour reste désactivée sur macOS, même pour les paquets de ce fork.
 
+La version 2.7.0.7.2 corrige les échecs de téléchargement LolRoms introduits dans la version 2.7.0.7.1 en conservant les URL directes du catalogue et le référent de leur répertoire.
+
 ### Noms de dossiers ES-DE
 
 RGSX utilise les noms de dossiers Batocera/RetroBat, ES-DE les siens. Sur macOS RGSX les traduit pour que les jeux arrivent dans les dossiers scannés par ES-DE :

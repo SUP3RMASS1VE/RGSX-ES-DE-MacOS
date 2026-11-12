@@ -1051,12 +1051,7 @@ def _is_lolroms_url(url: str | None) -> bool:
 
 def _normalize_lolroms_url(url: str) -> str:
     parsed = urllib.parse.urlsplit(url)
-    # The site now serves files as /?file=<path>, and "Nintendo - DS" became "Nintendo/DS".
-    if parsed.path not in ('', '/') and not parsed.query:
-        file_path = urllib.parse.unquote(parsed.path).lstrip('/')
-        if file_path.startswith('Nintendo - '):
-            file_path = 'Nintendo/' + file_path[len('Nintendo - '):]
-        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, '/', 'file=' + urllib.parse.quote_plus(file_path), ''))
+    # Preserve the catalog endpoint. Rewriting direct files as /?file= returns HTML.
     normalized_path = urllib.parse.quote(
         urllib.parse.unquote(parsed.path or '/'),
         safe="/@:$&'()*+,;=-._~",

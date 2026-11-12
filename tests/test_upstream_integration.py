@@ -51,6 +51,70 @@ class IsolatedCase(unittest.TestCase):
         mock.patch.object(network.requests, "get", side_effect=AssertionError("external network is forbidden")).start()
 
 
+class LolRomsDownloadTests(IsolatedCase):
+    url = "https://lolroms.com/Microsoft/XBOX/Fixture Game (Europe).7z"
+    encoded_url = "https://lolroms.com/Microsoft/XBOX/Fixture%20Game%20(Europe).7z"
+    payload = bytes.fromhex("377abcaf271c") + b"fixture archive data"
+
+    def test_direct_links_keep_their_catalog_path(self):
+        for path in ("Microsoft/XBOX", "Nintendo - DS", "Nintendo/DS"):
+            with self.subTest(path=path):
+                url = f"https://lolroms.com/{path}/Fixture Game.7z"
+                expected = url.replace(" ", "%20")
+                self.assertEqual(network._normalize_lolroms_url(url), expected)
+                self.assertEqual(network._normalize_lolroms_url(expected), expected)
+
+    def test_existing_query_links_are_preserved(self):
+        url = "https://lolroms.com/?file=Microsoft%2FXBOX%2FFixture+Game.7z"
+        self.assertEqual(network._normalize_lolroms_url(url), url)
+
+    def test_parent_referer_keeps_the_catalog_directory(self):
+        self.assertEqual(network._build_lolroms_parent_url(self.url),
+                         "https://lolroms.com/Microsoft/XBOX/")
+
+    def test_external_download_uses_direct_link_and_validates_payload(self):
+        destination = self.root / "fixture.7z"
+
+        def start_process(command, **kwargs):
+            self.assertEqual(command[-1], self.encoded_url)
+            self.assertIn("Referer: https://lolroms.com/Microsoft/XBOX/", command)
+            Path(command[command.index("-o") + 1]).write_bytes(self.payload)
+            return mock.Mock(stdout=io.StringIO(), stderr=io.StringIO(),
+                             poll=mock.Mock(return_value=0), returncode=0)
+
+        with mock.patch.object(network, "_resolve_lolroms_external_command", return_value=("curl", "/usr/bin/curl")), \
+                mock.patch.object(network.subprocess, "run", return_value=mock.Mock(
+                    stdout=f"Content-Length: {len(self.payload)}\n", stderr="")) as probe, \
+                mock.patch.object(network.subprocess, "Popen", side_effect=start_process) as download:
+            success, message = network._download_lolroms_with_external_tool(self.url, str(destination), "fixture")
+        self.assertTrue(success, message)
+        self.assertEqual(probe.call_args.args[0][-1], self.encoded_url)
+        download.assert_called_once()
+        self.assertEqual(destination.read_bytes(), self.payload)
+
+    def test_requests_fallback_downloads_direct_link(self):
+        self.settings.write_text('{"auto_extract": false}')
+        response = mock.Mock(status_code=200, headers={"content-length": str(len(self.payload)),
+                                                     "content-type": "application/octet-stream"})
+        response.iter_content.return_value = iter([self.payload])
+        session = mock.Mock()
+        session.get.return_value = response
+        with mock.patch.object(network.requests, "Session", return_value=session), \
+                mock.patch.object(network, "_download_lolroms_with_external_tool", return_value=(False, "fixture fallback")), \
+                mock.patch.object(network, "_lookup_known_game_size", return_value=len(self.payload)), \
+                mock.patch.object(network, "load_archive_org_cookie", return_value=""), \
+                mock.patch.object(network, "_is_browser_challenge_response", return_value=False), \
+                mock.patch.object(rgsx_settings, "get_platform_custom_path", return_value=None), \
+                mock.patch.object(rgsx_settings, "apply_symlink_path", return_value=str(self.root / "roms")), \
+                mock.patch.object(network, "notify_download_finished"), \
+                mock.patch.object(history, "mark_game_as_downloaded"):
+            success, message = asyncio.run(network.download_rom(self.url, "Xbox (LolRoms)",
+                                                               "fixture.7z", task_id="lolroms-regression"))
+        self.assertTrue(success, message)
+        self.assertEqual(session.get.call_args.args[0], self.encoded_url)
+        self.assertEqual((self.root / "roms" / "fixture.7z").read_bytes(), self.payload)
+
+
 class ArchiveSafetyTests(IsolatedCase):
     def archive(self, members):
         path = self.root / "download.zip"

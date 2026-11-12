@@ -51,6 +51,8 @@ The in-app updater on macOS only **notifies**: when the fork publishes a newer v
 
 Version 2.7.0.7.1 keeps the v2.7.0.7 macOS port and selectively brings in upstream archive safety, settings-save, download/history/web fixes and Media Manager through commit `722f5c7` (2026-11-05). It is not a full upstream sync. The local catalog database is upgraded in place to cache ScreenScraper details; existing settings, history and downloaded-game records are kept. Automatic application installation remains disabled on macOS, including packages from this fork.
 
+Version 2.7.0.7.2 fixes LolRoms download failures introduced in 2.7.0.7.1 by preserving direct catalog URLs and their directory referers.
+
 ### ES-DE folder names
 
 RGSX uses Batocera/RetroBat folder names, ES-DE uses its own. RGSX translates them on macOS so games land in the folders ES-DE scans:
